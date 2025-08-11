@@ -1,0 +1,29 @@
+# 呜呜大地图 - 依赖包列表
+
+# 核心UI框架
+PySide6>=6.5.0
+
+# 图像处理
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# OCR和机器学习
+ultralytics>=8.0.0
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Web服务器
+werkzeug>=2.3.0
+Flask>=2.3.0
+
+# HTTP请求
+requests>=2.31.0
+
+# 打包工具
+pyinstaller>=5.13.0
+
+# 可选依赖（用于开发）
+# pytest>=7.4.0  # 测试框架
+# black>=23.7.0  # 代码格式化
+# flake8>=6.0.0  # 代码检查

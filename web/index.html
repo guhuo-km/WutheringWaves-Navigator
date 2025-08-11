@@ -1,0 +1,504 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>游戏地图工具 (终极交互版 - 瓦片优化 - 状态同步)</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    />
+    <style>
+      html, body, #map { height: 100%; width: 100%; margin: 0; padding: 0; background-color: #333; overflow: hidden; }
+      #panel-container { position: fixed; top: 10px; right: 10px; z-index: 1000; display: flex; align-items: flex-start; transition: transform 0.35s ease-in-out; }
+      #panel-container.is-hidden { transform: translateX(292px); }
+      #panel-toggle-btn { width: 30px; height: 50px; line-height: 50px; text-align: center; font-size: 20px; background: white; cursor: pointer; border-radius: 8px 0 0 8px; box-shadow: -2px 2px 8px rgba(0, 0, 0, 0.15); border: 1px solid #ccc; border-right: none; order: 1; }
+      #control-panel { width: 250px; background: rgba(255, 255, 255, 0.95); padding: 15px; border-radius: 0 8px 8px 0; box-shadow: 2px 2px 8px rgba(0, 0, 0, 0.15); border: 1px solid #ccc; order: 2; }
+      #control-panel h4 { margin: 0 0 10px 0; padding-bottom: 10px; border-bottom: 1px solid #ccc; }
+      .map-list-item { display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; }
+      .map-list-item label { cursor: pointer; }
+      #sync-status { font-size: 12px; color: #888; margin-top: 10px; text-align: center; }
+      
+      /* 瓦片图像无损放大样式 - 解决拉伸模糊问题 */
+      .leaflet-tile-container img {
+        image-rendering: -moz-crisp-edges;      /* Firefox */
+        image-rendering: -webkit-crisp-edges;   /* Webkit */
+        image-rendering: pixelated;             /* Chrome */
+        image-rendering: crisp-edges;           /* 标准属性 */
+        image-rendering: -webkit-optimize-contrast; /* Safari */
+        -ms-interpolation-mode: nearest-neighbor; /* IE */
+      }
+      
+      /* 确保瓦片图像保持锐利 */
+      .leaflet-tile {
+        image-rendering: -moz-crisp-edges;
+        image-rendering: -webkit-crisp-edges;
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+        image-rendering: -webkit-optimize-contrast;
+        -ms-interpolation-mode: nearest-neighbor;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <div id="panel-container">
+      <div id="panel-toggle-btn" title="切换面板">→</div>
+      <div id="control-panel"><h4>地图加载中...</h4></div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+      // --- 1. 初始化和状态管理 ---
+      let mapData = [];
+      let currentMapInfo = null;
+      let currentLayer = null;
+      let ws; // WebSocket 实例
+      let isUpdatingFromServer = false; // 防止更新循环的标志
+      let currentSvgOverlay = null; // 用于管理当前叠加的SVG
+
+      const map = L.map("map", {
+        crs: L.CRS.Simple,
+        minZoom: -5,
+        maxZoom: 10,
+      });
+
+      const panelContainer = document.getElementById("panel-container");
+      const controlPanel = document.getElementById("control-panel");
+      const toggleBtn = document.getElementById("panel-toggle-btn");
+
+      // --- 2. 核心功能：加载地图 ---
+      function loadMap(mapName, triggeredByServer = false) {
+        let mapInfo = mapData.find(m => m.name === mapName);
+        
+        // 如果精确匹配失败，尝试模糊匹配（去除扩展名）
+        if (!mapInfo) {
+          const nameWithoutExt = mapName.replace(/\.[^/.]+$/, "");
+          mapInfo = mapData.find(m => {
+            const mapNameWithoutExt = m.name.replace(/\.[^/.]+$/, "");
+            return mapNameWithoutExt === nameWithoutExt || m.name === nameWithoutExt;
+          });
+        }
+        
+        if (!mapInfo) {
+          console.warn(`未找到名为 "${mapName}" 的地图信息！`);
+          return;
+        }
+        
+        // 如果是由用户操作触发的，则通知服务器
+        if (!triggeredByServer && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'mapChange', mapName: mapName }));
+        }
+
+        if (currentLayer) map.removeLayer(currentLayer);
+
+        currentMapInfo = mapInfo;
+
+        const bounds = [[0, 0], [-mapInfo.height, mapInfo.width]];
+
+        if (mapInfo.tiled) {
+          currentLayer = L.tileLayer(`tiles/${mapInfo.name}/{z}/{x}/{y}.png`, {
+            tileSize: 256,
+            tms: false,
+            noWrap: true,
+            bounds: bounds,
+            minZoom: map.getMinZoom(),
+            maxZoom: map.getMaxZoom(),
+            minNativeZoom: 0,
+            maxNativeZoom: mapInfo.maxZoom, // 保持瓦片的真实最大等级
+            errorTileUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' // 透明的1x1像素图片作为错误瓦片
+          }).addTo(map);
+          // 如果不是由服务器触发的，可以设置一个默认视图
+          if (!triggeredByServer) {
+            map.setView([0, 0], 0);
+          }
+        } else {
+          const imageUrl = `images/${mapInfo.name}`;
+          currentLayer = L.imageOverlay(imageUrl, bounds).addTo(map);
+          const img = new Image();
+          img.src = imageUrl;
+          img.onerror = () => {
+              alert(`图片 "${imageUrl}" 加载失败！请确保文件在 'images' 目录下且文件名正确。`);
+          };
+          if (!triggeredByServer) {
+            map.fitBounds(bounds);
+          }
+        }
+        
+        updateControlPanel();
+      }
+
+      // --- 3. 核心功能：更新和渲染控制面板 ---
+      function updateControlPanel() {
+        controlPanel.innerHTML = "";
+        const title = document.createElement("h4");
+        title.textContent = "地图控制器";
+        controlPanel.appendChild(title);
+        mapData.forEach((mapInfo) => {
+          const itemDiv = document.createElement("div");
+          itemDiv.className = "map-list-item";
+          const label = document.createElement("label");
+          const radio = document.createElement("input");
+          radio.type = "radio";
+          radio.name = "map-choice";
+          radio.value = mapInfo.name;
+          if (currentMapInfo && mapInfo.name === currentMapInfo.name) {
+            radio.checked = true;
+          }
+          radio.onchange = () => loadMap(mapInfo.name); // 用户点击时，默认 triggeredByServer=false
+          label.appendChild(radio);
+          label.appendChild(document.createTextNode(` ${mapInfo.name}${mapInfo.tiled ? ' (瓦片)' : ''}`));
+          itemDiv.appendChild(label);
+          controlPanel.appendChild(itemDiv);
+        });
+        const syncStatus = document.createElement("div");
+        syncStatus.id = "sync-status";
+        syncStatus.textContent = "正在连接同步服务器...";
+        controlPanel.appendChild(syncStatus);
+      }
+
+      // --- 4. 切换面板显隐 ---
+      toggleBtn.addEventListener("click", () => {
+        panelContainer.classList.toggle("is-hidden");
+        toggleBtn.textContent = panelContainer.classList.contains("is-hidden") ? "←" : "→";
+        toggleBtn.title = panelContainer.classList.contains("is-hidden") ? "显示面板" : "隐藏面板";
+      });
+      
+      // --- 5. 初始化应用 ---
+      async function initializeApp() {
+        try {
+          const response = await fetch('maps.json?t=' + new Date().getTime());
+          if (!response.ok) {
+            throw new Error('无法加载 maps.json，请先运行 tile_generator.py 添加地图。');
+          }
+          mapData = await response.json();
+          if (mapData.length > 0) {
+            // 初始加载由服务器状态决定，或加载第一个
+            loadMap(mapData[0].name, true); // 初始加载标记为服务器行为，避免广播
+          } else {
+            updateControlPanel();
+            controlPanel.innerHTML = '<h4>无可用地图</h4><p>请使用 <code>python tile_generator.py</code> 添加地图。</p>'
+          }
+          setupWebSocket(); // 在地图数据加载后设置WebSocket
+        } catch (error) {
+          console.error(error);
+          controlPanel.innerHTML = `<h4>错误</h4><p style="color:red;">${error.message}</p>`;
+        }
+      }
+      
+      // --- 6. 实时同步功能 (WebSocket) ---
+      function setupWebSocket() {
+        // --- 修改这里的地址以匹配你的WebSocket服务器 ---
+        ws = new WebSocket('ws://localhost:8080/ws'); 
+        const statusEl = document.getElementById("sync-status");
+
+        ws.onopen = () => {
+          console.log('WebSocket连接成功!');
+          if(statusEl) statusEl.textContent = '同步已连接';
+          if(statusEl) statusEl.style.color = 'green';
+        };
+
+        ws.onmessage = (event) => {
+          const data = JSON.parse(event.data);
+          console.log('收到数据:', data);
+
+          isUpdatingFromServer = true; // 开始处理服务器数据，设置标志
+
+          switch (data.type) {
+            case 'mapChange':
+              if (data.mapName !== currentMapInfo.name) {
+                  console.log(`从服务器切换地图到: ${data.mapName}`);
+                  loadMap(data.mapName, true); // 标记为服务器触发
+              }
+              // 地图切换后，通常会附带位置信息
+              if (data.lat !== undefined && data.lng !== undefined && data.zoom !== undefined) {
+                  map.setView([data.lat, data.lng], data.zoom, { animate: true });
+              }
+              break;
+            case 'stateUpdate':
+              map.setView([data.lat, data.lng], data.zoom, { animate: true });
+              break;
+            // 可选：处理初始连接时服务器发送的完整状态
+            case 'initialState':
+              console.log(`同步初始状态: ${data.mapName}`);
+              loadMap(data.mapName, true);
+              map.setView([data.lat, data.lng], data.zoom);
+              break;
+            // --- 新增指令处理 ---
+            case 'panBy':
+                if (data.x) map.panBy([data.x, 0], { animate: true });
+                if (data.y) map.panBy([0, data.y], { animate: true });
+                break;
+            case 'zoomIn':
+                map.zoomIn();
+                break;
+            case 'zoomOut':
+                map.zoomOut();
+                break;
+            case 'jumpTo':
+                if (data.lat !== undefined && data.lng !== undefined) {
+                    map.setView([data.lat, data.lng], map.getZoom(), { animate: true });
+                }
+                break;
+          }
+
+          // 短暂延迟后重置标志，以确保地图动画完成后再允许发送
+          setTimeout(() => {
+            isUpdatingFromServer = false;
+          }, 500); // 500ms应该足够地图动画完成
+        };
+
+        ws.onclose = () => {
+          console.log('WebSocket连接已断开。');
+          if(statusEl) statusEl.textContent = '同步已断开';
+          if(statusEl) statusEl.style.color = 'red';
+        };
+
+        ws.onerror = (error) => {
+          console.error('WebSocket 错误:', error);
+          if(statusEl) statusEl.textContent = '同步连接失败';
+          if(statusEl) statusEl.style.color = 'red';
+        };
+      }
+
+      function sendMapState() {
+        // 如果正在处理服务器更新，或ws未连接，则不发送任何内容
+        if (isUpdatingFromServer || !ws || ws.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        const center = map.getCenter();
+        const zoom = map.getZoom();
+        const data = {
+          type: 'stateUpdate',
+          lat: center.lat,
+          lng: center.lng,
+          zoom: zoom,
+        };
+        console.log('发送数据:', data);
+        ws.send(JSON.stringify(data));
+      }
+      
+      // --- 7. 绑定事件 ---
+      initializeApp();
+
+      map.on("click", (e) =>
+        console.log(`坐标: Y=${Math.round(-e.latlng.lat)}, X=${Math.round(e.latlng.lng)}`)
+      );
+
+      // 当移动或缩放结束时，发送新状态
+      map.on('moveend', sendMapState);
+      map.on('zoomend', sendMapState);
+
+      // --- 8. 与PySide6 GUI的QWebChannel桥接 ---
+      function initializeQtBridge() {
+          // 检查是否在QWebEngineView环境中，并且qwebchannel.js已被注入
+          if (typeof QWebChannel !== 'undefined') {
+              console.log("检测到Qt环境，正在建立QWebChannel连接...");
+              
+              new QWebChannel(qt.webChannelTransport, function(channel) {
+                  window.py_backend = channel.objects.backend;
+                  console.log("QWebChannel连接成功，后端对象已映射。");
+
+                  // 创建一个函数，用于将地图状态发送到Python
+                  function sendStatusToPython() {
+                      if (window.py_backend) {
+                          try {
+                              const center = map.getCenter();
+                              const zoom = map.getZoom();
+                              // 调用在Python中定义的槽函数
+                              window.py_backend.updateStatus(center.lat, center.lng, zoom);
+                          } catch (error) {
+                              console.error('通过QWebChannel发送状态到Python时出错:', error);
+                          }
+                      }
+                  }
+
+                  // 当地图移动或缩放结束时，调用该函数
+                  map.on('moveend zoomend', sendStatusToPython);
+                  
+                  // 首次加载完成时，立即发送一次初始状态
+                  sendStatusToPython();
+                  
+                  console.log("已为本地地图绑定状态更新事件到Python后端。");
+              });
+          } else {
+              console.log("非Qt环境，不加载QWebChannel桥接。");
+          }
+      }
+
+      // --- 9. SVG路线覆盖层功能 - 升级版支持复杂变换 ---
+      window.displaySvgRoute = function(data) {
+        console.log('收到SVG路线数据:', data);
+        
+        try {
+          // 如果已有SVG，先移除
+          if (currentSvgOverlay) {
+            map.removeLayer(currentSvgOverlay);
+            currentSvgOverlay = null;
+          }
+          
+          const { svgContent, viewBox, startPoint, endPoint, transformMatrix, formatType } = data;
+          console.log(`SVG格式类型: ${formatType}`);
+          
+          let bounds;
+          
+          if (formatType === 'complex' && transformMatrix) {
+            // 复杂变换SVG处理方式
+            console.log('使用复杂变换算法处理SVG');
+            bounds = calculateComplexSvgBounds(viewBox, startPoint, endPoint, transformMatrix);
+          } else {
+            // 简单SVG处理方式（保持原有逻辑）
+            console.log('使用简单算法处理SVG');
+            bounds = calculateSimpleSvgBounds(viewBox, startPoint, endPoint);
+          }
+          
+          // 解析SVG内容
+          const parser = new DOMParser();
+          const svgDoc = parser.parseFromString(svgContent, "image/svg+xml");
+          const svgElement = svgDoc.documentElement;
+          
+          // 创建SVG覆盖层
+          currentSvgOverlay = L.svgOverlay(svgElement, bounds, {
+            interactive: true,
+            opacity: 0.8
+          });
+          
+          // 添加到地图
+          currentSvgOverlay.addTo(map);
+          
+          // 可选：让地图视图适应SVG的边界
+          map.fitBounds(bounds);
+          
+          console.log('SVG路线覆盖层添加成功');
+          console.log('计算的边界:', bounds);
+          
+        } catch (error) {
+          console.error('显示SVG路线时出错:', error);
+        }
+      };
+      
+      // 简单SVG边界计算（原有逻辑）
+      function calculateSimpleSvgBounds(viewBox, startPoint, endPoint) {
+        const s1 = { x: startPoint.svg_x, y: startPoint.svg_y };
+        const s2 = { x: endPoint.svg_x, y: endPoint.svg_y };
+        const m1 = { lat: startPoint.lat, lng: startPoint.lng };
+        const m2 = { lat: endPoint.lat, lng: endPoint.lng };
+        
+        // 计算SVG坐标系和地图坐标系之间的向量
+        const vec_svg = { x: s2.x - s1.x, y: s2.y - s1.y };
+        const vec_map = { x: m2.lng - m1.lng, y: m2.lat - m1.lat };
+        
+        // 计算缩放比例，处理除零情况
+        const scaleX = vec_svg.x !== 0 ? vec_map.x / vec_svg.x : 1;
+        const scaleY = vec_svg.y !== 0 ? vec_map.y / vec_svg.y : 1;
+        
+        // 计算SVG原点在地图上的位置
+        const delta_svg = { x: s1.x - viewBox.x, y: s1.y - viewBox.y };
+        const delta_map = { x: delta_svg.x * scaleX, y: delta_svg.y * scaleY };
+        
+        const bounds_topLeft_lng = m1.lng - delta_map.x;
+        const bounds_topLeft_lat = m1.lat - delta_map.y;
+        
+        // 计算SVG右下角在地图上的位置
+        const bounds_bottomRight_lng = bounds_topLeft_lng + viewBox.width * scaleX;
+        const bounds_bottomRight_lat = bounds_topLeft_lat + viewBox.height * scaleY;
+        
+        // 创建地理边界
+        const topLeft = L.latLng(bounds_topLeft_lat, bounds_topLeft_lng);
+        const bottomRight = L.latLng(bounds_bottomRight_lat, bounds_bottomRight_lng);
+        
+        return L.latLngBounds(topLeft, bottomRight);
+      }
+      
+      // 复杂SVG边界计算（新增）- 修复坐标系统不一致问题
+      function calculateComplexSvgBounds(viewBox, startPoint, endPoint, transformMatrix) {
+        console.log('变换矩阵:', transformMatrix);
+        
+        // 关键修复：对于复杂变换SVG，直接使用svg_x/svg_y作为实际SVG坐标
+        // 因为这些坐标已经是在SVG渲染坐标系中的正确位置
+        const s1 = { x: startPoint.svg_x, y: startPoint.svg_y };
+        const s2 = { x: endPoint.svg_x, y: endPoint.svg_y };
+        const m1 = { lat: startPoint.lat, lng: startPoint.lng };
+        const m2 = { lat: endPoint.lat, lng: endPoint.lng };
+        
+        console.log('使用直接SVG坐标:', { s1, s2 });
+        
+        // 计算缩放比例
+        const vec_svg = { x: s2.x - s1.x, y: s2.y - s1.y };
+        const vec_map = { x: m2.lng - m1.lng, y: m2.lat - m1.lat };
+        
+        const scaleX = vec_svg.x !== 0 ? vec_map.x / vec_svg.x : 1;
+        const scaleY = vec_svg.y !== 0 ? vec_map.y / vec_svg.y : 1;
+        
+        console.log('计算得到的缩放比例:', { scaleX, scaleY });
+        
+        // 计算viewBox在地图上的位置
+        const delta_svg = { x: s1.x - viewBox.x, y: s1.y - viewBox.y };
+        const delta_map = { x: delta_svg.x * scaleX, y: delta_svg.y * scaleY };
+        
+        const bounds_topLeft_lng = m1.lng - delta_map.x;
+        const bounds_topLeft_lat = m1.lat - delta_map.y;
+        
+        const bounds_bottomRight_lng = bounds_topLeft_lng + viewBox.width * scaleX;
+        const bounds_bottomRight_lat = bounds_topLeft_lat + viewBox.height * scaleY;
+        
+        const topLeft = L.latLng(bounds_topLeft_lat, bounds_topLeft_lng);
+        const bottomRight = L.latLng(bounds_bottomRight_lat, bounds_bottomRight_lng);
+        
+        console.log('计算的边界:', { 
+          topLeft: { lat: bounds_topLeft_lat, lng: bounds_topLeft_lng },
+          bottomRight: { lat: bounds_bottomRight_lat, lng: bounds_bottomRight_lng }
+        });
+        
+        return L.latLngBounds(topLeft, bottomRight);
+      }
+      
+      // SVG变换矩阵逆变换
+      function inverseSvgTransform(x, y, matrix) {
+        if (!matrix) return { x: x, y: y };
+        
+        try {
+          const { a, b, c, d, e, f } = matrix;
+          
+          // 计算行列式
+          const det = a * d - b * c;
+          if (Math.abs(det) < 1e-10) {
+            console.warn('变换矩阵行列式接近零，使用原坐标');
+            return { x: x, y: y };
+          }
+          
+          // 逆矩阵计算
+          const inv_a = d / det;
+          const inv_b = -b / det;
+          const inv_c = -c / det;
+          const inv_d = a / det;
+          const inv_e = (c * f - d * e) / det;
+          const inv_f = (b * e - a * f) / det;
+          
+          // 应用逆变换
+          const orig_x = inv_a * x + inv_c * y + inv_e;
+          const orig_y = inv_b * x + inv_d * y + inv_f;
+          
+          return { x: orig_x, y: orig_y };
+          
+        } catch (error) {
+          console.error('逆变换计算失败:', error);
+          return { x: x, y: y };
+        }
+      }
+      
+      // SVG路线管理函数
+      window.clearSvgRoute = function() {
+        if (currentSvgOverlay) {
+          map.removeLayer(currentSvgOverlay);
+          currentSvgOverlay = null;
+          console.log('SVG路线覆盖层已清除');
+        }
+      };
+
+      // 在Leaflet地图完全初始化后，尝试建立与Qt的桥接
+      map.whenReady(initializeQtBridge);
+
+    </script>
+  </body>
+</html>

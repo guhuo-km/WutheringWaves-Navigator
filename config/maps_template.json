@@ -1,0 +1,16 @@
+[
+    {
+        "name": "example_map.jpg",
+        "tiled": false,
+        "width": 2048,
+        "height": 2048,
+        "maxZoom": 0
+    },
+    {
+        "name": "example_tiled_map",
+        "tiled": true,
+        "width": 4096,
+        "height": 4096,
+        "maxZoom": 5
+    }
+]

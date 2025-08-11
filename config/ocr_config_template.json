@@ -1,0 +1,20 @@
+{
+  "confidence_threshold": 0.35,
+  "ocr_interval": 1000,
+  "model_path": "models/coord_ocr.pt",
+  "ocr_capture_area": {
+    "x": 21,
+    "y": 1053,
+    "width": 437,
+    "height": 27
+  },
+  "advanced_ocr_settings": {
+    "max_speed_threshold": 1500,
+    "lost_threshold_frames": 3,
+    "z_axis_threshold": 80,
+    "verbose_debug": true
+  },
+  "target_window_name": "",
+  "screenshot_mode": "BitBlt",
+  "auto_jump_enabled": true
+}
