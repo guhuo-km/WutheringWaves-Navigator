@@ -121,7 +121,20 @@ class OCRRegionCalibrator(QWidget):
             self.draw_magnifier(painter)
 
     def draw_info_box(self, painter):
-        info_text = f"OCR区域: {self.selection_rect.x()}, {self.selection_rect.y()} - {self.selection_rect.width()}x{self.selection_rect.height()}"
+        rect = self.selection_rect
+        device_pixel_ratio = self.screen.devicePixelRatio()
+        
+        # 计算物理坐标
+        physical_x = int(rect.x() * device_pixel_ratio)
+        physical_y = int(rect.y() * device_pixel_ratio)
+        physical_width = int(rect.width() * device_pixel_ratio)
+        physical_height = int(rect.height() * device_pixel_ratio)
+        
+        # 创建显示文本（显示物理坐标，这是实际截图坐标）
+        info_text = f"OCR区域: {physical_x}, {physical_y} - {physical_width}x{physical_height}"
+        if device_pixel_ratio != 1.0:
+            info_text += f" (缩放: {device_pixel_ratio})"
+        
         font = QFont("Arial", 10)
         painter.setFont(font)
         metrics = painter.fontMetrics()
@@ -243,9 +256,22 @@ class OCRRegionCalibrator(QWidget):
     def confirm_selection(self):
         """确认选择区域"""
         rect = self.selection_rect
-        print(f"OCR区域已选择: x={rect.x()}, y={rect.y()}, width={rect.width()}, height={rect.height()}")
-        # 发射信号
-        self.region_selected.emit(rect.x(), rect.y(), rect.width(), rect.height())
+        
+        # 获取DPI缩放比例
+        device_pixel_ratio = self.screen.devicePixelRatio()
+        
+        # 将逻辑坐标转换为物理坐标
+        physical_x = int(rect.x() * device_pixel_ratio)
+        physical_y = int(rect.y() * device_pixel_ratio)
+        physical_width = int(rect.width() * device_pixel_ratio)
+        physical_height = int(rect.height() * device_pixel_ratio)
+        
+        print(f"OCR区域已选择 (逻辑坐标): x={rect.x()}, y={rect.y()}, width={rect.width()}, height={rect.height()}")
+        print(f"DPI缩放比例: {device_pixel_ratio}")
+        print(f"OCR区域转换 (物理坐标): x={physical_x}, y={physical_y}, width={physical_width}, height={physical_height}")
+        
+        # 发射物理坐标信号
+        self.region_selected.emit(physical_x, physical_y, physical_width, physical_height)
         self.close()
     
     def cancel_selection(self):
