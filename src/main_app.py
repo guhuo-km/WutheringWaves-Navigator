@@ -1,5 +1,6 @@
 import sys
 import os
+import multiprocessing
 import numpy as np
 import json
 import threading
@@ -4374,6 +4375,11 @@ class MapCalibrationMainWindow(QMainWindow):
             event.accept()  # 确保窗口能正常关闭
 
 if __name__ == "__main__":
+    # 【核心修复】必须放在第一行！
+    # 这行代码会检查当前是否是作为"子进程"启动的。
+    # 如果是子进程（比如 OCR 启动的），它会在这里拦截并执行工作，然后退出，不会继续往下执行启动 GUI 的代码。
+    multiprocessing.freeze_support()
+
     # 确保工作目录是脚本所在目录
     import os
     script_dir = os.path.dirname(os.path.abspath(__file__))
