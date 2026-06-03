@@ -63,6 +63,7 @@ captures/
 temp_images/
 
 # Configuration files with sensitive data (if any)
+.local/
 .env
 .env.local
 config/local_*.json

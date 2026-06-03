@@ -26,11 +26,8 @@ languages/                   i18n 文本
 config/                      配置模板
 scripts/                     构建、安装器和 release 元数据脚本
 tests/                       pytest 测试
-docs/                        当前公开文档
 version.json                 版本信息
 ```
-
-更详细的运行时结构见 `docs/project_structure.md`。
 
 ## 环境
 
