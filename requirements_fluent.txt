@@ -1,0 +1,54 @@
+# 呜呜大地图导航器 - 依赖包列表
+
+# ==================== 核心 UI 框架 ====================
+PySide6>=6.5.0
+
+# Fluent Design UI 组件库 (新增)
+PySide6-Fluent-Widgets>=1.10.5
+PySideSix-Frameless-Window>=0.4.0
+
+# ==================== 图像处理 ====================
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# ==================== OCR 和机器学习 ====================
+onnxruntime>=1.23.0
+
+# ==================== 模板渲染 ====================
+jinja2>=3.1.0
+
+# ==================== HTTP 请求 ====================
+requests>=2.31.0
+
+# ==================== 全局快捷键 ====================
+keyboard>=0.13.5
+pynput>=1.7.6
+
+# ==================== Windows API ====================
+pywin32>=306
+
+# ==================== 打包工具 ====================
+pyinstaller>=5.13.0
+
+# ==================== 可选依赖（用于开发）====================
+# pytest>=7.4.0  # 测试框架
+# black>=23.7.0  # 代码格式化
+# flake8>=6.0.0  # 代码检查
+
+# ==================== 安装说明 ====================
+#
+# 方案1: 完整安装（推荐）
+# pip install -r requirements_fluent.txt
+#
+# 方案2: 安装 Fluent Widgets 完整版（包含毛玻璃效果）
+# pip install "PySide6-Fluent-Widgets[full]" -i https://pypi.org/simple/
+#
+# 方案3: 使用本地源码安装 Fluent Widgets
+# cd PyQt-Fluent-Widgets-PySide6
+# pip install -e .
+#
+# 注意:
+# - 不要同时安装 PyQt-Fluent-Widgets 和 PySide6-Fluent-Widgets
+# - 它们的包名都是 qfluentwidgets，会冲突
+# - 本项目使用 PySide6，请安装 PySide6-Fluent-Widgets

@@ -26,7 +26,7 @@ if exist "smart_build.py" (
     echo [OK] Smart build script found
     echo.
     echo [START] Running smart build...
-    python smart_build.py
+    python smart_build.py %*
 ) else (
     echo [SEARCH] Smart build script not found in current directory
     echo [SEARCH] Trying to locate from project...
@@ -34,13 +34,13 @@ if exist "smart_build.py" (
     :: Try to find the script in common locations
     if exist "..\smart_build.py" (
         echo [FOUND] Found script in parent directory
-        python ..\smart_build.py
+        python ..\smart_build.py %*
     ) else if exist "scripts\smart_build.py" (
         echo [FOUND] Found script in scripts directory
-        python scripts\smart_build.py
+        python scripts\smart_build.py %*
     ) else if exist "..\scripts\smart_build.py" (
         echo [FOUND] Found script in parent\scripts directory
-        python ..\scripts\smart_build.py
+        python ..\scripts\smart_build.py %*
     ) else (
         echo [ERROR] Cannot find smart_build.py script!
         echo.

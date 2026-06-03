@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>游戏地图工具 (本地瓦片版)</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    />
+    <style>
+      html, body, #map { height: 100%; width: 100%; margin: 0; padding: 0; background-color: #333; overflow: hidden; }
+      #panel-container { position: fixed; top: 10px; right: 10px; z-index: 1000; display: flex; align-items: flex-start; transition: transform 0.35s ease-in-out; }
+      #panel-container.is-hidden { transform: translateX(292px); }
+      #panel-toggle-btn { width: 30px; height: 50px; line-height: 50px; text-align: center; font-size: 20px; background: white; cursor: pointer; border-radius: 8px 0 0 8px; box-shadow: -2px 2px 8px rgba(0, 0, 0, 0.15); border: 1px solid #ccc; border-right: none; order: 1; }
+      #control-panel { width: 250px; background: rgba(255, 255, 255, 0.95); padding: 15px; border-radius: 0 8px 8px 0; box-shadow: 2px 2px 8px rgba(0, 0, 0, 0.15); border: 1px solid #ccc; order: 2; }
+      #control-panel h4 { margin: 0 0 10px 0; padding-bottom: 10px; border-bottom: 1px solid #ccc; }
+      .map-list-item { display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; }
+      .map-list-item label { cursor: pointer; }
+
+      /* 瓦片图像无损放大样式 - 解决拉伸模糊问题 */
+      .leaflet-tile-container img {
+        image-rendering: -moz-crisp-edges;      /* Firefox */
+        image-rendering: -webkit-crisp-edges;   /* Webkit */
+        image-rendering: pixelated;             /* Chrome */
+        image-rendering: crisp-edges;           /* 标准属性 */
+        image-rendering: -webkit-optimize-contrast; /* Safari */
+        -ms-interpolation-mode: nearest-neighbor; /* IE */
+      }
+
+      /* 确保瓦片图像保持锐利 */
+      .leaflet-tile {
+        image-rendering: -moz-crisp-edges;
+        image-rendering: -webkit-crisp-edges;
+        image-rendering: pixelated;
+        image-rendering: crisp-edges;
+        image-rendering: -webkit-optimize-contrast;
+        -ms-interpolation-mode: nearest-neighbor;
+        -ms-interpolation-mode: nearest-neighbor;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <div id="panel-container">
+      <div id="panel-toggle-btn" title="切换面板">→</div>
+      <div id="control-panel"><h4>地图加载中...</h4></div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+      // --- 1. 初始化和状态管理 ---
+      let mapData = [];
+      let currentMapInfo = null;
+      let currentLayer = null;
+
+      // 添加Promise以处理异步初始化竞争条件
+      let initResolve;
+      const initializationPromise = new Promise((resolve) => {
+          initResolve = resolve;
+      });
+
+      const map = L.map("map", {
+        crs: L.CRS.Simple,
+        minZoom: -5,
+        maxZoom: 10,
+      });
+      window.discoveredMap = map; // 统一接口，方便Python端直接注入指令
+
+      const panelContainer = document.getElementById("panel-container");
+      const controlPanel = document.getElementById("control-panel");
+      const toggleBtn = document.getElementById("panel-toggle-btn");
+
+      // --- 2. 核心功能：加载地图 ---
+      async function loadMap(mapName, triggeredByServer = false) {
+        // 等待初始化完成
+        await initializationPromise;
+
+        let mapInfo = mapData.find(m => m.name === mapName);
+
+        // 如果精确匹配失败，尝试模糊匹配（去除扩展名）
+        if (!mapInfo) {
+          const nameWithoutExt = mapName.replace(/\.[^/.]+$/, "");
+          mapInfo = mapData.find(m => {
+            const mapNameWithoutExt = m.name.replace(/\.[^/.]+$/, "");
+            return mapNameWithoutExt === nameWithoutExt || m.name === nameWithoutExt;
+          });
+        }
+
+        if (!mapInfo) {
+          console.warn(`未找到名为 "${mapName}" 的地图信息！`);
+          return;
+        }
+
+        if (currentLayer) map.removeLayer(currentLayer);
+
+        currentMapInfo = mapInfo;
+
+        // ========== 新增：更新URL（不刷新页面）==========
+        try {
+            const newUrl = `${window.location.pathname}?map=${encodeURIComponent(mapInfo.name)}`;
+            history.replaceState({ map: mapInfo.name }, '', newUrl);
+            console.log(`URL已更新: ${newUrl}`);
+        } catch (e) {
+            console.warn('URL更新/通知失败:', e);
+        }
+        // ================================================
+
+        const bounds = [[0, 0], [-mapInfo.height, mapInfo.width]];
+
+        if (mapInfo.tiled) {
+          currentLayer = L.tileLayer(`tiles/${mapInfo.name}/{z}/{x}/{y}.png`, {
+            tileSize: 256,
+            tms: false,
+            noWrap: true,
+            bounds: bounds,
+            minZoom: map.getMinZoom(),
+            maxZoom: map.getMaxZoom(),
+            minNativeZoom: 0,
+            maxNativeZoom: mapInfo.maxZoom, // 保持瓦片的真实最大等级
+            errorTileUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' // 透明的1x1像素图片作为错误瓦片
+          }).addTo(map);
+          // 如果不是由服务器触发的，或者地图从未初始化视图，则设置默认视图
+          if (!triggeredByServer || map.getZoom() === undefined) {
+            map.setView([0, 0], 0);
+          }
+        } else {
+          const imageUrl = `images/${mapInfo.name}`;
+          currentLayer = L.imageOverlay(imageUrl, bounds).addTo(map);
+          const img = new Image();
+          img.src = imageUrl;
+          img.onerror = () => {
+              alert(`图片 "${imageUrl}" 加载失败！请确保文件在 'images' 目录下且文件名正确。`);
+          };
+          if (!triggeredByServer || map.getZoom() === undefined) {
+            map.fitBounds(bounds);
+          }
+        }
+
+        updateControlPanel();
+      }
+
+      // --- 3. 核心功能：更新和渲染控制面板 ---
+      function updateControlPanel() {
+        controlPanel.innerHTML = "";
+        const title = document.createElement("h4");
+        title.textContent = "地图控制器";
+        controlPanel.appendChild(title);
+        mapData.forEach((mapInfo) => {
+          const itemDiv = document.createElement("div");
+          itemDiv.className = "map-list-item";
+          const label = document.createElement("label");
+          const radio = document.createElement("input");
+          radio.type = "radio";
+          radio.name = "map-choice";
+          radio.value = mapInfo.name;
+          if (currentMapInfo && mapInfo.name === currentMapInfo.name) {
+            radio.checked = true;
+          }
+          radio.onchange = () => loadMap(mapInfo.name); // 用户点击时，默认 triggeredByServer=false
+          label.appendChild(radio);
+          label.appendChild(document.createTextNode(` ${mapInfo.name}${mapInfo.tiled ? ' (瓦片)' : ''}`));
+          itemDiv.appendChild(label);
+          controlPanel.appendChild(itemDiv);
+        });
+      }
+
+      // --- 4. 切换面板显隐 ---
+      toggleBtn.addEventListener("click", () => {
+        panelContainer.classList.toggle("is-hidden");
+        toggleBtn.textContent = panelContainer.classList.contains("is-hidden") ? "←" : "→";
+        toggleBtn.title = panelContainer.classList.contains("is-hidden") ? "显示面板" : "隐藏面板";
+      });
+
+      // --- 5. 初始化应用 ---
+      async function initializeApp() {
+        try {
+          const response = await fetch('maps.json?t=' + new Date().getTime());
+          if (!response.ok) {
+            throw new Error('无法加载 maps.json，请先运行 tile_generator.py 添加地图。');
+          }
+          mapData = await response.json();
+          initResolve(); // 标记初始化完成
+
+          if (mapData.length > 0) {
+            // ========== 新增：检查URL参数 ==========
+            const urlParams = new URLSearchParams(window.location.search);
+            const mapFromUrl = urlParams.get('map');
+
+            if (mapFromUrl) {
+              // URL中指定了地图名称
+              const targetMap = mapData.find(m => m.name === mapFromUrl);
+              if (targetMap) {
+                console.log(`从URL加载地图: ${mapFromUrl}`);
+                loadMap(mapFromUrl, true);
+              } else {
+                console.warn(`URL指定的地图 "${mapFromUrl}" 不存在，加载默认地图`);
+                loadMap(mapData[0].name, true);
+              }
+            } else {
+              // 没有URL参数，加载第一个地图
+              loadMap(mapData[0].name, true);
+            }
+            // ========================================
+          } else {
+            updateControlPanel();
+            controlPanel.innerHTML = '<h4>无可用地图</h4><p>请使用 <code>python tile_generator.py</code> 添加地图。</p>'
+          }
+        } catch (error) {
+          console.error(error);
+          controlPanel.innerHTML = `<h4>错误</h4><p style="color:red;">${error.message}</p>`;
+        }
+      }
+
+      // --- 6. 绑定事件 ---
+      initializeApp();
+
+      map.on("click", (e) =>
+        console.log(`坐标: Y=${Math.round(-e.latlng.lat)}, X=${Math.round(e.latlng.lng)}`)
+      );
+
+      // 暴露公共API供Python QWebEngineView.runJavaScript() 调用
+      window.loadMap = loadMap;
+      window.getCurrentMapName = function() {
+        return currentMapInfo ? currentMapInfo.name : null;
+      };
+
+      // ✅ 新增：暴露地图列表重新加载方法
+      window.reloadMapList = async function() {
+        try {
+            const response = await fetch('maps.json?t=' + new Date().getTime());
+            if (!response.ok) {
+                throw new Error('无法重新加载 maps.json');
+            }
+            const newMapData = await response.json();
+
+            // 保存当前地图名称
+            const currentMapName = currentMapInfo ? currentMapInfo.name : null;
+
+            // 更新地图数据
+            mapData = newMapData;
+
+            // 刷新控制面板
+            updateControlPanel();
+
+            // 如果当前地图仍存在，保持选中状态
+            if (currentMapName && mapData.find(m => m.name === currentMapName)) {
+                console.log(`地图列表已更新，当前地图 ${currentMapName} 保持不变`);
+            } else if (mapData.length > 0) {
+                // 当前地图已被删除或首次加载，加载第一个地图
+                loadMap(mapData[0].name, true);
+            } else {
+                // 没有地图了
+                controlPanel.innerHTML = '<h4>无可用地图</h4><p>请使用 <code>python tile_generator.py</code> 添加地图。</p>';
+                if (currentLayer) {
+                    map.removeLayer(currentLayer);
+                    currentLayer = null;
+                }
+                currentMapInfo = null;
+            }
+
+            console.log('地图列表已重新加载');
+        } catch (error) {
+            console.error('重新加载地图列表失败:', error);
+        }
+      };
+
+      window.initializeApp = initializeApp;  // 供Python刷新地图列表
+      // ====================================================
+
+    </script>
+  </body>
+</html>

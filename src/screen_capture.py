@@ -5,14 +5,16 @@ Screen Capture Module for WutheringWaves Navigator
 屏幕截图模块
 """
 
+import os
 import numpy as np
 import win32gui
 import win32ui
 import win32con
 import win32api
+import win32process
 from PIL import Image
 import cv2
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, List
 import logging
 
 
@@ -24,6 +26,29 @@ class ScreenCapture:
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
+
+    @staticmethod
+    def _is_own_app_window(title: str, process_name: str) -> bool:
+        """Exclude this navigator app window from game auto-detection."""
+        title_norm = (title or "").lower().replace(" ", "")
+        proc_norm = (process_name or "").lower().replace(" ", "")
+
+        own_title_keywords = [
+            "wutheringwaves-navigator",
+            "wutheringwavesnavigator",
+            "呜呜大地图",
+            "navigator",
+        ]
+        own_process_keywords = [
+            "wutheringwaves-navigator-smart.exe",
+            "wutheringwaves-navigator.exe",
+        ]
+
+        if any(k in title_norm for k in own_title_keywords):
+            return True
+        if any(k in proc_norm for k in own_process_keywords):
+            return True
+        return False
     
     def capture_region(self, x: int, y: int, width: int, height: int, 
                       mode: str = 'BitBlt', target_window_name: str = '') -> Optional[np.ndarray]:
@@ -52,6 +77,10 @@ class ScreenCapture:
         """
         使用BitBlt方式捕获屏幕区域
         """
+        screen_dc = None
+        mem_dc = None
+        save_dc = None
+        save_bitmap = None
         try:
             # 获取屏幕DC
             screen_dc = win32gui.GetDC(0)
@@ -78,24 +107,45 @@ class ScreenCapture:
             
             # 转换BGRA到BGR
             image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-            
-            # 清理资源
-            win32gui.DeleteObject(save_bitmap.GetHandle())
-            save_dc.DeleteDC()
-            mem_dc.DeleteDC()
-            win32gui.ReleaseDC(0, screen_dc)
-            
+
             return image
             
         except Exception as e:
             self.logger.error(f"BitBlt截图失败: {e}")
             return None
+        finally:
+            if save_bitmap is not None:
+                try:
+                    win32gui.DeleteObject(save_bitmap.GetHandle())
+                except Exception:
+                    pass
+            if save_dc is not None:
+                try:
+                    save_dc.DeleteDC()
+                except Exception:
+                    pass
+            if mem_dc is not None:
+                try:
+                    mem_dc.DeleteDC()
+                except Exception:
+                    pass
+            if screen_dc is not None:
+                try:
+                    win32gui.ReleaseDC(0, screen_dc)
+                except Exception:
+                    pass
     
     def _capture_window_region(self, x: int, y: int, width: int, height: int, 
                               window_name: str) -> Optional[np.ndarray]:
         """
         使用PrintWindow方式捕获指定窗口的区域
         """
+        hwnd = None
+        window_dc = None
+        mem_dc = None
+        save_dc = None
+        save_bitmap = None
+        fallback_to_screen = False
         try:
             # 查找窗口
             hwnd = win32gui.FindWindow(None, window_name)
@@ -148,27 +198,40 @@ class ScreenCapture:
                 
                 if region_x < region_x2 and region_y < region_y2:
                     cropped_image = image[region_y:region_y2, region_x:region_x2]
-                    
-                    # 清理资源
-                    win32gui.DeleteObject(save_bitmap.GetHandle())
-                    save_dc.DeleteDC()
-                    mem_dc.DeleteDC()
-                    win32gui.ReleaseDC(hwnd, window_dc)
-                    
+
                     return cropped_image
-            
-            # 清理资源
-            win32gui.DeleteObject(save_bitmap.GetHandle())
-            save_dc.DeleteDC()
-            mem_dc.DeleteDC()
-            win32gui.ReleaseDC(hwnd, window_dc)
-            
+
             # 如果PrintWindow失败，降级到BitBlt
-            return self._capture_screen_region(x, y, width, height)
+            fallback_to_screen = True
             
         except Exception as e:
             self.logger.error(f"PrintWindow截图失败: {e}")
+            fallback_to_screen = True
+        finally:
+            if save_bitmap is not None:
+                try:
+                    win32gui.DeleteObject(save_bitmap.GetHandle())
+                except Exception:
+                    pass
+            if save_dc is not None:
+                try:
+                    save_dc.DeleteDC()
+                except Exception:
+                    pass
+            if mem_dc is not None:
+                try:
+                    mem_dc.DeleteDC()
+                except Exception:
+                    pass
+            if hwnd and window_dc is not None:
+                try:
+                    win32gui.ReleaseDC(hwnd, window_dc)
+                except Exception:
+                    pass
+
+        if fallback_to_screen:
             return self._capture_screen_region(x, y, width, height)  # 降级到屏幕截图
+        return None
     
     def _find_window_partial(self, partial_name: str) -> Optional[int]:
         """
@@ -217,6 +280,9 @@ class ScreenCapture:
         def enum_windows_callback(hwnd, windows):
             if win32gui.IsWindowVisible(hwnd):
                 window_text = win32gui.GetWindowText(hwnd)
+                process_name = self._get_process_name(hwnd)
+                if self._is_own_app_window(window_text, process_name):
+                    return True
                 for game_name in game_names:
                     if game_name.lower() in window_text.lower():
                         windows.append((window_text, hwnd))
@@ -228,6 +294,86 @@ class ScreenCapture:
         if windows:
             return windows[0]  # 返回第一个匹配的窗口
         return None
+
+    def find_best_game_window(self, keywords: Optional[List[str]] = None) -> Optional[Dict[str, object]]:
+        """
+        查找匹配度最高的游戏窗口（标题关键字优先，其次进程名，再面积）
+
+        Returns:
+            dict: {
+                'title': str,
+                'hwnd': int,
+                'rect': (left, top, right, bottom),
+                'width': int,
+                'height': int,
+                'area': int,
+                'process_name': str,
+                'mode': 'fullscreen'|'borderless'|'windowed',
+                'title_hits': int,
+                'process_hits': int
+            }
+        """
+        if keywords is None:
+            keywords = ['鸣潮', 'Wuthering Waves']
+
+        normalized_keywords = [kw.lower().replace(" ", "") for kw in keywords if kw]
+        candidates: List[Dict[str, object]] = []
+
+        def enum_windows_callback(hwnd, windows):
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+
+            title = win32gui.GetWindowText(hwnd)
+            if not title or not title.strip():
+                return True
+
+            rect = win32gui.GetWindowRect(hwnd)
+            width = rect[2] - rect[0]
+            height = rect[3] - rect[1]
+            if width <= 0 or height <= 0:
+                return True
+
+            title_norm = title.lower().replace(" ", "")
+            title_hits = sum(1 for kw in normalized_keywords if kw in title_norm)
+
+            process_name = self._get_process_name(hwnd)
+            if self._is_own_app_window(title, process_name):
+                return True
+            proc_norm = process_name.lower().replace(" ", "") if process_name else ""
+            process_hits = sum(1 for kw in normalized_keywords if kw in proc_norm)
+
+            if title_hits == 0 and process_hits == 0:
+                return True
+
+            area = width * height
+            style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+            monitor_rect = self._get_monitor_rect(hwnd)
+            mode = self._detect_window_mode(rect, style, monitor_rect)
+
+            windows.append({
+                'title': title,
+                'hwnd': hwnd,
+                'rect': rect,
+                'width': width,
+                'height': height,
+                'area': area,
+                'process_name': process_name,
+                'mode': mode,
+                'title_hits': title_hits,
+                'process_hits': process_hits
+            })
+            return True
+
+        win32gui.EnumWindows(enum_windows_callback, candidates)
+
+        if not candidates:
+            return None
+
+        candidates.sort(
+            key=lambda w: (w['title_hits'], w['process_hits'], w['area']),
+            reverse=True
+        )
+        return candidates[0]
     
     def get_all_windows(self) -> list:
         """
@@ -253,6 +399,55 @@ class ScreenCapture:
         # 按窗口名称排序
         windows.sort(key=lambda x: x[0])
         return windows
+
+    def _get_process_name(self, hwnd: int) -> str:
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if not pid:
+                return ""
+            try:
+                process_handle = win32api.OpenProcess(
+                    win32con.PROCESS_QUERY_LIMITED_INFORMATION | win32con.PROCESS_VM_READ,
+                    False,
+                    pid
+                )
+            except Exception:
+                process_handle = win32api.OpenProcess(
+                    win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ,
+                    False,
+                    pid
+                )
+            try:
+                exe_path = win32process.GetModuleFileNameEx(process_handle, 0)
+                return os.path.basename(exe_path)
+            finally:
+                win32api.CloseHandle(process_handle)
+        except Exception:
+            return ""
+
+    def _get_monitor_rect(self, hwnd: int) -> Tuple[int, int, int, int]:
+        try:
+            monitor = win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+            info = win32api.GetMonitorInfo(monitor)
+            return info.get("Monitor", (0, 0, 0, 0))
+        except Exception:
+            return (0, 0, 0, 0)
+
+    def _detect_window_mode(self, rect: Tuple[int, int, int, int], style: int,
+                            monitor_rect: Tuple[int, int, int, int]) -> str:
+        left, top, right, bottom = rect
+        mon_left, mon_top, mon_right, mon_bottom = monitor_rect
+
+        tolerance = 2
+        if (abs(left - mon_left) <= tolerance and abs(top - mon_top) <= tolerance and
+                abs(right - mon_right) <= tolerance and abs(bottom - mon_bottom) <= tolerance):
+            return "fullscreen"
+
+        has_caption = bool(style & win32con.WS_CAPTION)
+        has_thick = bool(style & win32con.WS_THICKFRAME)
+        if not has_caption and not has_thick:
+            return "borderless"
+        return "windowed"
 
 
 # 全局截图实例

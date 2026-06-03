@@ -7,15 +7,16 @@
 
 import math
 from PySide6.QtWidgets import QWidget
-from PySide6.QtCore import Qt, Signal, QTimer, QObject
+from PySide6.QtCore import Qt, Signal, QTimer, QObject, QRectF
 from PySide6.QtGui import QPainter, QPen, QBrush, QColor
 
 
 class TransparentOverlay(QWidget):
     """透明覆盖层控件"""
     
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, resource_probe=None):
         super().__init__(parent)
+        self._resource_probe = resource_probe
         
         # 设置窗口属性：透明背景、鼠标穿透
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -24,19 +25,17 @@ class TransparentOverlay(QWidget):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         
         # 圆点属性
-        self.circle_radius = 10  # 圆点半径 (1-50)
+        self.circle_radius = 5.0  # 圆点半径（默认 5px，对应 50.0%）
         self.circle_color = QColor(255, 0, 0)  # 默认红色
         self.z_color_mapping = False  # Z轴颜色映射开关
         self.current_z_value = 0  # 当前Z值
         
-        # 动画定时器（用于颜色变化动画）
-        self.animation_timer = QTimer()
-        self.animation_timer.timeout.connect(self.update)
-        self.animation_timer.start(50)  # 20fps更新
+        # 当前覆盖层没有连续动画；半径/Z值变化时由对应 setter 主动 update。
+        self.animation_timer = None
         
     def set_circle_radius(self, radius):
         """设置圆点半径"""
-        self.circle_radius = max(1, min(50, radius))
+        self.circle_radius = max(0.1, min(50.0, float(radius)))
         self.update()
     
     def set_z_color_mapping(self, enabled):
@@ -77,6 +76,8 @@ class TransparentOverlay(QWidget):
     
     def paintEvent(self, event):
         """绘制事件"""
+        if self._resource_probe:
+            self._resource_probe.count("overlay.paint")
         painter = QPainter(self)
         # 不使用抗锯齿，确保边缘硬度100%
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
@@ -90,10 +91,14 @@ class TransparentOverlay(QWidget):
             # 只绘制主圆点，边缘硬度100%，无阴影效果
             painter.setPen(QPen(self.circle_color, 1))
             painter.setBrush(QBrush(self.circle_color))
-            painter.drawEllipse(center_x - self.circle_radius, 
-                              center_y - self.circle_radius,
-                              self.circle_radius * 2, 
-                              self.circle_radius * 2)
+            radius = float(self.circle_radius)
+            rect = QRectF(
+                float(center_x) - radius,
+                float(center_y) - radius,
+                radius * 2.0,
+                radius * 2.0,
+            )
+            painter.drawEllipse(rect)
     
     def resizeEvent(self, event):
         """窗口大小改变事件"""
@@ -104,16 +109,17 @@ class TransparentOverlay(QWidget):
 class OverlayManager(QObject):
     """覆盖层管理器"""
     
-    def __init__(self, web_view):
+    def __init__(self, web_view, resource_probe=None):
         super().__init__()
         self.web_view = web_view
+        self._resource_probe = resource_probe
         self.overlay = None
         self.setup_overlay()
     
     def setup_overlay(self):
         """设置覆盖层"""
         # 创建透明覆盖层，设置web_view为父控件
-        self.overlay = TransparentOverlay(self.web_view)
+        self.overlay = TransparentOverlay(self.web_view, self._resource_probe)
         
         # 初始化覆盖层大小和位置
         self.update_overlay_geometry()
@@ -123,12 +129,14 @@ class OverlayManager(QObject):
             self.web_view.installEventFilter(self)
             
         # 创建定时器用于实时更新位置
-        self.position_timer = QTimer()
+        self.position_timer = QTimer(self)
         self.position_timer.timeout.connect(self.update_overlay_geometry)
         self.position_timer.start(50)  # 每50ms更新一次位置
     
     def update_overlay_geometry(self):
         """更新覆盖层的几何位置"""
+        if self._resource_probe:
+            self._resource_probe.count("overlay.geometry")
         if not self.overlay or not self.web_view:
             return
         
@@ -188,6 +196,10 @@ class OverlayManager(QObject):
     
     def cleanup(self):
         """清理资源"""
+        if self.overlay and self.overlay.animation_timer:
+            self.overlay.animation_timer.stop()
+            self.overlay.animation_timer = None
+
         # 停止定时器
         if hasattr(self, 'position_timer') and self.position_timer:
             self.position_timer.stop()
