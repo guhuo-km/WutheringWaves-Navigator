@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>游戏地图工具 (终极交互版 - 瓦片优化 - 状态同步)</title>
+    <title>游戏地图工具 (本地瓦片版)</title>
     <link
       rel="stylesheet"
       href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
@@ -17,8 +17,7 @@
       #control-panel h4 { margin: 0 0 10px 0; padding-bottom: 10px; border-bottom: 1px solid #ccc; }
       .map-list-item { display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; }
       .map-list-item label { cursor: pointer; }
-      #sync-status { font-size: 12px; color: #888; margin-top: 10px; text-align: center; }
-      
+
       /* 瓦片图像无损放大样式 - 解决拉伸模糊问题 */
       .leaflet-tile-container img {
         image-rendering: -moz-crisp-edges;      /* Firefox */
@@ -53,8 +52,6 @@
       let mapData = [];
       let currentMapInfo = null;
       let currentLayer = null;
-      let ws; // WebSocket 实例
-      let isUpdatingFromServer = false; // 防止更新循环的标志
       let currentSvgOverlay = null; // 用于管理当前叠加的SVG
 
       const map = L.map("map", {
@@ -62,6 +59,7 @@
         minZoom: -5,
         maxZoom: 10,
       });
+      window.discoveredMap = map; // 统一接口，方便Python端直接注入指令
 
       const panelContainer = document.getElementById("panel-container");
       const controlPanel = document.getElementById("control-panel");
@@ -84,15 +82,29 @@
           console.warn(`未找到名为 "${mapName}" 的地图信息！`);
           return;
         }
-        
-        // 如果是由用户操作触发的，则通知服务器
-        if (!triggeredByServer && ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'mapChange', mapName: mapName }));
-        }
 
         if (currentLayer) map.removeLayer(currentLayer);
 
         currentMapInfo = mapInfo;
+
+        // ========== 新增：更新URL（不刷新页面）==========
+        try {
+            const newUrl = `${window.location.pathname}?map=${encodeURIComponent(mapInfo.name)}`;
+            history.replaceState({ map: mapInfo.name }, '', newUrl);
+            console.log(`URL已更新: ${newUrl}`);
+
+            // ✅ 新增：通过 QWebChannel 主动通知 Python 地图已切换
+            if (window.py_backend && typeof window.py_backend.localMapChanged === 'function') {
+                 window.py_backend.localMapChanged(mapInfo.name);
+                 console.log(`已通过 QWebChannel 通知 Python：地图切换到 ${mapInfo.name}`);
+            } else {
+                 // 尝试旧的通知方式作为回退
+                 notifyLocalMapChanged(mapInfo.name);
+            }
+        } catch (e) {
+            console.warn('URL更新/通知失败:', e);
+        }
+        // ================================================
 
         const bounds = [[0, 0], [-mapInfo.height, mapInfo.width]];
 
@@ -151,10 +163,6 @@
           itemDiv.appendChild(label);
           controlPanel.appendChild(itemDiv);
         });
-        const syncStatus = document.createElement("div");
-        syncStatus.id = "sync-status";
-        syncStatus.textContent = "正在连接同步服务器...";
-        controlPanel.appendChild(syncStatus);
       }
 
       // --- 4. 切换面板显隐 ---
@@ -172,124 +180,45 @@
             throw new Error('无法加载 maps.json，请先运行 tile_generator.py 添加地图。');
           }
           mapData = await response.json();
+
           if (mapData.length > 0) {
-            // 初始加载由服务器状态决定，或加载第一个
-            loadMap(mapData[0].name, true); // 初始加载标记为服务器行为，避免广播
+            // ========== 新增：检查URL参数 ==========
+            const urlParams = new URLSearchParams(window.location.search);
+            const mapFromUrl = urlParams.get('map');
+
+            if (mapFromUrl) {
+              // URL中指定了地图名称
+              const targetMap = mapData.find(m => m.name === mapFromUrl);
+              if (targetMap) {
+                console.log(`从URL加载地图: ${mapFromUrl}`);
+                loadMap(mapFromUrl, true);
+              } else {
+                console.warn(`URL指定的地图 "${mapFromUrl}" 不存在，加载默认地图`);
+                loadMap(mapData[0].name, true);
+              }
+            } else {
+              // 没有URL参数，加载第一个地图
+              loadMap(mapData[0].name, true);
+            }
+            // ========================================
           } else {
             updateControlPanel();
             controlPanel.innerHTML = '<h4>无可用地图</h4><p>请使用 <code>python tile_generator.py</code> 添加地图。</p>'
           }
-          setupWebSocket(); // 在地图数据加载后设置WebSocket
         } catch (error) {
           console.error(error);
           controlPanel.innerHTML = `<h4>错误</h4><p style="color:red;">${error.message}</p>`;
         }
       }
-      
-      // --- 6. 实时同步功能 (WebSocket) ---
-      function setupWebSocket() {
-        // --- 修改这里的地址以匹配你的WebSocket服务器 ---
-        ws = new WebSocket('ws://localhost:8080/ws'); 
-        const statusEl = document.getElementById("sync-status");
 
-        ws.onopen = () => {
-          console.log('WebSocket连接成功!');
-          if(statusEl) statusEl.textContent = '同步已连接';
-          if(statusEl) statusEl.style.color = 'green';
-        };
-
-        ws.onmessage = (event) => {
-          const data = JSON.parse(event.data);
-          console.log('收到数据:', data);
-
-          isUpdatingFromServer = true; // 开始处理服务器数据，设置标志
-
-          switch (data.type) {
-            case 'mapChange':
-              if (data.mapName !== currentMapInfo.name) {
-                  console.log(`从服务器切换地图到: ${data.mapName}`);
-                  loadMap(data.mapName, true); // 标记为服务器触发
-              }
-              // 地图切换后，通常会附带位置信息
-              if (data.lat !== undefined && data.lng !== undefined && data.zoom !== undefined) {
-                  map.setView([data.lat, data.lng], data.zoom, { animate: true });
-              }
-              break;
-            case 'stateUpdate':
-              map.setView([data.lat, data.lng], data.zoom, { animate: true });
-              break;
-            // 可选：处理初始连接时服务器发送的完整状态
-            case 'initialState':
-              console.log(`同步初始状态: ${data.mapName}`);
-              loadMap(data.mapName, true);
-              map.setView([data.lat, data.lng], data.zoom);
-              break;
-            // --- 新增指令处理 ---
-            case 'panBy':
-                if (data.x) map.panBy([data.x, 0], { animate: true });
-                if (data.y) map.panBy([0, data.y], { animate: true });
-                break;
-            case 'zoomIn':
-                map.zoomIn();
-                break;
-            case 'zoomOut':
-                map.zoomOut();
-                break;
-            case 'jumpTo':
-                if (data.lat !== undefined && data.lng !== undefined) {
-                    map.setView([data.lat, data.lng], map.getZoom(), { animate: true });
-                }
-                break;
-          }
-
-          // 短暂延迟后重置标志，以确保地图动画完成后再允许发送
-          setTimeout(() => {
-            isUpdatingFromServer = false;
-          }, 500); // 500ms应该足够地图动画完成
-        };
-
-        ws.onclose = () => {
-          console.log('WebSocket连接已断开。');
-          if(statusEl) statusEl.textContent = '同步已断开';
-          if(statusEl) statusEl.style.color = 'red';
-        };
-
-        ws.onerror = (error) => {
-          console.error('WebSocket 错误:', error);
-          if(statusEl) statusEl.textContent = '同步连接失败';
-          if(statusEl) statusEl.style.color = 'red';
-        };
-      }
-
-      function sendMapState() {
-        // 如果正在处理服务器更新，或ws未连接，则不发送任何内容
-        if (isUpdatingFromServer || !ws || ws.readyState !== WebSocket.OPEN) {
-          return;
-        }
-        const center = map.getCenter();
-        const zoom = map.getZoom();
-        const data = {
-          type: 'stateUpdate',
-          lat: center.lat,
-          lng: center.lng,
-          zoom: zoom,
-        };
-        console.log('发送数据:', data);
-        ws.send(JSON.stringify(data));
-      }
-      
-      // --- 7. 绑定事件 ---
+      // --- 6. 绑定事件 ---
       initializeApp();
 
       map.on("click", (e) =>
         console.log(`坐标: Y=${Math.round(-e.latlng.lat)}, X=${Math.round(e.latlng.lng)}`)
       );
 
-      // 当移动或缩放结束时，发送新状态
-      map.on('moveend', sendMapState);
-      map.on('zoomend', sendMapState);
-
-      // --- 8. 与PySide6 GUI的QWebChannel桥接 ---
+      // --- 7. 与PySide6 GUI的QWebChannel桥接 ---
       function initializeQtBridge() {
           // 检查是否在QWebEngineView环境中，并且qwebchannel.js已被注入
           if (typeof QWebChannel !== 'undefined') {
@@ -326,7 +255,7 @@
           }
       }
 
-      // --- 9. SVG路线覆盖层功能 - 升级版支持复杂变换 ---
+      // --- 8. SVG路线覆盖层功能 - 升级版支持复杂变换 ---
       window.displaySvgRoute = function(data) {
         console.log('收到SVG路线数据:', data);
         
@@ -486,7 +415,7 @@
           return { x: x, y: y };
         }
       }
-      
+
       // SVG路线管理函数
       window.clearSvgRoute = function() {
         if (currentSvgOverlay) {
@@ -495,6 +424,67 @@
           console.log('SVG路线覆盖层已清除');
         }
       };
+
+      // ========== 新增：通知Python端本地地图切换 ==========
+      function notifyLocalMapChanged(mapName) {
+        try {
+          if (window.py_backend && typeof window.py_backend.localMapChanged === 'function') {
+            window.py_backend.localMapChanged(mapName);
+            console.log(`已通知Python端地图切换: ${mapName}`);
+          }
+        } catch (e) {
+          console.warn('通知Python失败:', e);
+        }
+      }
+
+      // 暴露公共API供Python QWebEngineView.runJavaScript() 调用
+      window.loadMap = loadMap;
+      window.getCurrentMapName = function() {
+        return currentMapInfo ? currentMapInfo.name : null;
+      };
+
+      // ✅ 新增：暴露地图列表重新加载方法
+      window.reloadMapList = async function() {
+        try {
+            const response = await fetch('maps.json?t=' + new Date().getTime());
+            if (!response.ok) {
+                throw new Error('无法重新加载 maps.json');
+            }
+            const newMapData = await response.json();
+
+            // 保存当前地图名称
+            const currentMapName = currentMapInfo ? currentMapInfo.name : null;
+
+            // 更新地图数据
+            mapData = newMapData;
+
+            // 刷新控制面板
+            updateControlPanel();
+
+            // 如果当前地图仍存在，保持选中状态
+            if (currentMapName && mapData.find(m => m.name === currentMapName)) {
+                console.log(`地图列表已更新，当前地图 ${currentMapName} 保持不变`);
+            } else if (mapData.length > 0) {
+                // 当前地图已被删除或首次加载，加载第一个地图
+                loadMap(mapData[0].name, true);
+            } else {
+                // 没有地图了
+                controlPanel.innerHTML = '<h4>无可用地图</h4><p>请使用 <code>python tile_generator.py</code> 添加地图。</p>';
+                if (currentLayer) {
+                    map.removeLayer(currentLayer);
+                    currentLayer = null;
+                }
+                currentMapInfo = null;
+            }
+
+            console.log('地图列表已重新加载');
+        } catch (error) {
+            console.error('重新加载地图列表失败:', error);
+        }
+      };
+
+      window.initializeApp = initializeApp;  // 供Python刷新地图列表
+      // ====================================================
 
       // 在Leaflet地图完全初始化后，尝试建立与Qt的桥接
       map.whenReady(initializeQtBridge);

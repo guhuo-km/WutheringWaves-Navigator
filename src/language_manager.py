@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 多语言管理器
-支持中文、英文、日文、韩文、俄文、法文、德文
+支持中文、英文
 """
+
 
 import json
 import os
+import sys
 from typing import Dict, Optional
 from PySide6.QtCore import QObject, Signal
 
@@ -21,29 +23,40 @@ class LanguageManager(QObject):
     SUPPORTED_LANGUAGES = {
         'zh_CN': '简体中文',
         'en_US': 'English',
-        'ja_JP': '日本語',
-        'ko_KR': '한국어',
-        'ru_RU': 'Русский',
-        'fr_FR': 'Français',
-        'de_DE': 'Deutsch'
     }
+
     
     def __init__(self):
         super().__init__()
         self.current_language = 'zh_CN'  # 默认简体中文
         self.translations: Dict[str, Dict[str, str]] = {}
-        self.config_file = 'language_config.json'
+        self.app_root = self._resolve_app_root()
+        self.resource_root = self._resolve_resource_root()
+        self.config_file = os.path.join(self.app_root, 'language_config.json')
+        self.lang_dir = os.path.join(self.resource_root, 'languages')
         
-        # 创建语言文件目录
-        self.lang_dir = 'languages'
         if not os.path.exists(self.lang_dir):
             os.makedirs(self.lang_dir)
+
         
         # 加载所有语言翻译
         self.load_all_translations()
         
         # 加载用户设置
         self.load_language_config()
+
+    def _resolve_app_root(self) -> str:
+        if getattr(sys, 'frozen', False):
+            return os.path.dirname(sys.executable)
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.dirname(script_dir)
+
+    def _resolve_resource_root(self) -> str:
+        if getattr(sys, 'frozen', False):
+            return getattr(sys, '_MEIPASS', self.app_root)
+
+        return self.app_root
     
     def load_all_translations(self):
         """加载所有语言的翻译文件"""

@@ -6,12 +6,16 @@
 """
 
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QRect
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 
 class SeparatedMapWindow(QWidget):
     """分离出来的地图窗口 - 使用原有的WebView"""
+
+    DEFAULT_MAP_WINDOW_WIDTH = 630
+    DEFAULT_MAP_WINDOW_HEIGHT = 580
     
     # 信号定义（与主窗口通信）
     window_closed = Signal()
@@ -19,22 +23,27 @@ class SeparatedMapWindow(QWidget):
     def __init__(self, web_view, main_window, parent=None):
         """
         初始化分离的地图窗口
-        
+
         Args:
             web_view: 主窗口的WebView对象
             main_window: 主窗口引用，用于保持原有逻辑
             parent: 父窗口
         """
         super().__init__(parent)
-        
+
         # 保存引用
         self.web_view = web_view
         self.main_window = main_window
         self._is_closing = False  # 关闭标志
-        
+
         # 设置窗口属性
-        self.setWindowTitle("鸣潮地图导航 - 地图窗口")
-        self.setGeometry(100, 100, 630, 580)
+        self.setWindowTitle("呜呜大地图 - 地图窗口")
+        self.setGeometry(
+            100,
+            100,
+            self.DEFAULT_MAP_WINDOW_WIDTH,
+            self.DEFAULT_MAP_WINDOW_HEIGHT,
+        )
         
         # 设置UI
         self.setup_ui()
@@ -63,23 +72,47 @@ class SeparatedMapWindow(QWidget):
             error_label.setStyleSheet("color: red; font-size: 16px;")
             layout.addWidget(error_label)
     
-    def show_at_position(self, main_window_geometry):
-        """在主窗口右侧显示"""
+    @classmethod
+    def default_geometry_from_main_window(cls, main_window_geometry) -> QRect:
+        return QRect(
+            main_window_geometry.x(),
+            main_window_geometry.y(),
+            cls.DEFAULT_MAP_WINDOW_WIDTH,
+            cls.DEFAULT_MAP_WINDOW_HEIGHT,
+        )
+
+    @staticmethod
+    def _is_geometry_visible_on_screen(geometry: QRect) -> bool:
+        if geometry.width() <= 0 or geometry.height() <= 0:
+            return False
+        for screen in QGuiApplication.screens():
+            if screen.availableGeometry().intersects(geometry):
+                return True
+        return False
+
+    def show_with_geometry_memory(self, main_window_geometry, saved_geometry=None):
         try:
-            # 计算位置（在主窗口右侧）
-            map_x = main_window_geometry.x() + main_window_geometry.width() + 20
-            map_y = main_window_geometry.y()
-            map_width = 630
-            map_height = 580
-            
-            self.setGeometry(map_x, map_y, map_width, map_height)
+            geometry = None
+            if saved_geometry is not None and self._is_geometry_visible_on_screen(saved_geometry):
+                geometry = saved_geometry
+            if geometry is None:
+                geometry = self.default_geometry_from_main_window(main_window_geometry)
+
+            self.setGeometry(geometry)
             self.show()
             self.raise_()
-            
-            print(f"地图窗口显示在位置: ({map_x}, {map_y}, {map_width}, {map_height})")
-            
+
+            print(
+                "地图窗口显示在位置: "
+                f"({geometry.x()}, {geometry.y()}, {geometry.width()}, {geometry.height()})"
+            )
+
         except Exception as e:
             print(f"显示地图窗口失败: {e}")
+
+    def show_at_position(self, main_window_geometry):
+        """在与主窗口相同位置显示"""
+        self.show_with_geometry_memory(main_window_geometry)
     
     def closeEvent(self, event):
         """窗口关闭事件"""
