@@ -53,7 +53,7 @@ def update_map_config(map_name, is_tiled, width, height, max_zoom):
         json.dump(config, f, indent=4, ensure_ascii=False)
     print(f"'{MAP_CONFIG_FILE}' 已更新。")
 
-def process_image(image_path):
+def process_image(image_path, progress_callback=None):
     # --- 关键修改：使用不带扩展名的文件名作为地图ID ---
     map_identifier = os.path.splitext(os.path.basename(image_path))[0]
     original_map_name = os.path.basename(image_path)
@@ -69,7 +69,7 @@ def process_image(image_path):
 
     if file_size_mb > MAX_IMAGE_SIZE_MB or width > MAX_DIMENSION or height > MAX_DIMENSION:
         print("  - 结果: 需要瓦片化处理。")
-        generate_tiles(image_path, map_identifier, width, height)
+        generate_tiles(image_path, map_identifier, width, height, progress_callback)
     else:
         print("  - 结果: 作为普通图片处理。")
         os.makedirs(OUTPUT_IMAGES_DIR, exist_ok=True)
@@ -77,23 +77,32 @@ def process_image(image_path):
         print(f"  - 图片已复制到 '{OUTPUT_IMAGES_DIR}/' 目录。")
         # 对于普通图片，我们仍然使用原始文件名进行配置
         update_map_config(original_map_name, False, width, height, 0)
+        # 小图片直接完成
+        if progress_callback:
+            progress_callback(1.0)
 
-def generate_tiles(image_path, map_identifier, width, height):
+def generate_tiles(image_path, map_identifier, width, height, progress_callback=None):
     with Image.open(image_path) as original_img:
         img = original_img.convert("RGBA")
         max_zoom = math.ceil(math.log2(max(width, height) / TILE_SIZE))
         print(f"  - 计算得到最大缩放级别: {max_zoom}")
+
+        total_levels = max_zoom + 1  # 从0到max_zoom，总共max_zoom+1个级别
+        completed_levels = 0
 
         for z in range(max_zoom + 1):
             current_width = int(width / (2**(max_zoom - z)))
             current_height = int(height / (2**(max_zoom - z)))
             if current_width == 0 or current_height == 0:
                 print(f"  - 跳过 Zoom Level {z} (尺寸过小)")
+                completed_levels += 1
+                if progress_callback:
+                    progress_callback(completed_levels / total_levels)
                 continue
 
             print(f"  - 正在生成 Zoom Level {z} (图像尺寸: {current_width}x{current_height})...")
             scaled_img = img.resize((current_width, current_height), Image.Resampling.LANCZOS)
-            
+
             cols = math.ceil(current_width / TILE_SIZE)
             rows = math.ceil(current_height / TILE_SIZE)
 
@@ -109,19 +118,26 @@ def generate_tiles(image_path, map_identifier, width, height):
                     tile_dir = os.path.join(OUTPUT_TILES_DIR, map_identifier, str(z), str(x))
                     os.makedirs(tile_dir, exist_ok=True)
                     tile_path = os.path.join(tile_dir, f'{y}.png')
-                    
+
                     # 即使文件存在也重新生成，以确保是新逻辑生成的
                     # if os.path.exists(tile_path): continue
-                    
+
                     left = x * TILE_SIZE
                     top = y * TILE_SIZE
                     right = left + TILE_SIZE
                     bottom = top + TILE_SIZE
-                    
+
                     # --- 从大画布上裁剪瓦片，而不是从缩放图上裁剪 ---
                     tile_img = canvas_img.crop((left, top, right, bottom))
                     tile_img.save(tile_path, 'PNG')
-        
+
+            # 每完成一个缩放级别，更新进度
+            completed_levels += 1
+            if progress_callback:
+                progress = completed_levels / total_levels
+                progress_callback(progress)
+                print(f"  - 进度: {progress * 100:.1f}% ({completed_levels}/{total_levels})")
+
         print(f"  - 瓦片化完成！所有瓦片已保存至 '{os.path.join(OUTPUT_TILES_DIR, map_identifier)}'。")
         update_map_config(map_identifier, True, width, height, max_zoom)
 

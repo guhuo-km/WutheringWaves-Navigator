@@ -1,0 +1,115 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+.venv/
+.venv312/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Worktrees
+.worktrees/
+worktrees/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.cache
+
+# Screenshots and runtime generated images
+screenshots/
+captures/
+temp_images/
+
+# Configuration files with sensitive data (if any)
+.env
+.env.local
+config/local_*.json
+
+# OS
+Thumbs.db
+desktop.ini
+
+# Test coverage
+htmlcov/
+.coverage
+.coverage.*
+.pytest_cache/
+
+# ============================================
+# WutheringWaves Navigator 运行时生成文件
+# ============================================
+
+# 路线录制
+recorded_routes/
+
+# WebEngine 缓存和配置
+web_profile/
+src/web_profile/
+
+# 本地地图瓦片和图片 (tile_generator 生成)
+tiles/
+images/
+maps.json
+
+# 运行时配置文件
+ocr_config.json
+ocr_logs.json
+app_settings.json
+language_config.json
+calibration_data.json
+login_history.json
+src/ocr_config.json
+src/ocr_logs.json
+src/app_settings.json
+src/language_config.json
+src/calibration_data.json
+src/login_history.json
+
+# 模型文件
+*.pt
+*.pt*
+*.onnx
+!src/models/coord_ocr.onnx
+models/*.7z

@@ -3,19 +3,23 @@
 # 核心UI框架
 PySide6>=6.5.0
 
+# 模板渲染
+jinja2>=3.1.0
+
 # 图像处理
 opencv-python>=4.8.0
 Pillow>=10.0.0
 numpy>=1.24.0
 
 # OCR和机器学习
-ultralytics>=8.0.0
-torch>=2.0.0
-torchvision>=0.15.0
+onnxruntime>=1.23.0
 
-# Web服务器
-werkzeug>=2.3.0
-Flask>=2.3.0
+# 快捷键支持
+keyboard>=0.13.5
+pynput>=1.7.6
+
+# Windows API (窗口检测、进程信息)
+pywin32>=306
 
 # HTTP请求
 requests>=2.31.0

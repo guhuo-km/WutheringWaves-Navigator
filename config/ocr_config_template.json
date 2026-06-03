@@ -1,7 +1,7 @@
 {
   "confidence_threshold": 0.35,
   "ocr_interval": 1000,
-  "model_path": "models/coord_ocr.pt",
+  "model_path": "models/coord_ocr.onnx",
   "ocr_capture_area": {
     "x": 21,
     "y": 1053,
