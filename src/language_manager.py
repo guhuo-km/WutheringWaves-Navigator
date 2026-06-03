@@ -12,6 +12,8 @@ import sys
 from typing import Dict, Optional
 from PySide6.QtCore import QObject, Signal
 
+from core import paths
+
 
 class LanguageManager(QObject):
     """多语言管理器"""
@@ -30,13 +32,10 @@ class LanguageManager(QObject):
         super().__init__()
         self.current_language = 'zh_CN'  # 默认简体中文
         self.translations: Dict[str, Dict[str, str]] = {}
-        self.app_root = self._resolve_app_root()
+        self.runtime_root = self._resolve_runtime_root()
         self.resource_root = self._resolve_resource_root()
-        self.config_file = os.path.join(self.app_root, 'language_config.json')
+        self.config_file = os.path.join(self.runtime_root, 'config', 'language_config.json')
         self.lang_dir = os.path.join(self.resource_root, 'languages')
-        
-        if not os.path.exists(self.lang_dir):
-            os.makedirs(self.lang_dir)
 
         
         # 加载所有语言翻译
@@ -45,18 +44,11 @@ class LanguageManager(QObject):
         # 加载用户设置
         self.load_language_config()
 
-    def _resolve_app_root(self) -> str:
-        if getattr(sys, 'frozen', False):
-            return os.path.dirname(sys.executable)
-
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        return os.path.dirname(script_dir)
+    def _resolve_runtime_root(self) -> str:
+        return str(paths.runtime_root())
 
     def _resolve_resource_root(self) -> str:
-        if getattr(sys, 'frozen', False):
-            return getattr(sys, '_MEIPASS', self.app_root)
-
-        return self.app_root
+        return str(paths.resource_root())
     
     def load_all_translations(self):
         """加载所有语言的翻译文件"""
@@ -98,6 +90,7 @@ class LanguageManager(QObject):
     def save_language_config(self):
         """保存语言配置"""
         try:
+            os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
             config = {
                 'current_language': self.current_language,
                 'available_languages': list(self.SUPPORTED_LANGUAGES.keys())

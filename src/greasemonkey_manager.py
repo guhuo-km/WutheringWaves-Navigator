@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 import os
-import sys
 import re
 import json
 from jinja2 import Environment, FileSystemLoader
 from PySide6.QtWebEngineCore import QWebEngineScript
+
+from core import paths
 
 class GreasemonkeyManager:
     """
@@ -14,14 +15,9 @@ class GreasemonkeyManager:
     """
     def __init__(self, template_dir=None):
         if template_dir is None:
-            # 默认指向资源根目录下的 templates 文件夹
-            if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-                base_dir = sys._MEIPASS
-            else:
-                base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            template_dir = os.path.join(base_dir, "templates")
+            template_dir = paths.resource_root() / "templates"
 
-        self.template_dir = template_dir
+        self.template_dir = str(template_dir)
         self.env = Environment(loader=FileSystemLoader(self.template_dir))
 
         print(f"GreasemonkeyManager 初始化完成，模板目录: {self.template_dir}")

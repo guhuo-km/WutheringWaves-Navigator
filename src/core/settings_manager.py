@@ -7,6 +7,8 @@ import os
 import json
 from typing import Any, Optional
 
+from core import paths
+
 
 class SettingsManager:
     """Manages application settings persistence"""
@@ -22,9 +24,7 @@ class SettingsManager:
                          Defaults to app_settings.json in src directory.
         """
         if settings_file is None:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            src_dir = os.path.dirname(script_dir)
-            self.settings_file = os.path.join(src_dir, "app_settings.json")
+            self.settings_file = str(paths.config_file("app_settings.json"))
         else:
             self.settings_file = settings_file
 
@@ -52,6 +52,7 @@ class SettingsManager:
     def _save(self) -> bool:
         """Save settings to file"""
         try:
+            os.makedirs(os.path.dirname(self.settings_file), exist_ok=True)
             with open(self.settings_file, 'w', encoding='utf-8') as f:
                 json.dump(self._cache, f, indent=2, ensure_ascii=False)
             return True

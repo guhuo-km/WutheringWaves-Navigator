@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import os
-import sys
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QGridLayout
@@ -22,6 +21,11 @@ try:
 except ImportError:
     from ...core.version import load_version_info
 
+try:
+    from core import paths
+except ImportError:
+    from ...core import paths
+
 
 class AboutInterface(ScrollArea):
     check_update_requested = Signal()
@@ -33,10 +37,7 @@ class AboutInterface(ScrollArea):
 
     @staticmethod
     def _resolve_runtime_asset(*parts: str) -> str:
-        frozen_base = getattr(sys, "_MEIPASS", None)
-        if frozen_base:
-            return os.path.join(frozen_base, *parts)
-        return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", *parts))
+        return str(paths.resource_root().joinpath(*parts))
     
     def __init__(self, parent=None):
         super().__init__(parent)

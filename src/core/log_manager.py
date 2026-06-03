@@ -11,6 +11,7 @@ import threading
 from datetime import datetime
 from typing import Dict, Optional, Tuple
 
+from . import paths
 from .settings_manager import SettingsManager
 
 
@@ -29,10 +30,7 @@ class LogManager:
         self._session_ts = session_ts or datetime.now().strftime("%Y%m%d_%H%M%S")
 
         if log_dir is None:
-            core_dir = os.path.dirname(os.path.abspath(__file__))
-            src_dir = os.path.dirname(core_dir)
-            repo_root = os.path.dirname(src_dir)
-            log_dir = os.path.join(repo_root, "logs")
+            log_dir = str(paths.log_dir())
 
         self._base_log_dir = log_dir
         self._log_dir = self._session_log_dir(log_dir, self._session_ts)

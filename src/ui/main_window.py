@@ -38,6 +38,7 @@ from .interfaces import (
     LogInterface, SettingsInterface, AboutInterface
 )
 from .components.ocr_preview_overlay import OCRPreviewOverlay
+from core import paths
 
 try:
     from core.app_state import AppState
@@ -266,11 +267,11 @@ class MainWindow(FluentWindow):
     def _init_webview(self):
         self._web_profile = QWebEngineProfile("WutheringWavesNavigator", self)
         try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            profile_path = os.path.join(script_dir, "web_profile")
+            from core import paths
+            profile_path = paths.cache_dir("web_profile")
             os.makedirs(profile_path, exist_ok=True)
-            self._web_profile.setPersistentStoragePath(profile_path)
-            self._web_profile.setCachePath(os.path.join(profile_path, "cache"))
+            self._web_profile.setPersistentStoragePath(str(profile_path))
+            self._web_profile.setCachePath(str(profile_path / "cache"))
             print(f"WebProfile设置完成: {profile_path}")
         except Exception as e:
             print(f"WebProfile设置失败: {e}")
@@ -304,20 +305,13 @@ class MainWindow(FluentWindow):
             # 清除旧脚本防止重复
             self._web_profile.scripts().clear()
 
-            # 查找用户脚本（Lite + 原版）
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-                resource_root = sys._MEIPASS
-            else:
-                resource_root = os.path.abspath(os.path.join(script_dir, os.pardir, os.pardir))
-
             user_scripts = []
 
             # 优先加载 Lite（光环助手/本地地图），同时兼容保留原版（官方地图）
             for script_name in ["wuwa_map_optimizer_lite.js", "wuwa_map_optimizer.js"]:
-                user_script_path = os.path.join(resource_root, "js", script_name)
+                user_script_path = paths.resource_root() / "js" / script_name
                 if os.path.exists(user_script_path):
-                    user_scripts.append(user_script_path)
+                    user_scripts.append(str(user_script_path))
                     print(f"✓ 发现用户脚本: {user_script_path}")
                 else:
                     print(f"⚠ 未发现用户脚本: {user_script_path}")
@@ -523,7 +517,7 @@ class MainWindow(FluentWindow):
     def _get_download_dir(self) -> str:
         path = QStandardPaths.writableLocation(QStandardPaths.DownloadLocation)
         if not path:
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "downloads")
+            path = str(paths.runtime_dir("downloads"))
         os.makedirs(path, exist_ok=True)
         return path
 
@@ -1119,9 +1113,7 @@ class MainWindow(FluentWindow):
         self._app_state.append_system_log(f"已打开下载页面: {target_url}", "INFO")
 
     def _app_root_for_update(self) -> Path:
-        if getattr(sys, "frozen", False):
-            return Path(sys.executable).resolve().parent
-        return Path(__file__).resolve().parents[2]
+        return paths.app_root()
 
     def _main_exe_name_for_update(self) -> str:
         if getattr(sys, "frozen", False):

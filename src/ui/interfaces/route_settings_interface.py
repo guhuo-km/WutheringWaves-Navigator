@@ -211,12 +211,13 @@ class RouteSettingsInterface(QWidget):
         import os
         import subprocess
         import sys
+        from core import paths
 
         if not self.route_recorder:
             return
 
         # 获取路线文件夹路径
-        folder_path = os.path.join(os.getcwd(), "recorded_routes")
+        folder_path = paths.routes_dir()
 
         # 确保文件夹存在
         if not os.path.exists(folder_path):
@@ -225,11 +226,11 @@ class RouteSettingsInterface(QWidget):
         # 根据操作系统打开文件夹
         try:
             if sys.platform == "win32":
-                os.startfile(folder_path)
+                os.startfile(str(folder_path))
             elif sys.platform == "darwin":  # macOS
-                subprocess.run(["open", folder_path])
+                subprocess.run(["open", str(folder_path)])
             else:  # Linux
-                subprocess.run(["xdg-open", folder_path])
+                subprocess.run(["xdg-open", str(folder_path)])
         except Exception as e:
             print(f"打开文件夹失败: {e}")
 

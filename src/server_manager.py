@@ -6,6 +6,21 @@ import errno
 import socket
 from http.server import SimpleHTTPRequestHandler
 from socketserver import ThreadingTCPServer
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+from core import paths
+
+
+def local_map_content_path(request_path: str) -> Path:
+    parsed_path = unquote(urlparse(request_path).path).lstrip("/")
+    if parsed_path == "maps.json":
+        return paths.config_file("maps.json")
+    if parsed_path.startswith("tiles/"):
+        return paths.tiles_dir() / parsed_path.removeprefix("tiles/")
+    if parsed_path.startswith("images/"):
+        return paths.images_dir() / parsed_path.removeprefix("images/")
+    return paths.src_root() / parsed_path
 
 
 class ServerThread(threading.Thread):
@@ -54,9 +69,12 @@ class LocalServerManager:
             return True
 
         try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
+            script_dir = str(paths.src_root())
 
             class LocalFileHandler(SimpleHTTPRequestHandler):
+                def translate_path(self, path):
+                    return str(local_map_content_path(path))
+
                 def __init__(self, *args, **kwargs):
                     super().__init__(*args, directory=script_dir, **kwargs)
 
@@ -133,8 +151,7 @@ class LocalServerManager:
 
     def get_local_maps(self):
         try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            maps_json_path = os.path.join(script_dir, 'maps.json')
+            maps_json_path = paths.config_file('maps.json')
             with open(maps_json_path, 'r', encoding='utf-8') as f:
                 return [item['name'] for item in json.load(f)]
         except (FileNotFoundError, json.JSONDecodeError):
@@ -152,8 +169,7 @@ class LocalServerManager:
         """
         try:
             import shutil
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            maps_json_path = os.path.join(script_dir, 'maps.json')
+            maps_json_path = paths.config_file('maps.json')
 
             # Load maps.json
             with open(maps_json_path, 'r', encoding='utf-8') as f:
@@ -177,18 +193,18 @@ class LocalServerManager:
 
             # Delete tiles directory if tiled
             if map_entry.get('tiled', False):
-                tiles_dir = os.path.join(script_dir, 'tiles', map_name)
+                tiles_dir = paths.tiles_dir() / map_name
                 if os.path.exists(tiles_dir):
                     shutil.rmtree(tiles_dir)
                     print(f"Deleted tiles directory: {tiles_dir}")
 
             # Delete image file if not tiled
             else:
-                images_dir = os.path.join(script_dir, 'images')
+                images_dir = paths.images_dir()
                 # Try to find and delete the image file
                 for file in os.listdir(images_dir):
                     if file.startswith(map_name):
-                        image_path = os.path.join(images_dir, file)
+                        image_path = images_dir / file
                         os.remove(image_path)
                         print(f"Deleted image file: {image_path}")
                         break

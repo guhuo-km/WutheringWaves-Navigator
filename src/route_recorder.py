@@ -13,6 +13,8 @@ from typing import List, Dict, Any, Optional
 from PySide6.QtCore import QObject, Signal, QTimer
 from PySide6.QtWidgets import QMessageBox, QFileDialog
 
+from core import paths
+
 # 多语言支持
 try:
     from language_manager import get_language_manager, tr
@@ -133,7 +135,7 @@ class RouteRecorder(QObject):
         self.current_route: Optional[RouteData] = None
         
         # 配置
-        self.routes_dir = "recorded_routes"  # 路线存储目录
+        self.routes_dir = paths.routes_dir()  # 路线存储目录
         self.ensure_routes_directory()
         
         # 统计信息

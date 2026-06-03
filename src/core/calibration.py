@@ -10,6 +10,8 @@ from typing import Optional, Dict, List, Any
 
 import numpy as np
 
+from core import paths
+
 
 class CalibrationPoint:
     """Calibration point data structure"""
@@ -153,10 +155,7 @@ class CalibrationDataManager:
                             Defaults to calibration_data.json in script directory.
         """
         if calibration_file is None:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            # Go up to src directory
-            src_dir = os.path.dirname(script_dir)
-            self.calibration_file = os.path.join(src_dir, "calibration_data.json")
+            self.calibration_file = str(paths.config_file("calibration_data.json"))
         else:
             self.calibration_file = calibration_file
     
@@ -214,6 +213,7 @@ class CalibrationDataManager:
             data[map_key] = calibration_data
             
             # Write to file
+            os.makedirs(os.path.dirname(self.calibration_file), exist_ok=True)
             with open(self.calibration_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             
@@ -305,6 +305,7 @@ class CalibrationDataManager:
             
             if map_key in data:
                 del data[map_key]
+                os.makedirs(os.path.dirname(self.calibration_file), exist_ok=True)
                 with open(self.calibration_file, 'w', encoding='utf-8') as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
                 print(f"Deleted calibration data: {map_key}")

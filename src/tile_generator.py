@@ -4,15 +4,29 @@ from PIL import Image
 import math
 import shutil
 
+from core import paths
+
 # --- 配置 ---
 TILE_SIZE = 256
 MAX_IMAGE_SIZE_MB = 12
 MAX_DIMENSION = 8192
-OUTPUT_TILES_DIR = 'tiles'
-OUTPUT_IMAGES_DIR = 'images'
-MAP_CONFIG_FILE = 'maps.json'
+OUTPUT_TILES_DIR = paths.tiles_dir()
+OUTPUT_IMAGES_DIR = paths.images_dir()
+MAP_CONFIG_FILE = paths.config_file('maps.json')
 
 Image.MAX_IMAGE_PIXELS = None
+
+
+def map_config_file():
+    return paths.config_file('maps.json')
+
+
+def output_tiles_dir():
+    return paths.tiles_dir()
+
+
+def output_images_dir():
+    return paths.images_dir()
 
 def get_image_info(image_path):
     if not os.path.exists(image_path):
@@ -25,8 +39,9 @@ def get_image_info(image_path):
 
 def update_map_config(map_name, is_tiled, width, height, max_zoom):
     config = []
-    if os.path.exists(MAP_CONFIG_FILE):
-        with open(MAP_CONFIG_FILE, 'r', encoding='utf-8') as f:
+    config_file = map_config_file()
+    if os.path.exists(config_file):
+        with open(config_file, 'r', encoding='utf-8') as f:
             try:
                 config = json.load(f)
             except json.JSONDecodeError:
@@ -49,7 +64,8 @@ def update_map_config(map_name, is_tiled, width, height, max_zoom):
             "maxZoom": max_zoom if is_tiled else 0
         })
     
-    with open(MAP_CONFIG_FILE, 'w', encoding='utf-8') as f:
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_file, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=4, ensure_ascii=False)
     print(f"'{MAP_CONFIG_FILE}' 已更新。")
 
@@ -72,9 +88,10 @@ def process_image(image_path, progress_callback=None):
         generate_tiles(image_path, map_identifier, width, height, progress_callback)
     else:
         print("  - 结果: 作为普通图片处理。")
-        os.makedirs(OUTPUT_IMAGES_DIR, exist_ok=True)
-        shutil.copy(image_path, os.path.join(OUTPUT_IMAGES_DIR, original_map_name))
-        print(f"  - 图片已复制到 '{OUTPUT_IMAGES_DIR}/' 目录。")
+        images_dir = output_images_dir()
+        os.makedirs(images_dir, exist_ok=True)
+        shutil.copy(image_path, images_dir / original_map_name)
+        print(f"  - 图片已复制到 '{images_dir}/' 目录。")
         # 对于普通图片，我们仍然使用原始文件名进行配置
         update_map_config(original_map_name, False, width, height, 0)
         # 小图片直接完成
@@ -115,9 +132,9 @@ def generate_tiles(image_path, map_identifier, width, height, progress_callback=
 
             for x in range(cols):
                 for y in range(rows):
-                    tile_dir = os.path.join(OUTPUT_TILES_DIR, map_identifier, str(z), str(x))
+                    tile_dir = output_tiles_dir() / map_identifier / str(z) / str(x)
                     os.makedirs(tile_dir, exist_ok=True)
-                    tile_path = os.path.join(tile_dir, f'{y}.png')
+                    tile_path = tile_dir / f'{y}.png'
 
                     # 即使文件存在也重新生成，以确保是新逻辑生成的
                     # if os.path.exists(tile_path): continue
@@ -138,7 +155,7 @@ def generate_tiles(image_path, map_identifier, width, height, progress_callback=
                 progress_callback(progress)
                 print(f"  - 进度: {progress * 100:.1f}% ({completed_levels}/{total_levels})")
 
-        print(f"  - 瓦片化完成！所有瓦片已保存至 '{os.path.join(OUTPUT_TILES_DIR, map_identifier)}'。")
+        print(f"  - 瓦片化完成！所有瓦片已保存至 '{output_tiles_dir() / map_identifier}'。")
         update_map_config(map_identifier, True, width, height, max_zoom)
 
 if __name__ == '__main__':
@@ -147,7 +164,7 @@ if __name__ == '__main__':
         print("使用方法: python tile_generator.py <图片1.jpg> [图片2.png] ...")
         sys.exit(1)
     
-    os.makedirs(OUTPUT_IMAGES_DIR, exist_ok=True)
+    os.makedirs(output_images_dir(), exist_ok=True)
 
     for image_file in sys.argv[1:]:
         process_image(image_file)

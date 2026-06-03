@@ -8,6 +8,7 @@ build/
 develop-eggs/
 dist/
 downloads/
+*.spec
 eggs/
 .eggs/
 lib/
@@ -64,6 +65,7 @@ temp_images/
 
 # Configuration files with sensitive data (if any)
 .local/
+.runtime/
 .env
 .env.local
 config/local_*.json
@@ -84,6 +86,7 @@ htmlcov/
 
 # 路线录制
 recorded_routes/
+src/recorded_routes/
 
 # WebEngine 缓存和配置
 web_profile/
@@ -92,7 +95,10 @@ src/web_profile/
 # 本地地图瓦片和图片 (tile_generator 生成)
 tiles/
 images/
+src/tiles/
+src/images/
 maps.json
+src/maps.json
 
 # 运行时配置文件
 ocr_config.json
@@ -112,5 +118,5 @@ src/login_history.json
 *.pt
 *.pt*
 *.onnx
-!src/models/coord_ocr.onnx
+!models/coord_ocr.onnx
 models/*.7z

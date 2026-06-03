@@ -2,7 +2,6 @@
 import os
 import random
 import subprocess
-import sys
 from typing import Optional
 
 from PySide6.QtCore import Qt, QSignalBlocker, QRect, QSize
@@ -31,14 +30,12 @@ except ImportError:
         return text
 
 from core.settings_manager import SettingsManager
+from core import paths
 
 
 def _resolve_runtime_asset(*parts: str) -> str:
     """Resolve asset path in source and PyInstaller-frozen runtime."""
-    frozen_base = getattr(sys, "_MEIPASS", None)
-    if frozen_base:
-        return os.path.join(frozen_base, *parts)
-    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", *parts))
+    return str(paths.resource_root().joinpath(*parts))
 
 
 class BannerOverlay(QWidget):

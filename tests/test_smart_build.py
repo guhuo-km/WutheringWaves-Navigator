@@ -113,9 +113,9 @@ def test_runtime_language_config_is_not_packaged_as_default_user_setting(tmp_pat
         "data_dirs": [],
         "data_files": [],
         "runtime_data_files": [
-            "src/ocr_config.json",
-            "src/app_settings.json",
-            "src/language_config.json",
+            ".runtime/config/ocr_config.json",
+            ".runtime/config/app_settings.json",
+            ".runtime/config/language_config.json",
         ],
     }
     builder.include_local_maps = False
@@ -131,3 +131,49 @@ def test_runtime_language_config_is_not_packaged_as_default_user_setting(tmp_pat
     args = builder.build_pyinstaller_args()
 
     assert not any("language_config.json" in arg for arg in args)
+
+
+def test_default_build_uses_canonical_static_resource_locations():
+    builder = SmartBuilder.__new__(SmartBuilder)
+    builder.project_config = SmartBuilder(skip_deps=True, skip_updater=True).project_config
+
+    model_dirs = [
+        data_dir
+        for data_dir in builder.project_config["data_dirs"]
+        if data_dir["dest"] == "models"
+    ]
+    assert model_dirs == [
+        {
+            "dest": "models",
+            "candidates": ["models"],
+            "required": True,
+            "include_files": ["class_names.txt", "coord_ocr.onnx", "README.md"],
+        }
+    ]
+    assert "src/ocr_config.json" not in builder.project_config["runtime_data_files"]
+    assert "src/app_settings.json" not in builder.project_config["runtime_data_files"]
+    assert ".runtime/config/ocr_config.json" in builder.project_config["runtime_data_files"]
+    assert ".runtime/config/app_settings.json" in builder.project_config["runtime_data_files"]
+
+    language_dirs = [
+        data_dir
+        for data_dir in builder.project_config["data_dirs"]
+        if data_dir["dest"] == "languages"
+    ]
+    assert language_dirs == [
+        {
+            "dest": "languages",
+            "candidates": ["languages"],
+            "required": True,
+        }
+    ]
+
+    optional_runtime_dirs = {
+        data_dir["dest"]: data_dir["candidates"]
+        for data_dir in builder.project_config["data_dirs"]
+        if data_dir["dest"] in {"tiles", "images"}
+    }
+    assert optional_runtime_dirs == {
+        "tiles": [".runtime/tiles"],
+        "images": [".runtime/images"],
+    }

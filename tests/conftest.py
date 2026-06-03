@@ -8,6 +8,10 @@ sys.modules.pop('src', None)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+VENDORED_FLUENT = os.path.join(PROJECT_ROOT, 'PyQt-Fluent-Widgets-PySide6')
+if VENDORED_FLUENT not in sys.path:
+    sys.path.insert(0, VENDORED_FLUENT)
+
 # Add src to path to allow importing from ocr_engine
 sys.path.append(os.path.join(PROJECT_ROOT, 'src'))
 

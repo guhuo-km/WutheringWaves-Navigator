@@ -19,6 +19,8 @@ import re
 import traceback
 from PySide6.QtCore import QThread, Signal
 
+from core import paths
+
 
 def cluster_detections_to_rich_clusters(
     detections: List[Dict[str, Any]],
@@ -1120,7 +1122,7 @@ class OCRWorker(QThread):
             List of class names where index corresponds to class ID
         """
         try:
-            class_names_path = Path("models/class_names.txt")
+            class_names_path = paths.model_file("class_names.txt")
             
             if not class_names_path.exists():
                 self.logger.error(f"类别名称文件不存在: {class_names_path}")
@@ -1147,9 +1149,11 @@ class OCRWorker(QThread):
         """Load ONNX coordinate recognition model."""
         try:
             if model_path is None:
-                model_path = self.config_dict.get('model_path', "models/coord_ocr.onnx")
-            
+                model_path = self.config_dict.get('model_path', paths.model_file("coord_ocr.onnx"))
+
             model_path = Path(model_path)
+            if str(model_path).replace("\\", "/") == "models/coord_ocr.onnx":
+                model_path = paths.model_file("coord_ocr.onnx")
             
             if not model_path.exists():
                 error_msg = f"模型文件不存在: {model_path}"

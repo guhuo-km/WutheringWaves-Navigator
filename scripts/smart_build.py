@@ -66,12 +66,12 @@ class SmartBuilder:
             'data_dirs': [
                 {
                     'dest': 'languages',
-                    'candidates': ['languages', 'src/languages'],
+                    'candidates': ['languages'],
                     'required': True
                 },
                 {
                     'dest': 'models',
-                    'candidates': ['src/models', 'models'],
+                    'candidates': ['models'],
                     'required': True,
                     'include_files': ['class_names.txt', 'coord_ocr.onnx', 'README.md'],
                 },
@@ -92,13 +92,13 @@ class SmartBuilder:
                 },
                 {
                     'dest': 'tiles',
-                    'candidates': ['src/tiles'],
+                    'candidates': ['.runtime/tiles'],
                     'required': False,
                     'group': 'local_maps'
                 },
                 {
                     'dest': 'images',
-                    'candidates': ['src/images'],
+                    'candidates': ['.runtime/images'],
                     'required': False,
                     'group': 'map_images'
                 }
@@ -109,11 +109,11 @@ class SmartBuilder:
                 'src/jszip.min.js'
             ],
             'local_map_files': [
-                'src/maps.json'
+                '.runtime/config/maps.json'
             ],
             'runtime_data_files': [
-                'src/ocr_config.json',
-                'src/app_settings.json'
+                '.runtime/config/ocr_config.json',
+                '.runtime/config/app_settings.json'
             ],
             'requirements_files': ['requirements_fluent.txt', 'requirements.txt']
         }

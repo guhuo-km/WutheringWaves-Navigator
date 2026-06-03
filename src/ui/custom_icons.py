@@ -6,24 +6,17 @@ Defines custom FluentIcon implementations that load SVG icons from assets/icons/
 """
 
 import os
-import sys
 from enum import Enum
 from qfluentwidgets.common.icon import FluentIconBase
 from qfluentwidgets.common import Theme
 from qfluentwidgets import isDarkTheme
 
+from core import paths
+
 
 def get_icon_path(filename: str) -> str:
     """Get absolute path to icon file in assets/icons/"""
-    frozen_base = getattr(sys, "_MEIPASS", None)
-    if frozen_base:
-        return os.path.join(frozen_base, "assets", "icons", filename)
-
-    # Get repository root (3 levels up from src/ui/)
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    repo_root = os.path.dirname(os.path.dirname(current_dir))
-    icon_path = os.path.join(repo_root, "assets", "icons", filename)
-    return icon_path
+    return str(paths.asset_file("icons", filename))
 
 
 class CustomFluentIcon(FluentIconBase, Enum):

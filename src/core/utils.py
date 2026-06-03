@@ -7,6 +7,8 @@ import sys
 import os
 import ctypes
 
+from core import paths
+
 
 def is_admin() -> bool:
     """检测是否以管理员权限运行"""
@@ -35,27 +37,24 @@ def show_admin_required_message():
 
 def get_script_dir() -> str:
     """获取脚本所在目录"""
-    return os.path.dirname(os.path.abspath(__file__))
+    return str(paths.src_root() / "core")
 
 
 def get_resource_root() -> str:
     """获取运行时资源根目录，兼容源码运行和 PyInstaller 打包。"""
-    frozen_base = getattr(sys, "_MEIPASS", None)
-    if frozen_base:
-        return frozen_base
-    return get_project_root()
+    return str(paths.resource_root())
 
 
 def get_src_dir() -> str:
     """获取 src 目录路径"""
-    return os.path.dirname(get_script_dir())
+    return str(paths.src_root())
 
 
 def get_project_root() -> str:
     """获取项目根目录路径"""
-    return os.path.dirname(get_src_dir())
+    return str(paths.project_root())
 
 
 def get_assets_path(filename: str) -> str:
     """获取 assets 目录下文件的完整路径"""
-    return os.path.join(get_resource_root(), "assets", filename)
+    return str(paths.asset_file(filename))

@@ -6,19 +6,53 @@ import sys
 def test_language_manager_defaults_to_chinese_when_user_config_missing(tmp_path, monkeypatch):
     monkeypatch.delenv("_PYI_APPLICATION_HOME_DIR", raising=False)
     monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
 
     import src.language_manager as language_manager
 
     importlib.reload(language_manager)
     monkeypatch.setattr(
         language_manager.LanguageManager,
-        "_resolve_app_root",
+        "_resolve_runtime_root",
         lambda self: str(tmp_path),
     )
     manager = language_manager.LanguageManager()
 
     assert manager.get_current_language() == "zh_CN"
-    assert manager.config_file == str(tmp_path / "language_config.json")
+    assert manager.config_file == str(tmp_path / "config" / "language_config.json")
+
+
+def test_language_manager_does_not_create_static_language_dir(tmp_path, monkeypatch):
+    runtime_root = tmp_path / "runtime"
+    static_root = tmp_path / "missing_static"
+    created_dirs = []
+
+    monkeypatch.delenv("_PYI_APPLICATION_HOME_DIR", raising=False)
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+
+    import src.language_manager as language_manager
+
+    importlib.reload(language_manager)
+    monkeypatch.setattr(
+        language_manager.LanguageManager,
+        "_resolve_runtime_root",
+        lambda self: str(runtime_root),
+    )
+    monkeypatch.setattr(
+        language_manager.LanguageManager,
+        "_resolve_resource_root",
+        lambda self: str(static_root),
+    )
+    monkeypatch.setattr(
+        language_manager.os,
+        "makedirs",
+        lambda path, *args, **kwargs: created_dirs.append(str(path)),
+    )
+
+    language_manager.LanguageManager()
+
+    assert str(static_root / "languages") not in created_dirs
 
 
 def test_language_manager_uses_app_root_config_when_frozen(tmp_path, monkeypatch):
@@ -26,7 +60,9 @@ def test_language_manager_uses_app_root_config_when_frozen(tmp_path, monkeypatch
     internal_root = app_root / "_internal"
     app_root.mkdir()
     internal_root.mkdir()
-    (app_root / "language_config.json").write_text(
+    config_dir = app_root / "config"
+    config_dir.mkdir()
+    (config_dir / "language_config.json").write_text(
         json.dumps({"current_language": "en_US"}),
         encoding="utf-8",
     )
@@ -44,7 +80,7 @@ def test_language_manager_uses_app_root_config_when_frozen(tmp_path, monkeypatch
     importlib.reload(language_manager)
     manager = language_manager.LanguageManager()
 
-    assert manager.config_file == str(app_root / "language_config.json")
+    assert manager.config_file == str(config_dir / "language_config.json")
     assert manager.get_current_language() == "en_US"
 
 

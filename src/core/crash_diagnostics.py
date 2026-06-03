@@ -11,6 +11,8 @@ import traceback
 from datetime import datetime
 from typing import Optional, TextIO
 
+from . import paths
+
 
 _SESSION_TS = datetime.now().strftime("%Y%m%d_%H%M%S")
 _installed = False
@@ -26,14 +28,7 @@ def resolve_session_log_dir(base_log_dir: str, session_ts: str) -> str:
 
 
 def _resolve_log_dir() -> str:
-    if getattr(sys, "frozen", False):
-        base_dir = os.path.dirname(sys.executable)
-    else:
-        core_dir = os.path.dirname(os.path.abspath(__file__))
-        src_dir = os.path.dirname(core_dir)
-        base_dir = os.path.dirname(src_dir)
-
-    log_dir = resolve_session_log_dir(os.path.join(base_dir, "logs"), _SESSION_TS)
+    log_dir = resolve_session_log_dir(str(paths.log_dir()), _SESSION_TS)
     os.makedirs(log_dir, exist_ok=True)
     return log_dir
 

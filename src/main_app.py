@@ -9,16 +9,19 @@ import os
 import multiprocessing
 import io
 import tempfile
+from pathlib import Path
 
-script_dir = os.path.dirname(os.path.abspath(__file__))
-repo_root = os.path.dirname(script_dir)
-os.chdir(script_dir)
-sys.path.insert(0, script_dir)
+sys.dont_write_bytecode = True
+
+BOOTSTRAP_SRC_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(BOOTSTRAP_SRC_ROOT))
+
+from core import paths
 
 # Prepend vendored PySide6-compatible qfluentwidgets to avoid mixing with PyQt5 version
-vendored_fluent = os.path.join(repo_root, "PyQt-Fluent-Widgets-PySide6")
-if os.path.isdir(vendored_fluent):
-    sys.path.insert(0, vendored_fluent)
+vendored_fluent = paths.project_root() / "PyQt-Fluent-Widgets-PySide6"
+if vendored_fluent.is_dir():
+    sys.path.insert(0, str(vendored_fluent))
 
 
 def _ensure_stdio_streams() -> None:
@@ -83,7 +86,7 @@ def main():
     try:
         from core.update_lock import is_update_in_progress, update_in_progress_message
 
-        app_root = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else repo_root
+        app_root = paths.app_root()
         if is_update_in_progress(app_root):
             QMessageBox.information(None, "更新正在进行", update_in_progress_message())
             sys.exit(0)

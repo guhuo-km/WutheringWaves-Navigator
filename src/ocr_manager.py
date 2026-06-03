@@ -39,6 +39,7 @@ except ImportError:
 from ocr_engine import OCRWorker, RecognitionState
 from ocr_region_calibrator import OCRRegionCalibrator
 from screen_capture import capture_region_callback
+from core import paths
 
 
 BUILTIN_OCR_MODEL_PATH = "models/coord_ocr.onnx"
@@ -49,6 +50,13 @@ LEGACY_BUILTIN_OCR_MODEL_PATHS = {
 
 def _normalized_model_path_value(model_path: object) -> str:
     return str(model_path or "").replace("\\", "/").strip()
+
+
+def resolve_ocr_model_path(model_path: object) -> Path:
+    normalized = _normalized_model_path_value(model_path)
+    if normalized == BUILTIN_OCR_MODEL_PATH:
+        return paths.model_file("coord_ocr.onnx")
+    return Path(model_path)
 
 
 def normalize_builtin_ocr_model_path(config: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
@@ -918,7 +926,7 @@ class OCRManager(QObject):
         super().__init__(parent)
         
         # 配置文件路径
-        self.config_file = Path("ocr_config.json")
+        self.config_file = paths.config_file("ocr_config.json")
         
         # 默认配置
         self.default_config = {
@@ -964,7 +972,7 @@ class OCRManager(QObject):
         self.jump_callback = None  # 跳转回调函数
         
         # 日志持久化
-        self.log_file = self.config_file.parent / "ocr_logs.json"
+        self.log_file = paths.log_file("ocr_logs.json")
         self.max_stored_logs = 500  # 最多存储500条日志记录
 
         # 自动窗口检测
@@ -1003,6 +1011,7 @@ class OCRManager(QObject):
                 merged_config.update(config)
                 merged_config, changed = normalize_builtin_ocr_model_path(merged_config)
                 if changed:
+                    self.config_file.parent.mkdir(parents=True, exist_ok=True)
                     with open(self.config_file, 'w', encoding='utf-8') as f:
                         json.dump(merged_config, f, indent=2, ensure_ascii=False)
                 return merged_config
@@ -1016,6 +1025,7 @@ class OCRManager(QObject):
     def save_config(self):
         """保存OCR配置"""
         try:
+            self.config_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.ocr_config, f, indent=2, ensure_ascii=False)
         except Exception as e:
@@ -1338,7 +1348,7 @@ class OCRManager(QObject):
                 return False
             
             # 检查模型文件是否存在
-            model_path = Path(self.ocr_config.get('model_path', BUILTIN_OCR_MODEL_PATH))
+            model_path = resolve_ocr_model_path(self.ocr_config.get('model_path', BUILTIN_OCR_MODEL_PATH))
             if not model_path.exists():
                 self.error_occurred.emit(f"OCR模型文件不存在: {model_path}")
                 return False
