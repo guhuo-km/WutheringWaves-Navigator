@@ -147,7 +147,7 @@ def test_default_build_uses_canonical_static_resource_locations():
             "dest": "models",
             "candidates": ["models"],
             "required": True,
-            "include_files": ["class_names.txt", "coord_ocr.onnx", "README.md"],
+            "include_files": ["class_names.txt", "coord_ocr.pt"],
         }
     ]
     assert "src/ocr_config.json" not in builder.project_config["runtime_data_files"]

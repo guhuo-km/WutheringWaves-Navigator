@@ -9,9 +9,6 @@
     "height": 27
   },
   "advanced_ocr_settings": {
-    "max_speed_threshold": 1500,
-    "lost_threshold_frames": 3,
-    "z_axis_threshold": 80,
     "verbose_debug": true
   },
   "target_window_name": "",

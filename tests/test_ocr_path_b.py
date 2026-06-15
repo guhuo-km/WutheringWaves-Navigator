@@ -14,6 +14,41 @@ from conftest import build_ocr_string_detections, build_yolo_detection
 from ocr_engine import OCRWorker
 
 
+def build_missing_comma_detections(
+    text,
+    missing_comma_indexes,
+    start_x=10,
+    start_y=10,
+    char_width=10,
+    char_height=20,
+    gap=2,
+):
+    class_map = {
+        '0': 0, '1': 1, '2': 2, '3': 3, '4': 4,
+        '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
+        ',': 10, ':': 11, '-': 12, '+': 13,
+    }
+    detections = []
+    current_x = start_x
+    missing_comma_indexes = set(missing_comma_indexes)
+
+    for index, char in enumerate(text):
+        if char == ' ':
+            current_x += char_width + gap
+            continue
+        if char == ',' and index in missing_comma_indexes:
+            current_x += char_width + gap
+            continue
+        if char not in class_map:
+            continue
+
+        bbox = [current_x, start_y, current_x + char_width, start_y + char_height]
+        detections.append(build_yolo_detection(class_id=class_map[char], bbox=bbox))
+        current_x += char_width + gap
+
+    return detections
+
+
 class TestPathBParsing:
     @pytest.fixture
     def ocr_worker(self):
@@ -39,28 +74,23 @@ class TestPathBParsing:
         assert success is True
         assert coords == (-500, 100, 50)
 
-    def test_locked_state_uses_path_b(self, ocr_worker):
-        from ocr_engine import RecognitionState
-
-        ocr_worker.recognition_state = RecognitionState.LOCKED
-        ocr_worker.last_valid_coord = (-495, 98, 49)
+    def test_current_frame_success_uses_path_b(self, ocr_worker):
         detections = build_ocr_string_detections("-500 100 50", gap=30)
-        best_cluster = {'word': '-500 100 50', 'detections': detections}
+        success, coords = ocr_worker._apply_tracking_algorithm(detections)
+        assert success is True
+        assert coords == (-500, 100, 50)
+        assert ocr_worker.get_current_state() == "SUCCESS"
 
-        success, coords = ocr_worker._handle_locked_state(detections, best_cluster)
+    def test_current_frame_failure_does_not_reuse_previous_success(self, ocr_worker):
+        detections = build_ocr_string_detections("-500 100 50", gap=30)
+        success, coords = ocr_worker._apply_tracking_algorithm(detections)
         assert success is True
         assert coords == (-500, 100, 50)
 
-    def test_searching_state_uses_path_b(self, ocr_worker):
-        from ocr_engine import RecognitionState
-
-        ocr_worker.recognition_state = RecognitionState.SEARCHING
-        detections = build_ocr_string_detections("-500 100 50", gap=30)
-        best_cluster = {'word': '-500 100 50', 'detections': detections}
-
-        success, coords = ocr_worker._handle_searching_state(detections, best_cluster)
-        assert success is True
-        assert coords == (-500, 100, 50)
+        success, coords = ocr_worker._apply_tracking_algorithm([])
+        assert success is False
+        assert coords is None
+        assert ocr_worker.get_current_state() == "FAILED"
 
     def test_timestamp_noise_with_timezone(self, ocr_worker):
         detections = build_ocr_string_detections("-500,100,50 2026-02-07 16:20:33 +8")
@@ -76,12 +106,10 @@ class TestPathBParsing:
         assert coords == (-500, 100, 50)
         assert metadata['method'] in ['path_b_groups', 'path_b_fallback', 'path_b']
 
-    def test_path_b_runs_when_best_cluster_missing(self, ocr_worker):
-        from ocr_engine import RecognitionState
-
-        ocr_worker.recognition_state = RecognitionState.SEARCHING
+    def test_tracking_algorithm_runs_when_best_cluster_missing(self, ocr_worker, monkeypatch):
         detections = build_ocr_string_detections("-500 100 50", gap=30)
-        success, coords = ocr_worker._handle_searching_state(detections, None)
+        monkeypatch.setattr("ocr_engine.find_best_coordinate_cluster", lambda clusters: (None, []))
+        success, coords = ocr_worker._apply_tracking_algorithm(detections)
         assert success is True
         assert coords == (-500, 100, 50)
 
@@ -105,7 +133,7 @@ class TestPathBParsing:
         assert metadata['method'] in ['path_b_groups', 'path_b_fallback', 'path_b']
 
     def test_recovers_compact_yz_joined(self, ocr_worker):
-        detections = build_ocr_string_detections("-1168,-6592395")
+        detections = build_missing_comma_detections("-1168,-6592,395", missing_comma_indexes=[11])
         success, coords, metadata = ocr_worker._parse_path_b_spacing_dominant(detections)
         assert success is True
         assert coords == (-1168, -6592, 395)
@@ -117,16 +145,14 @@ class TestPathBParsing:
         assert groups == ['-1168', '-6592', '395']
 
     def test_recovers_compact_xy_with_timestamp_tail(self, ocr_worker):
-        ocr_worker.last_valid_coord = (2405, 3307, -36)
-        detections = build_ocr_string_detections("24063306,-372026-02-0800:15:4318")
+        detections = build_missing_comma_detections("2406,3306,-372026-02-0800:15:4318", missing_comma_indexes=[4])
         success, coords, metadata = ocr_worker._parse_path_b_spacing_dominant(detections)
         assert success is True
         assert coords == (2406, 3306, -37)
-        assert metadata.get('recovered_from_two_groups') is True
+        assert metadata.get('recovered_from_two_group_gap') is True
 
     def test_recovers_compact_xy_without_timestamp(self, ocr_worker):
-        ocr_worker.last_valid_coord = (2407, 3305, -37)
-        detections = build_ocr_string_detections("24063306,-37")
+        detections = build_missing_comma_detections("2406,3306,-37", missing_comma_indexes=[4])
         success, coords, metadata = ocr_worker._parse_path_b_spacing_dominant(detections)
         assert success is True
         assert coords == (2406, 3306, -37)
@@ -168,6 +194,11 @@ class TestPathBParsing:
         success_prev, coords_prev, _ = ocr_worker._parse_path_b_spacing_dominant(det_prev)
         assert success_prev is True
         assert coords_prev == (-500, 100, 50)
+
+    def test_candidate_choice_ignores_previous_coordinate_attribute(self, ocr_worker):
+        ocr_worker.last_valid_coord = (1010, 2010, 100)
+        result = ocr_worker._choose_best_xyz_candidate([(1000, 2000, 100), (1010, 2010, 100)])
+        assert result == (1000, 2000, 100)
 
 
 class TestPathBEdgeCases:

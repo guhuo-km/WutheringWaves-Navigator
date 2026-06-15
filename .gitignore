@@ -118,5 +118,5 @@ src/login_history.json
 *.pt
 *.pt*
 *.onnx
-!models/coord_ocr.onnx
+!models/coord_ocr.pt
 models/*.7z

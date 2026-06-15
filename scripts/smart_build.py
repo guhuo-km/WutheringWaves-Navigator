@@ -73,7 +73,7 @@ class SmartBuilder:
                     'dest': 'models',
                     'candidates': ['models'],
                     'required': True,
-                    'include_files': ['class_names.txt', 'coord_ocr.onnx', 'README.md'],
+                    'include_files': ['class_names.txt', 'coord_ocr.pt'],
                 },
                 {
                     'dest': 'templates',
@@ -138,7 +138,8 @@ class SmartBuilder:
             'opencv-python>=4.8.0',
             'Pillow>=10.0.0',
             'numpy>=1.24.0',
-            'onnxruntime>=1.23.0',
+            'torch>=2.0.0',
+            'ultralytics>=8.0.0',
             'requests>=2.31.0'
         ]
         
@@ -501,7 +502,7 @@ class SmartBuilder:
             args.append(f'--add-binary={python_dll}{os.pathsep}.')
         
         # 收集依赖
-        collect_packages = ['onnxruntime', 'cv2', 'qfluentwidgets', 'qframelesswindow']
+        collect_packages = ['torch', 'torchvision', 'ultralytics', 'cv2', 'qfluentwidgets', 'qframelesswindow']
         for package in collect_packages:
             if self.check_package_installed(package):
                 args.append(f'--collect-all={package}')
@@ -519,12 +520,9 @@ class SmartBuilder:
         for module in hidden_imports:
             args.append(f'--hidden-import={module}')
         
-        # 排除多余的 Qt 绑定和旧 PyTorch 推理栈
+        # 排除多余的 Qt 绑定
         excluded_modules = [
             'PyQt5',
-            'torch',
-            'torchvision',
-            'ultralytics',
             'matplotlib',
             'pandas',
             'scipy',
@@ -611,7 +609,9 @@ class SmartBuilder:
             "--exclude-module",
             "cv2",
             "--exclude-module",
-            "onnxruntime",
+            "torch",
+            "torchvision",
+            "ultralytics",
             str(updater_script),
         ]
         print("[BUILD] 正在构建独立更新器...")

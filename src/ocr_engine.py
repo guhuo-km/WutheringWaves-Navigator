@@ -11,10 +11,10 @@ import logging
 import numpy as np
 import numpy.typing as npt
 import cv2
-from typing import ClassVar, Optional, List, Tuple, Dict, Any, TypedDict
+from typing import ClassVar, Optional, List, Tuple, Dict, Any
 from pathlib import Path
-import onnxruntime as ort
-import math
+import torch
+from ultralytics import YOLO
 import re
 import traceback
 from PySide6.QtCore import QThread, Signal
@@ -86,7 +86,7 @@ def cluster_detections_to_rich_clusters(
         logger.debug(f"[SMART_CLUSTERING] 分隔阈值: {separation_threshold:.2f} (方法1:{threshold_1:.2f}, 方法2:{threshold_2:.2f})")
     else:
         separation_threshold = avg_char_width * 1.8
-    
+
     clusters = []
     current_word = ""
     current_detections_list = []
@@ -208,31 +208,24 @@ def find_best_coordinate_cluster(
 
 
 class RecognitionState:
-    """Recognition states for the state machine"""
-    LOCKED = "LOCKED"
-    LOST = "LOST"
-    SEARCHING = "SEARCHING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
 
 
 class OCRWorker(QThread):
     """
     OCR Worker implementing advanced predictive tracking algorithm
     
-    This worker runs an ONNX OCR detection model on CPU and provides highly accurate coordinate
+    This worker runs an Ultralytics YOLO model on CPU and provides highly accurate coordinate
     tracking with state management and dynamic template adaptation.
     """
     
     # Static class names for global function access
     _class_names_static: ClassVar[List[str]] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ',', ':', '-', '+']
 
-    class _SuspectJumpState(TypedDict):
-        coord: Tuple[int, int, int]
-        count: int
-        stable_coord: Tuple[int, int, int]
-    
     # Qt Signals
     coordinates_detected = Signal(int, int, int)  # x, y, z coordinates
-    recognition_state_changed = Signal(str)  # LOCKED, LOST, SEARCHING
+    recognition_state_changed = Signal(str)  # SUCCESS, FAILED
     error_occurred = Signal(str)  # Error message
     ocr_output_updated = Signal(str)  # Raw OCR output text
     capture_area_updated = Signal(dict)  # Runtime capture area updates
@@ -254,48 +247,16 @@ class OCRWorker(QThread):
         self.is_running = False
         self.should_stop = False
         
-        # ONNX OCR model
+        # YOLOv8 model
         self.model = None
-        self.model_input_name = ""
-        self.model_input_shape: Tuple[int, int] = (512, 512)
-        self._last_onnx_scale: Tuple[float, float] = (1.0, 1.0)
-        self._last_onnx_pad: Tuple[float, float] = (0.0, 0.0)
-        self._last_onnx_source_shape: Tuple[int, int] = (0, 0)
         
         # Class names mapping
         self.class_names = self._load_class_names()
         
-        # Advanced tracking algorithm state variables
-        self.recognition_state = RecognitionState.SEARCHING
-        self.last_valid_coord = None  # (x, y, z) tuple
-        self.last_valid_detections = None  # Dynamic tracking template
-        self.consecutive_failures = 0
-
-        # Two-stage suspect jump confirmation
-        self.suspect_jump: Optional[OCRWorker._SuspectJumpState] = None
-        self.suspect_confirmation_window = 2
-
-        # Dynamic ROI state
-        self.consecutive_success_count = 0
-        self.last_successful_bbox = None
-        self.dynamic_roi_active = False
-        self.dynamic_failure_count = 0
-        self.dynamic_roi_base_area: Optional[Dict[str, int]] = None
-        self.dynamic_roi_anchor_center_global: Optional[Tuple[int, int]] = None
+        self.recognition_state = RecognitionState.FAILED
 
         config = self.config_dict
 
-        # Dynamic ROI constants
-        self.ROI_TRIGGER_FRAMES = 3
-        self.ROI_EXPAND_PIXELS = 5
-        self.ROI_MAX_HEIGHT = 200
-        self.ROI_MAX_WIDTH = 1000
-        self.ROI_MIN_HEIGHT = int(config.get('roi_min_height', 60)) if isinstance(config, dict) else 60
-        self.ROI_MIN_WIDTH = int(config.get('roi_min_width', 520)) if isinstance(config, dict) else 520
-        self.ROI_SHRINK_MARGIN = int(config.get('roi_shrink_margin', 15)) if isinstance(config, dict) else 15
-
-        # 去重优化：记录上一次发射的坐标
-        self.last_emitted_coord = None
         self._last_inference_debug: Dict[str, Any] = {}
         self._last_candidate_clusters: List[Dict[str, Any]] = []
         self._last_selection_details: List[Dict[str, Any]] = []
@@ -304,15 +265,9 @@ class OCRWorker(QThread):
         
         # Configurable parameters (loaded from config dict)
 
-        self.ROI_MAX_FAILURES_BEFORE_RESET = int(config.get('roi_max_failures_before_reset', 10)) if isinstance(config, dict) else 10
-        
         self.confidence_threshold = config.get('confidence_threshold', 0.45)
         self.digit_confidence_threshold = config.get('digit_confidence_threshold', self.confidence_threshold)
         self.symbol_confidence_threshold = config.get('symbol_confidence_threshold', self.confidence_threshold)
-        self.max_speed_threshold = config.get('max_speed_threshold', 1000)
-        self.ema_alpha = config.get('ema_alpha', 0.3)
-        self.lost_threshold_frames = config.get('lost_threshold_frames', 5)
-        self.z_axis_threshold = config.get('z_axis_threshold', 50)
         
         # OCR capture area and interval
         self.capture_area = None
@@ -363,10 +318,6 @@ class OCRWorker(QThread):
             return
 
         try:
-            raw_chars = self._build_raw_char_string(raw_detections)
-            best_word = (best_cluster or {}).get('word', '') if best_cluster else ''
-            best_count = len((best_cluster or {}).get('detections', [])) if best_cluster else 0
-
             b_success, b_coord, b_meta = path_b_result
 
             infer_dbg = self._last_inference_debug if isinstance(self._last_inference_debug, dict) else {}
@@ -376,17 +327,24 @@ class OCRWorker(QThread):
                 roi_str = f"({roi.get('x', '-')},{roi.get('y', '-')},{roi.get('width', '-')},{roi.get('height', '-')})"
 
             self.ocr_output_updated.emit(
-                f"[OCR-RAW] state={state} roi={roi_str} model_total={infer_dbg.get('total_boxes', 0)} kept={infer_dbg.get('kept_boxes', 0)} filtered={infer_dbg.get('filtered_boxes', 0)} raw='{raw_chars}'"
+                f"[OCR-RAW] state={state} roi={roi_str} model_total={infer_dbg.get('total_boxes', 0)} kept={infer_dbg.get('kept_boxes', 0)} filtered={infer_dbg.get('filtered_boxes', 0)}"
             )
 
             entries = infer_dbg.get('entries', []) if isinstance(infer_dbg.get('entries'), list) else []
             if entries:
-                parts = []
-                for e in entries[:36]:
-                    parts.append(
-                        f"'{e.get('char', '?')}'(conf={float(e.get('confidence', 0.0)):.2f},th={float(e.get('threshold', 0.0)):.2f},x={int(e.get('x', 0))},keep={'Y' if e.get('kept') else 'N'})"
+                for idx, e in enumerate(entries[:120], start=1):
+                    x1 = float(e.get('x1', e.get('x', 0.0)) or 0.0)
+                    y1 = float(e.get('y1', 0.0) or 0.0)
+                    x2 = float(e.get('x2', 0.0) or 0.0)
+                    y2 = float(e.get('y2', 0.0) or 0.0)
+                    self.ocr_output_updated.emit(
+                        "[OCR-RAW-DET] "
+                        f"#{idx} char='{e.get('char', '?')}' "
+                        f"bbox=({x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}) "
+                        f"conf={float(e.get('confidence', 0.0)):.2f} "
+                        f"th={float(e.get('threshold', 0.0)):.2f} "
+                        f"keep={'Y' if e.get('kept') else 'N'}"
                     )
-                self.ocr_output_updated.emit(f"[OCR-RAW-CHARS] {' '.join(parts)}")
 
             clusters = self._last_candidate_clusters if isinstance(self._last_candidate_clusters, list) else []
             if clusters:
@@ -474,20 +432,20 @@ class OCRWorker(QThread):
         self.logger.debug(f"[TIMESTAMP_REMOVAL] 未找到时间戳标识，返回原字符串")
         return coord_str
 
-    def _group_contiguous_tokens(self, detections: List[Dict[str, Any]]) -> Tuple[List[str], float]:
-        """Group OCR chars by continuity (gap consistency + punctuation boundaries)."""
+    def _group_contiguous_token_details(self, detections: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], float]:
+        """Group OCR chars by continuity while keeping each char bbox."""
         if not detections:
             return [], 0.0
 
         sorted_detections = sorted(detections, key=lambda d: d['bbox'][0])
-        tokens: List[Tuple[str, float, float]] = []
+        tokens: List[Dict[str, Any]] = []
         confidences: List[float] = []
         for d in sorted_detections:
             ch = OCRWorker._class_id_to_char_static(d['class'])
             if not ch:
                 continue
             x1, _, x2, _ = d['bbox']
-            tokens.append((ch, float(x1), float(x2)))
+            tokens.append({'char': ch, 'x1': float(x1), 'x2': float(x2)})
             confidences.append(float(d.get('confidence', 0.0)))
 
         if not tokens:
@@ -496,59 +454,69 @@ class OCRWorker(QThread):
         gaps: List[float] = []
         widths: List[float] = []
         for i in range(1, len(tokens)):
-            gaps.append(tokens[i][1] - tokens[i - 1][2])
-        for _, x1, x2 in tokens:
-            widths.append(max(1.0, x2 - x1))
+            gaps.append(tokens[i]['x1'] - tokens[i - 1]['x2'])
+        for token in tokens:
+            widths.append(max(1.0, token['x2'] - token['x1']))
 
         positive_gaps = sorted([g for g in gaps if g >= 0.0])
         median_gap = positive_gaps[len(positive_gaps) // 2] if positive_gaps else 0.0
         avg_width = sum(widths) / len(widths) if widths else 10.0
         gap_threshold = max(median_gap * 2.0, avg_width * 2.0)
 
-        groups: List[str] = []
+        groups: List[Dict[str, Any]] = []
         current = ""
+        current_tokens: List[Dict[str, Any]] = []
         prev_x2 = None
 
-        for ch, x1, x2 in tokens:
+        for token in tokens:
+            ch = token['char']
+            x1 = token['x1']
+            x2 = token['x2']
             is_punctuation = ch in [',', ':']
 
             if prev_x2 is not None:
                 gap = x1 - prev_x2
                 if gap > gap_threshold and current:
-                    groups.append(current)
+                    groups.append({'text': current, 'tokens': current_tokens})
                     current = ""
+                    current_tokens = []
 
             if is_punctuation:
                 if current:
-                    groups.append(current)
+                    groups.append({'text': current, 'tokens': current_tokens})
                     current = ""
+                    current_tokens = []
                 prev_x2 = x2
                 continue
 
-            # If a minus sign appears immediately after digits, treat it as a
-            # new numeric group start (e.g. "-1168-6592" -> "-1168", "-6592").
-            # This is constrained to continuity grouping and still guarded later
-            # by timestamp/noise checks in Path B.
             if ch == '-' and current and current[-1].isdigit():
-                groups.append(current)
+                groups.append({'text': current, 'tokens': current_tokens})
                 current = '-'
+                current_tokens = [token]
                 prev_x2 = x2
                 continue
 
             if ch.isdigit() or ch == '-':
                 current += ch
+                current_tokens.append(token)
 
             prev_x2 = x2
 
         if current:
-            groups.append(current)
+            groups.append({'text': current, 'tokens': current_tokens})
 
-        # Merge standalone '-' with next numeric group
-        merged: List[str] = []
+        merged: List[Dict[str, Any]] = []
         i = 0
         while i < len(groups):
-            if groups[i] == '-' and i + 1 < len(groups) and re.fullmatch(r'\d{1,7}', groups[i + 1]):
-                merged.append('-' + groups[i + 1])
+            if (
+                groups[i]['text'] == '-'
+                and i + 1 < len(groups)
+                and re.fullmatch(r'\d{1,7}', groups[i + 1]['text'])
+            ):
+                merged.append({
+                    'text': '-' + groups[i + 1]['text'],
+                    'tokens': groups[i]['tokens'] + groups[i + 1]['tokens'],
+                })
                 i += 2
                 continue
             merged.append(groups[i])
@@ -556,6 +524,10 @@ class OCRWorker(QThread):
 
         avg_conf = (sum(confidences) / len(confidences)) if confidences else 0.0
         return merged, avg_conf
+
+    def _group_contiguous_tokens(self, detections: List[Dict[str, Any]]) -> Tuple[List[str], float]:
+        groups, avg_conf = self._group_contiguous_token_details(detections)
+        return [g['text'] for g in groups], avg_conf
 
     def _truncate_groups_before_timestamp(self, groups: List[str]) -> List[str]:
         """Drop groups from first timestamp-like year segment onward.
@@ -576,6 +548,25 @@ class OCRWorker(QThread):
             return kept
         return groups
 
+    def _truncate_group_details_before_timestamp(self, groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        current_year = str(datetime.datetime.now().year)
+        kept: List[Dict[str, Any]] = []
+        for group in groups:
+            text = str(group.get('text', ''))
+            m = re.search(re.escape(current_year), text)
+            if not m:
+                kept.append(group)
+                continue
+
+            head = text[:m.start()].strip()
+            if re.fullmatch(r'-?\d{1,7}', head):
+                kept.append({
+                    'text': head,
+                    'tokens': list(group.get('tokens', []))[:len(head)],
+                })
+            return kept
+        return groups
+
     def _extract_xyz_from_numeric_groups(self, groups: List[str]) -> Optional[Tuple[int, int, int]]:
         """From numeric group stream, choose best valid coordinate triplet."""
         numeric: List[str] = []
@@ -591,41 +582,6 @@ class OCRWorker(QThread):
                 numeric.append(f"-{m.group(2)}")
 
         if len(numeric) < 3:
-            # Compact merge pattern: ["-1168", "-6592395"] -> (-1168, -6592, 395)
-            if len(numeric) == 2:
-                x_text, yz_text = numeric[0], numeric[1]
-                sign = '-' if yz_text.startswith('-') else ''
-                yz_digits = yz_text[1:] if sign else yz_text
-                if yz_digits.isdigit() and 4 <= len(yz_digits) <= 7:
-                    split_pairs: List[Tuple[str, str]] = []
-                    # Prefer z=3 first, then 2/4 as fallback
-                    for z_len in (3, 2, 4):
-                        y_len = len(yz_digits) - z_len
-                        if y_len < 1 or y_len > 7:
-                            continue
-                        y_text = f"{sign}{yz_digits[:y_len]}"
-                        z_text = yz_digits[y_len:]
-                        split_pairs.append((y_text, z_text))
-
-                    candidate_xyz: List[Tuple[int, int, int]] = []
-                    try:
-                        x_val = int(x_text)
-                    except Exception:
-                        x_val = None
-
-                    if x_val is not None:
-                        for y_text, z_text in split_pairs:
-                            try:
-                                y_val = int(y_text)
-                                z_val = int(z_text)
-                            except Exception:
-                                continue
-                            if all(abs(c) <= 9999999 for c in (x_val, y_val, z_val)):
-                                candidate_xyz.append((x_val, y_val, z_val))
-
-                    if candidate_xyz:
-                        return self._choose_best_xyz_candidate(candidate_xyz)
-
             return None
 
         triplet_candidates: List[Tuple[int, int, int]] = []
@@ -639,30 +595,11 @@ class OCRWorker(QThread):
         return self._choose_best_xyz_candidate(triplet_candidates)
 
     def _choose_best_xyz_candidate(self, candidates: List[Tuple[int, int, int]]) -> Optional[Tuple[int, int, int]]:
-        """Choose most plausible xyz deterministically (history-aware when available)."""
+        """Choose most plausible xyz deterministically from current frame only."""
         if not candidates:
             return None
 
         unique_candidates = list(dict.fromkeys(candidates))
-
-        last = self.last_valid_coord
-        if last is not None:
-            def _dist(c: Tuple[int, int, int]) -> float:
-                dx = c[0] - last[0]
-                dy = c[1] - last[1]
-                dz = c[2] - last[2]
-                return math.sqrt(dx * dx + dy * dy + dz * dz)
-
-            return sorted(
-                unique_candidates,
-                key=lambda c: (
-                    _dist(c),
-                    -self._score_xyz_without_history(c),
-                    abs(c[2]),
-                    c,
-                )
-            )[0]
-
         return sorted(
             unique_candidates,
             key=lambda c: (
@@ -701,89 +638,86 @@ class OCRWorker(QThread):
         score -= max(0, lz - 5) * 0.6
         return score
 
-    def _generate_xy_candidates_from_compact_group(self, compact_xy: str) -> List[Tuple[str, str]]:
-        """Split compact x+y group into candidate (x_text, y_text) pairs."""
-        text = compact_xy.strip()
-        if not re.fullmatch(r'-?\d{2,14}', text):
-            return []
-
-        sign = '-' if text.startswith('-') else ''
-        digits = text[1:] if sign else text
-        if len(digits) < 2:
-            return []
-
-        pairs: List[Tuple[str, str]] = []
-        for split_idx in range(1, len(digits)):
-            left = digits[:split_idx]
-            right = digits[split_idx:]
-            if not (1 <= len(left) <= 7 and 1 <= len(right) <= 7):
-                continue
-            x_text = f"{sign}{left}"
-            y_text = right
-            pairs.append((x_text, y_text))
-
-        return pairs
-
-    def _recover_xyz_from_two_groups(
+    def _split_numeric_group_by_largest_gap(
         self,
-        groups: List[str],
-        allow_compact_yz: bool = True,
-        allow_compact_xy: bool = True,
+        group: Dict[str, Any],
+        min_digits: int,
+    ) -> Optional[Tuple[str, str]]:
+        text = str(group.get('text', '')).strip()
+        if not re.fullmatch(r'-?\d{1,14}', text):
+            return None
+
+        digit_count = len(text[1:] if text.startswith('-') else text)
+        if digit_count < min_digits:
+            return None
+
+        tokens = list(group.get('tokens', []))
+        if len(tokens) < 3:
+            return None
+
+        candidates: List[Tuple[float, str, str]] = []
+        for split_idx in range(1, len(tokens)):
+            left = ''.join(str(t.get('char', '')) for t in tokens[:split_idx])
+            right = ''.join(str(t.get('char', '')) for t in tokens[split_idx:])
+            if not re.fullmatch(r'-?\d{1,7}', left):
+                continue
+            if not re.fullmatch(r'-?\d{1,7}', right):
+                continue
+            gap = float(tokens[split_idx].get('x1', 0.0)) - float(tokens[split_idx - 1].get('x2', 0.0))
+            candidates.append((gap, left, right))
+
+        if not candidates:
+            return None
+
+        widths = [max(1.0, float(t.get('x2', 0.0)) - float(t.get('x1', 0.0))) for t in tokens]
+        all_gaps = [
+            float(tokens[i].get('x1', 0.0)) - float(tokens[i - 1].get('x2', 0.0))
+            for i in range(1, len(tokens))
+        ]
+        median_gap = sorted(all_gaps)[len(all_gaps) // 2] if all_gaps else 0.0
+        avg_width = sum(widths) / len(widths) if widths else 10.0
+
+        gap, left, right = max(candidates, key=lambda item: item[0])
+        if gap < median_gap + avg_width * 0.5:
+            return None
+        return left, right
+
+    def _recover_xyz_from_two_group_details(
+        self,
+        groups: List[Dict[str, Any]],
     ) -> Optional[Tuple[int, int, int]]:
-        """Recover xyz from two groups, supporting compact XY and compact YZ patterns."""
         if len(groups) != 2:
             return None
 
-        g1, g2 = groups[0], groups[1]
+        g1 = str(groups[0].get('text', ''))
+        g2 = str(groups[1].get('text', ''))
         candidates: List[Tuple[int, int, int]] = []
 
-        # Pattern A: compact YZ, existing behavior generalized
-        if allow_compact_yz and re.fullmatch(r'-?\d{1,7}', g1):
-            sign = '-' if g2.startswith('-') else ''
-            yz_digits = g2[1:] if sign else g2
-            if yz_digits.isdigit() and 4 <= len(yz_digits) <= 7:
+        if re.fullmatch(r'-?\d{1,7}', g2):
+            split_xy = self._split_numeric_group_by_largest_gap(groups[0], min_digits=6)
+            if split_xy is not None:
+                x_text, y_text = split_xy
+                try:
+                    x_val = int(x_text)
+                    y_val = int(y_text)
+                    z_val = int(g2)
+                except Exception:
+                    z_val = None
+                if z_val is not None and all(abs(c) <= 9999999 for c in (x_val, y_val, z_val)):
+                    candidates.append((x_val, y_val, z_val))
+
+        if re.fullmatch(r'-?\d{1,7}', g1):
+            split_yz = self._split_numeric_group_by_largest_gap(groups[1], min_digits=4)
+            if split_yz is not None:
+                y_text, z_text = split_yz
                 try:
                     x_val = int(g1)
+                    y_val = int(y_text)
+                    z_val = int(z_text)
                 except Exception:
-                    x_val = None
-
-                if x_val is not None:
-                    for z_len in (3, 2, 4, 1):
-                        y_len = len(yz_digits) - z_len
-                        if not (1 <= y_len <= 7):
-                            continue
-                        y_text = f"{sign}{yz_digits[:y_len]}"
-                        z_text = yz_digits[y_len:]
-                        try:
-                            y_val = int(y_text)
-                            z_val = int(z_text)
-                        except Exception:
-                            continue
-                        if all(abs(c) <= 9999999 for c in (x_val, y_val, z_val)):
-                            candidates.append((x_val, y_val, z_val))
-
-        # Pattern B: compact XY + explicit Z (key missing-comma rescue)
-        # Require compact XY group to be long enough to avoid mis-parsing
-        # normal two-value input like "-500,100".
-        if allow_compact_xy and re.fullmatch(r'-?\d{1,7}', g2):
-            g1_digits = g1[1:] if g1.startswith('-') else g1
-            if not (g1_digits.isdigit() and 6 <= len(g1_digits) <= 14):
-                return self._choose_best_xyz_candidate(candidates)
-            xy_pairs = self._generate_xy_candidates_from_compact_group(g1)
-            try:
-                z_val = int(g2)
-            except Exception:
-                z_val = None
-
-            if z_val is not None:
-                for x_text, y_text in xy_pairs:
-                    try:
-                        x_val = int(x_text)
-                        y_val = int(y_text)
-                    except Exception:
-                        continue
-                    if all(abs(c) <= 9999999 for c in (x_val, y_val, z_val)):
-                        candidates.append((x_val, y_val, z_val))
+                    z_val = None
+                if z_val is not None and all(abs(c) <= 9999999 for c in (x_val, y_val, z_val)):
+                    candidates.append((x_val, y_val, z_val))
 
         return self._choose_best_xyz_candidate(candidates)
 
@@ -793,34 +727,6 @@ class OCRWorker(QThread):
         within_59 = sum(1 for v in vals if v <= 59)
         within_23 = any(v <= 23 for v in vals)
         return within_59 >= 2 and within_23
-
-    def _is_safe_timestamp_noise_compact_yz_candidate(self, xyz: Tuple[int, int, int]) -> bool:
-        """Extra guard for compact-yz recovery under timestamp noise.
-
-        When timestamp text contaminates the OCR string, two-group recovery (x, yz)
-        can accidentally absorb HH:MM:SS fragments into yz. This helper keeps the
-        recovery conservative by requiring trajectory history and a reasonable
-        delta from the last stable coordinate.
-        """
-        if self.last_valid_coord is None:
-            return False
-
-        last_x, last_y, last_z = self.last_valid_coord
-        x, y, z = xyz
-
-        dx = x - last_x
-        dy = y - last_y
-        dz = z - last_z
-        horizontal_distance = math.sqrt(dx * dx + dy * dy)
-
-        # Stay within normal movement thresholds; don't accept teleports from
-        # this recovery mode because it's the most error-prone.
-        if horizontal_distance > float(self.max_speed_threshold):
-            return False
-        if abs(dz) > float(self.z_axis_threshold):
-            return False
-
-        return True
 
     def _parse_path_b_spacing_dominant(self, detections: List[Dict[str, Any]]) -> Tuple[bool, Optional[Tuple[int, int, int]], Dict[str, Any]]:
         """
@@ -847,7 +753,8 @@ class OCRWorker(QThread):
             if not chars:
                 return False, None, metadata
 
-            groups, avg_conf = self._group_contiguous_tokens(detections)
+            group_details, avg_conf = self._group_contiguous_token_details(detections)
+            groups = [g['text'] for g in group_details]
             metadata['avg_confidence'] = avg_conf
             metadata['groups'] = list(groups)
 
@@ -865,8 +772,8 @@ class OCRWorker(QThread):
                     metadata['method'] = 'path_b'
                     return True, (x, y, z), metadata
 
-            # Continuity-group parse (non-fixed group count)
-            trimmed_groups = self._truncate_groups_before_timestamp(groups)
+            trimmed_details = self._truncate_group_details_before_timestamp(group_details)
+            trimmed_groups = [g['text'] for g in trimmed_details]
             metadata['trimmed_groups'] = list(trimmed_groups)
             current_year = str(datetime.datetime.now().year)
             metadata['timestamp_noise_detected'] = bool(re.search(re.escape(current_year), ''.join(groups)))
@@ -874,47 +781,18 @@ class OCRWorker(QThread):
 
             timestamp_noise = bool(metadata['timestamp_noise_detected'])
 
-            # Guard: with timestamp noise, allow only {2,3} groups for compact recovery;
-            # reject wider residual group streams to avoid taking HH/MM/SS fragments.
             if timestamp_noise and len(trimmed_groups) not in (2, 3):
                 metadata['method'] = 'path_b_groups_reject_timestamp_noise'
                 return False, None, metadata
 
-            # Under timestamp noise, two-group compact-YZ recovery is risky.
-            # However, when we have a stable trajectory history, allow it and
-            # validate against last_valid_coord to prevent time-fragment leakage.
-            allow_compact_yz_under_timestamp_noise = (
-                timestamp_noise
-                and len(trimmed_groups) == 2
-                and self.last_valid_coord is not None
-            )
-
-            if timestamp_noise and len(trimmed_groups) == 2 and not allow_compact_yz_under_timestamp_noise:
-                xyz = None
-            else:
-                xyz = self._extract_xyz_from_numeric_groups(trimmed_groups)
+            xyz = self._extract_xyz_from_numeric_groups(trimmed_groups)
 
             if xyz is None and len(trimmed_groups) == 2:
-                if timestamp_noise and self.last_valid_coord is None:
-                    metadata['method'] = 'path_b_groups_reject_timestamp_noise'
-                    return False, None, metadata
-
-                xyz = self._recover_xyz_from_two_groups(
-                    trimmed_groups,
-                    allow_compact_yz=(not timestamp_noise) or allow_compact_yz_under_timestamp_noise,
-                    allow_compact_xy=True,
-                )
+                xyz = self._recover_xyz_from_two_group_details(trimmed_details)
                 if xyz is not None:
-                    metadata['recovered_from_two_groups'] = True
-
-            if xyz is not None and allow_compact_yz_under_timestamp_noise:
-                metadata['recovered_compact_yz_under_timestamp_noise'] = True
-                if not self._is_safe_timestamp_noise_compact_yz_candidate(xyz):
-                    metadata['method'] = 'path_b_groups_reject_timestamp_noise'
-                    return False, None, metadata
+                    metadata['recovered_from_two_group_gap'] = True
 
             if xyz is not None:
-                # Additional guard for obvious time-like contamination.
                 if metadata['has_time_like_segment'] and self._is_time_contaminated_triplet(xyz):
                     metadata['method'] = 'path_b_groups_reject_time_contaminated_triplet'
                     return False, None, metadata
@@ -943,168 +821,6 @@ class OCRWorker(QThread):
             self.logger.debug(f"[PATH_B] 解析失败: {e}")
             return False, None, metadata
 
-    def _is_near(
-        self,
-        coord1: Tuple[int, int, int],
-        coord2: Tuple[int, int, int],
-        tolerance: int = 100
-    ) -> bool:
-        dx = coord1[0] - coord2[0]
-        dy = coord1[1] - coord2[1]
-        dz = coord1[2] - coord2[2]
-        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-        return dist <= tolerance
-
-    def _process_suspect_jump(self, candidate_coord: Tuple[int, int, int]) -> Optional[Tuple[int, int, int]]:
-        """
-        Two-stage suspect confirmation:
-        - Frame N: record suspect, return None
-        - Frame N+1: confirm if near suspect, else reject to stable coord
-        """
-        if self.last_valid_coord is None:
-            return candidate_coord
-
-        if self.suspect_jump is None:
-            self.suspect_jump = {
-                'coord': candidate_coord,
-                'count': 1,
-                'stable_coord': self.last_valid_coord
-            }
-            return None
-
-        suspect_coord = self.suspect_jump['coord']
-        if self._is_near(candidate_coord, suspect_coord, tolerance=100):
-            self.suspect_jump['count'] += 1
-            if self.suspect_jump['count'] >= self.suspect_confirmation_window:
-                confirmed = suspect_coord
-                self.suspect_jump = None
-                return confirmed
-            return None
-
-        # reject: keep stable
-        stable = self.suspect_jump['stable_coord']
-        self.suspect_jump = None
-        return stable
-
-    def _reset_suspect_on_failure(self) -> Optional[Tuple[int, int, int]]:
-        """Reset suspect buffer on failure/no-data and return stable coordinate if any."""
-        if self.suspect_jump is None:
-            return None
-        stable = self.suspect_jump.get('stable_coord')
-        self.suspect_jump = None
-        return stable
-
-    def _update_last_successful_bbox(self, detections: List[Dict[str, Any]]) -> None:
-        if not detections:
-            return
-        try:
-            x_min = min(float(d['bbox'][0]) for d in detections)
-            y_min = min(float(d['bbox'][1]) for d in detections)
-            x_max = max(float(d['bbox'][2]) for d in detections)
-            y_max = max(float(d['bbox'][3]) for d in detections)
-            self.last_successful_bbox = {
-                'x': int(x_min),
-                'y': int(y_min),
-                'width': int(max(0.0, x_max - x_min)),
-                'height': int(max(0.0, y_max - y_min)),
-            }
-            if isinstance(self.capture_area, dict):
-                origin_x = int(self.capture_area.get('x', 0) or 0)
-                origin_y = int(self.capture_area.get('y', 0) or 0)
-                center_x = origin_x + int(self.last_successful_bbox['x'] + self.last_successful_bbox['width'] / 2)
-                center_y = origin_y + int(self.last_successful_bbox['y'] + self.last_successful_bbox['height'] / 2)
-                self.dynamic_roi_anchor_center_global = (center_x, center_y)
-            self.logger.debug(f"[DYNAMIC_ROI] Updated successful bbox: {self.last_successful_bbox}")
-        except Exception:
-            return
-
-    def _shrink_roi_to_detections(self) -> None:
-        if not isinstance(self.capture_area, dict) or not self.last_successful_bbox:
-            return
-
-        old_w = int(self.capture_area.get('width', 0) or 0)
-        old_h = int(self.capture_area.get('height', 0) or 0)
-        margin = max(0, int(self.ROI_SHRINK_MARGIN))
-        bbox = self.last_successful_bbox
-        origin_x = int(self.capture_area.get('x', 0) or 0)
-        origin_y = int(self.capture_area.get('y', 0) or 0)
-        # bbox is ROI-local; convert to screen-global before updating capture area
-        new_x = max(0, origin_x + int(bbox['x'] - margin))
-        new_y = max(0, origin_y + int(bbox['y'] - margin))
-        new_w = int(min(self.ROI_MAX_WIDTH, bbox['width'] + margin * 2))
-        new_h = int(min(self.ROI_MAX_HEIGHT, bbox['height'] + margin * 2))
-
-        # Clamp to minimum ROI size only when source ROI is already at/above that scale.
-        # Never enlarge width during shrink for small base ROIs.
-        if old_w >= int(self.ROI_MIN_WIDTH):
-            new_w = max(int(self.ROI_MIN_WIDTH), new_w)
-        if old_h >= int(self.ROI_MIN_HEIGHT):
-            new_h = max(int(self.ROI_MIN_HEIGHT), new_h)
-
-        if self.dynamic_roi_base_area is None:
-            self.dynamic_roi_base_area = dict(self.capture_area)
-        self.capture_area.update({'x': new_x, 'y': new_y, 'width': new_w, 'height': new_h})
-        self.dynamic_roi_active = True
-        self.dynamic_failure_count = 0
-        self._emit_capture_area_updated()
-        self.logger.info(
-            f"[DYNAMIC_ROI] ✓ ROI shrunk from {old_w}x{old_h} to {new_w}x{new_h} at ({new_x}, {new_y})"
-        )
-
-    def _expand_roi_on_failure(self) -> None:
-        if not isinstance(self.capture_area, dict) or not self.last_successful_bbox:
-            return
-
-        old_w = int(self.capture_area['width'])
-        old_h = int(self.capture_area['height'])
-        origin_x = int(self.capture_area.get('x', 0) or 0)
-        origin_y = int(self.capture_area.get('y', 0) or 0)
-
-        new_w = min(self.ROI_MAX_WIDTH, old_w + self.ROI_EXPAND_PIXELS * 2)
-        new_h = min(self.ROI_MAX_HEIGHT, old_h + self.ROI_EXPAND_PIXELS * 2)
-
-        if self.dynamic_roi_anchor_center_global is not None:
-            center_x, center_y = self.dynamic_roi_anchor_center_global
-        else:
-            # fallback: last_successful_bbox is ROI-local; convert center to screen-global
-            center_x = origin_x + int(self.last_successful_bbox['x'] + self.last_successful_bbox['width'] / 2)
-            center_y = origin_y + int(self.last_successful_bbox['y'] + self.last_successful_bbox['height'] / 2)
-        new_x = max(0, center_x - new_w // 2)
-        new_y = max(0, center_y - new_h // 2)
-
-        self.capture_area.update({'x': int(new_x), 'y': int(new_y), 'width': int(new_w), 'height': int(new_h)})
-        self._emit_capture_area_updated()
-        self.logger.info(
-            f"[DYNAMIC_ROI] ⚠ ROI expanded from {old_w}x{old_h} to {new_w}x{new_h} at ({new_x}, {new_y})"
-        )
-
-    def _reset_dynamic_roi_to_base(self) -> None:
-        if isinstance(self.dynamic_roi_base_area, dict):
-            self.capture_area = dict(self.dynamic_roi_base_area)
-            self._emit_capture_area_updated()
-            self.logger.warning(
-                f"[DYNAMIC_ROI] ↩ rollback to base area after {self.dynamic_failure_count} failures: {self.capture_area}"
-            )
-
-        self.dynamic_roi_active = False
-        self.dynamic_failure_count = 0
-        self.consecutive_success_count = 0
-        self.last_successful_bbox = None
-        self.dynamic_roi_anchor_center_global = None
-
-    def _on_dynamic_roi_failure(self) -> None:
-        if not self.dynamic_roi_active:
-            self.consecutive_success_count = 0
-            return
-
-        self.dynamic_failure_count += 1
-        if self.dynamic_failure_count >= self.ROI_MAX_FAILURES_BEFORE_RESET:
-            self._reset_dynamic_roi_to_base()
-            return
-
-        self._expand_roi_on_failure()
-        self.consecutive_success_count = 0
-    
     @staticmethod
     def _class_id_to_char_static(class_id: int) -> str | None:
         try:
@@ -1146,14 +862,14 @@ class OCRWorker(QThread):
             return class_names
     
     def load_model(self, model_path=None) -> bool:
-        """Load ONNX coordinate recognition model."""
+        """Load YOLOv8 coordinate recognition model."""
         try:
             if model_path is None:
-                model_path = self.config_dict.get('model_path', paths.model_file("coord_ocr.onnx"))
+                model_path = self.config_dict.get('model_path', paths.model_file("coord_ocr.pt"))
 
             model_path = Path(model_path)
-            if str(model_path).replace("\\", "/") == "models/coord_ocr.onnx":
-                model_path = paths.model_file("coord_ocr.onnx")
+            if str(model_path).replace("\\", "/") == "models/coord_ocr.pt":
+                model_path = paths.model_file("coord_ocr.pt")
             
             if not model_path.exists():
                 error_msg = f"模型文件不存在: {model_path}"
@@ -1161,16 +877,27 @@ class OCRWorker(QThread):
                 self.error_occurred.emit(error_msg)
                 return False
 
-            self.model = ort.InferenceSession(str(model_path), providers=['CPUExecutionProvider'])
-            inputs = self.model.get_inputs()
-            if not inputs:
-                raise ValueError("ONNX model has no inputs")
-            self.model_input_name = inputs[0].name
-            shape = inputs[0].shape
-            if len(shape) >= 4 and isinstance(shape[2], int) and isinstance(shape[3], int):
-                self.model_input_shape = (shape[2], shape[3])
+            original_torch_load = torch.load
 
-            self.logger.info(f"ONNX OCR模型加载成功: {model_path}")
+            def _compat_torch_load(*args, **kwargs):
+                kwargs['weights_only'] = False
+                return original_torch_load(*args, **kwargs)
+
+            try:
+                import ultralytics.utils  # noqa: F401
+                from ultralytics.utils import GIT as _UL_GIT  # noqa: F401
+            except Exception as _e:
+                self.logger.warning(f"Ultralytics utils preload failed (non-fatal): {_e}")
+
+            torch.load = _compat_torch_load
+            try:
+                self.model = YOLO(str(model_path))
+            finally:
+                torch.load = original_torch_load
+
+            self.model.to('cpu')
+
+            self.logger.info(f"YOLOv8模型加载成功: {model_path}")
             return True
             
         except Exception as e:
@@ -1260,54 +987,21 @@ class OCRWorker(QThread):
         """Get current recognition state"""
         return self.recognition_state
     
-    def update_advanced_parameters(self, params: Dict[str, Any]):
-        """Update advanced OCR parameters dynamically"""
-        try:
-            if 'confidence_threshold' in params:
-                self.confidence_threshold = params['confidence_threshold']
-            
-            if 'max_speed_threshold' in params:
-                self.max_speed_threshold = params['max_speed_threshold']
-            
-            if 'ema_alpha' in params:
-                self.ema_alpha = params['ema_alpha']
-            
-            if 'lost_threshold_frames' in params:
-                self.lost_threshold_frames = params['lost_threshold_frames']
-            
-            if 'z_axis_threshold' in params:
-                self.z_axis_threshold = params['z_axis_threshold']
-            
-            self.logger.info(f"高级OCR参数已更新: {params}")
-            
-        except Exception as e:
-            self.logger.error(f"更新高级OCR参数失败: {e}")
-    
     def run(self):
         """Main thread execution loop"""
         self.is_running = True
         
         # Load model and settings
         if not self.load_model():
-            self.ocr_output_updated.emit("❌ 模型加载失败，请检查models/coord_ocr.onnx文件")
+            self.ocr_output_updated.emit("❌ 模型加载失败，请检查models/coord_ocr.pt文件")
             self.error_occurred.emit("OCR模型加载失败")
             self.is_running = False
             return
         
         self.load_settings()
         
-        # Reset state
-        self.recognition_state = RecognitionState.SEARCHING
-        self.last_valid_coord = None
-        self.last_valid_detections = None
-        self.consecutive_failures = 0
-        self.suspect_jump = None
-        self.consecutive_success_count = 0
-        self.last_successful_bbox = None
-        self.dynamic_roi_active = False
-        self.dynamic_failure_count = 0
-        self.dynamic_roi_base_area = None
-        self.dynamic_roi_anchor_center_global = None
+        # Reset current-frame state
+        self.recognition_state = RecognitionState.FAILED
         
         # Emit initial state
         self.recognition_state_changed.emit(self.recognition_state)
@@ -1334,19 +1028,6 @@ class OCRWorker(QThread):
                 # 应用跟踪算法
                 success, final_coords = self._apply_tracking_algorithm(detections)
 
-                # Dynamic ROI: conditional activation with progressive shrinking/expansion
-                if self.config_dict.get('auto_detect_region_enabled', True):
-                    if success and final_coords is not None:
-                        self._update_last_successful_bbox(detections)
-                        self.consecutive_success_count += 1
-                        self.dynamic_failure_count = 0
-
-                        if self.consecutive_success_count >= self.ROI_TRIGGER_FRAMES:
-                            self._shrink_roi_to_detections()
-                            self.consecutive_success_count = 0
-                    else:
-                        self._on_dynamic_roi_failure()
-                
                 # Calculate sleep time to maintain consistent interval
                 processing_time = (time.time() - frame_start_time) * 1000
                 sleep_time = max(0, self.ocr_interval - processing_time)
@@ -1401,11 +1082,11 @@ class OCRWorker(QThread):
                 self.logger.error(f"截图失败 (第{self._capture_error_count}次): {e}")
             
             return None
-    
+
     def _run_yolo_inference(self, image: npt.NDArray[np.uint8]) -> List[Dict[str, Any]]:
         try:
             if self.model is None:
-                self.logger.error("ONNX OCR model is not loaded")
+                self.logger.error("YOLO model is not loaded")
                 self._last_inference_debug = {
                     'roi': dict(self.capture_area) if isinstance(self.capture_area, dict) else None,
                     'total_boxes': 0,
@@ -1415,16 +1096,69 @@ class OCRWorker(QThread):
                 }
                 return []
 
-            input_tensor = self._prepare_onnx_input(image)
-            outputs = self.model.run(None, {self.model_input_name: input_tensor})
-            detections, debug = self._parse_onnx_output(outputs[0])
+            results = self.model(image, verbose=False)
+            detections: List[Dict[str, Any]] = []
+            collect_debug = self._is_detailed_debug_enabled()
+            debug_entries: List[Dict[str, Any]] = []
+            total_boxes = 0
+            kept_boxes = 0
+            for result in results:
+                boxes = result.boxes
+                if boxes is None:
+                    continue
+                for i in range(len(boxes)):
+                    total_boxes += 1
+                    confidence = float(boxes.conf[i])
+                    class_id = int(boxes.cls[i])
+                    char = OCRWorker._class_id_to_char_static(class_id) or '?'
+                    threshold = self._get_confidence_threshold_for_class(class_id)
+                    kept = confidence >= threshold
+                    x1 = float(boxes.xyxy[i][0].item())
+                    y1 = float(boxes.xyxy[i][1].item())
+                    x2 = float(boxes.xyxy[i][2].item())
+                    y2 = float(boxes.xyxy[i][3].item())
+                    if collect_debug and len(debug_entries) < 120:
+                        debug_entries.append({
+                            'char': char,
+                            'class_id': class_id,
+                            'confidence': confidence,
+                            'threshold': threshold,
+                            'x': x1,
+                            'x1': x1,
+                            'y1': y1,
+                            'x2': x2,
+                            'y2': y2,
+                            'kept': kept,
+                        })
+                    if kept:
+                        kept_boxes += 1
+                        detections.append({
+                            'class': class_id,
+                            'bbox': boxes.xyxy[i].cpu().numpy(),
+                            'confidence': confidence,
+                        })
+            debug = {
+                'total_boxes': total_boxes,
+                'kept_boxes': kept_boxes,
+                'filtered_boxes': max(0, total_boxes - kept_boxes),
+                'entries': debug_entries,
+            }
             self._last_inference_debug = {
                 **debug,
                 'roi': dict(self.capture_area) if isinstance(self.capture_area, dict) else None,
             }
             return detections
         except Exception as e:
-            self.logger.error(f"ONNX OCR推理失败: {e}")
+            try:
+                import sys as _sys
+                import ultralytics as _ul
+                ul_ver = getattr(_ul, '__version__', 'unknown')
+                ul_file = getattr(_ul, '__file__', 'unknown')
+                self.logger.error(
+                    f"YOLO推理失败: {e} | ultralytics={ul_ver} ({ul_file}) | python={_sys.executable}"
+                )
+            except Exception:
+                self.logger.error(f"YOLO推理失败: {e}")
             self._last_inference_debug = {
                 'roi': dict(self.capture_area) if isinstance(self.capture_area, dict) else None,
                 'total_boxes': 0,
@@ -1433,92 +1167,9 @@ class OCRWorker(QThread):
                 'entries': [],
             }
             return []
-
-    def _prepare_onnx_input(self, image: npt.NDArray[np.uint8]) -> npt.NDArray[np.float32]:
-        target_h, target_w = self.model_input_shape
-        source_h, source_w = image.shape[:2]
-        self._last_onnx_source_shape = (int(source_h), int(source_w))
-        scale = min(float(target_w) / float(source_w), float(target_h) / float(source_h))
-        resized_w = int(round(source_w * scale))
-        resized_h = int(round(source_h * scale))
-        resized = cv2.resize(image, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
-        pad_x = float(target_w - resized_w) / 2.0
-        pad_y = float(target_h - resized_h) / 2.0
-        canvas = np.full((target_h, target_w, 3), 114, dtype=np.uint8)
-        left = int(round(pad_x - 0.1))
-        top = int(round(pad_y - 0.1))
-        canvas[top:top + resized_h, left:left + resized_w] = resized
-        self._last_onnx_scale = (1.0 / scale, 1.0 / scale)
-        self._last_onnx_pad = (float(left), float(top))
-        image = canvas
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        tensor = image_rgb.transpose(2, 0, 1).astype(np.float32) / 255.0
-        return np.expand_dims(tensor, axis=0)
-
-    def _parse_onnx_output(self, output: npt.NDArray[np.float32]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        arr = np.asarray(output)
-        if arr.ndim == 3:
-            arr = arr[0]
-
-        detections: List[Dict[str, Any]] = []
-        debug_entries: List[Dict[str, Any]] = []
-        total_boxes = 0
-        kept_boxes = 0
-        collect_debug = self._is_detailed_debug_enabled()
-
-        for row in arr:
-            if len(row) < 6:
-                continue
-            total_boxes += 1
-            raw_x1, raw_y1, raw_x2, raw_y2, confidence, class_id_float = row[:6]
-            confidence = float(confidence)
-            class_id = int(round(float(class_id_float)))
-            threshold = self._get_confidence_threshold_for_class(class_id)
-            scale_x, scale_y = self._last_onnx_scale
-            pad_x, pad_y = self._last_onnx_pad
-            x1 = (float(raw_x1) - pad_x) * scale_x
-            y1 = (float(raw_y1) - pad_y) * scale_y
-            x2 = (float(raw_x2) - pad_x) * scale_x
-            y2 = (float(raw_y2) - pad_y) * scale_y
-            source_h, source_w = self._last_onnx_source_shape
-            if source_h > 0 and source_w > 0:
-                x1 = max(0.0, min(float(source_w), x1))
-                x2 = max(0.0, min(float(source_w), x2))
-                y1 = max(0.0, min(float(source_h), y1))
-                y2 = max(0.0, min(float(source_h), y2))
-            valid_box = (x2 - x1) >= 1.0 and (y2 - y1) >= 1.0
-            kept = confidence >= threshold and valid_box
-
-            if collect_debug and len(debug_entries) < 120:
-                debug_entries.append({
-                    'char': OCRWorker._class_id_to_char_static(class_id) or '?',
-                    'class_id': class_id,
-                    'confidence': confidence,
-                    'threshold': threshold,
-                    'x': x1,
-                    'kept': kept,
-                })
-
-            if kept:
-                kept_boxes += 1
-                detections.append({
-                    'class': class_id,
-                    'bbox': np.array([x1, y1, x2, y2], dtype=np.float32),
-                    'confidence': confidence,
-                })
-
-        return detections, {
-            'total_boxes': total_boxes,
-            'kept_boxes': kept_boxes,
-            'filtered_boxes': max(0, total_boxes - kept_boxes),
-            'entries': debug_entries,
-        }
     
     def _apply_tracking_algorithm(self, raw_detections: List[Dict[str, Any]]) -> Tuple[bool, Optional[Tuple[int, int, int]]]:
-        """
-        重写的追踪算法：智能调试输出，支持简洁和详细两种模式
-        """
-        # 使用新的聚类算法
+        """Parse one OCR frame without reusing previous recognition results."""
         candidate_clusters = cluster_detections_to_rich_clusters(raw_detections)
         best_cluster, selection_details = find_best_coordinate_cluster(candidate_clusters)
         self._last_candidate_clusters = candidate_clusters
@@ -1527,207 +1178,59 @@ class OCRWorker(QThread):
         detection_count = len(raw_detections)
         cluster_count = len(candidate_clusters)
         
-        # 简洁模式：只显示关键信息
-        debug_info = f"OCR [{self.recognition_state}]: {detection_count}字符 -> {cluster_count}聚类"
-        
-        if candidate_clusters:
-            cluster_words = [f"'{cluster['word']}'" for cluster in candidate_clusters]
-            debug_info += f" | {' '.join(cluster_words)}"
-        
-        if best_cluster:
-            selected_word = best_cluster['word'].replace(" ", "").replace("\t", "")
-            debug_info += f" -> '{selected_word}' ✓"
-        else:
-            debug_info += f" -> 无匹配 ✗"
-        
-        success_this_frame = False
-        new_coords = None
+        path_b_result = self._parse_path_b_spacing_dominant(raw_detections)
+        is_valid, new_coords, _ = path_b_result
 
-        if self.recognition_state == RecognitionState.LOCKED:
-            success_this_frame, new_coords = self._handle_locked_state(raw_detections, best_cluster)
-        elif self.recognition_state in [RecognitionState.SEARCHING, RecognitionState.LOST]:
-            success_this_frame, new_coords = self._handle_searching_state(raw_detections, best_cluster)
-
-        # 最终状态更新与信号发射
-        if success_this_frame and new_coords is not None:
-            self.consecutive_failures = 0
-            self.last_valid_coord = new_coords
-            if self.recognition_state != RecognitionState.LOCKED:
-                self._transition_to_locked()
-            # 坐标去重：如果与上一个完全相同则跳过
-            if hasattr(self, 'last_emitted_coord') and self.last_emitted_coord == new_coords:
-                pass  # 跳过重复坐标
-            else:
-                self.coordinates_detected.emit(*new_coords)
-                self.last_emitted_coord = new_coords
-            # 发射成功的坐标结果
+        if is_valid and new_coords is not None:
+            self._set_recognition_state(RecognitionState.SUCCESS)
+            self._emit_detailed_pipeline_log(
+                self.recognition_state,
+                raw_detections,
+                best_cluster,
+                path_b_result,
+                True,
+                new_coords,
+                note="current_frame_success",
+            )
+            self.coordinates_detected.emit(*new_coords)
             final_output = f"✓ 坐标: ({new_coords[0]}, {new_coords[1]}, {new_coords[2]})"
             self.ocr_output_updated.emit(final_output)
-        else:
-            self.consecutive_failures += 1
-            if self.recognition_state == RecognitionState.LOCKED and self.consecutive_failures >= self.lost_threshold_frames:
-                self._transition_to_lost()
-            # 根据调试模式发射对应的信息
+            return True, new_coords
+
+        self._set_recognition_state(RecognitionState.FAILED)
+        self._emit_detailed_pipeline_log(
+            self.recognition_state,
+            raw_detections,
+            best_cluster,
+            path_b_result,
+            False,
+            None,
+            note="current_frame_failed",
+        )
+        if not self._is_detailed_debug_enabled():
+            debug_info = f"OCR [{self.recognition_state}]: {detection_count}字符 -> {cluster_count}聚类"
+
+            if candidate_clusters:
+                cluster_words = [f"'{cluster['word']}'" for cluster in candidate_clusters]
+                debug_info += f" | {' '.join(cluster_words)}"
+
+            if best_cluster:
+                selected_word = best_cluster['word'].replace(" ", "").replace("\t", "")
+                debug_info += f" -> '{selected_word}' ✓"
+            else:
+                debug_info += f" -> 无匹配 ✗"
             self.ocr_output_updated.emit(debug_info)
-        
-        return success_this_frame, new_coords
-    
-    def _handle_locked_state(self, raw_detections: List[Dict[str, Any]], best_cluster: Optional[Dict[str, Any]]) -> Tuple[bool, Optional[Tuple[int, int, int]]]:
-        """处理LOCKED状态：仅Path B解析 + suspect jump确认"""
-        best_detections = best_cluster.get('detections', []) if best_cluster else []
-        path_b_result = self._parse_path_b_spacing_dominant(raw_detections)
-        is_valid, parsed_coords, _ = path_b_result
-
-        if is_valid and parsed_coords is not None:
-            if self._is_teleport_jump(parsed_coords):
-                suspect_result = self._process_suspect_jump(parsed_coords)
-                if suspect_result is None:
-                    self._emit_detailed_pipeline_log(
-                        self.recognition_state,
-                        raw_detections,
-                        best_cluster,
-                        path_b_result,
-                        True if self.last_valid_coord is not None else False,
-                        self.last_valid_coord,
-                        note="suspect_pending",
-                    )
-                    if self.last_valid_coord is not None:
-                        return True, self.last_valid_coord
-                    return False, None
-
-                self.last_valid_detections = best_detections
-                self._emit_detailed_pipeline_log(
-                    self.recognition_state,
-                    raw_detections,
-                    best_cluster,
-                    path_b_result,
-                    True,
-                    suspect_result,
-                    note="suspect_confirmed_or_rejected",
-                )
-                return True, suspect_result
-
-            # Normal movement clears suspect state
-            self.suspect_jump = None
-            self.last_valid_detections = best_detections
-            self._emit_detailed_pipeline_log(
-                self.recognition_state,
-                raw_detections,
-                best_cluster,
-                path_b_result,
-                True,
-                parsed_coords,
-                note="normal",
-            )
-            return True, parsed_coords
-
-        suspect_reset = self._reset_suspect_on_failure()
-        if suspect_reset is not None:
-            self._emit_detailed_pipeline_log(
-                self.recognition_state,
-                raw_detections,
-                best_cluster,
-                path_b_result,
-                True,
-                suspect_reset,
-                note="suspect_reset_to_stable",
-            )
-            return True, suspect_reset
-
-        self._emit_detailed_pipeline_log(
-            self.recognition_state,
-            raw_detections,
-            best_cluster,
-            path_b_result,
-            False,
-            None,
-            note="path_b_failed",
-        )
-
         return False, None
 
-    def _handle_searching_state(self, raw_detections: List[Dict[str, Any]], best_cluster: Optional[Dict[str, Any]]) -> Tuple[bool, Optional[Tuple[int, int, int]]]:
-        """处理SEARCHING/LOST状态：仅Path B解析（不做jump过滤）"""
-        best_detections = best_cluster.get('detections', []) if best_cluster else []
-        path_b_result = self._parse_path_b_spacing_dominant(raw_detections)
-        is_valid, parsed_coords, _ = path_b_result
-
-        if is_valid and parsed_coords is not None:
-            self.last_valid_detections = best_detections
-            self._emit_detailed_pipeline_log(
-                self.recognition_state,
-                raw_detections,
-                best_cluster,
-                path_b_result,
-                True,
-                parsed_coords,
-                note="searching_or_lost",
-            )
-            return True, parsed_coords
-
-        self._emit_detailed_pipeline_log(
-            self.recognition_state,
-            raw_detections,
-            best_cluster,
-            path_b_result,
-            False,
-            None,
-            note="searching_or_lost_failed",
-        )
-
-        return False, None
-    
-    def _is_teleport_jump(self, coordinates: Tuple[int, int, int]) -> bool:
-        """Check if coordinate change exceeds maximum speed threshold"""
-        if not self.last_valid_coord:
-            return False
-        
-        # Calculate differences
-        dx = coordinates[0] - self.last_valid_coord[0]
-        dy = coordinates[1] - self.last_valid_coord[1]
-        dz = coordinates[2] - self.last_valid_coord[2]
-        
-        # Calculate 2D horizontal distance (X, Y only)
-        horizontal_distance = math.sqrt(dx*dx + dy*dy)
-        
-        # Z轴(高度)异常检测
-        if abs(dz) > self.z_axis_threshold:
-            return True
-        
-        # 水平移动检测
-        if horizontal_distance > self.max_speed_threshold:
-            return True
-        
-        return False
-    
-    def _transition_to_locked(self):
-        """Transition to LOCKED state"""
-        if self.recognition_state != RecognitionState.LOCKED:
-            self.recognition_state = RecognitionState.LOCKED
-            self.recognition_state_changed.emit(RecognitionState.LOCKED)
-            self.logger.info(f"[STATE_CHANGE] -> LOCKED")
-    
-    def _transition_to_lost(self):
-        """Transition to LOST state"""
-        if self.recognition_state != RecognitionState.LOST:
-            self.recognition_state = RecognitionState.LOST
-            self.recognition_state_changed.emit(RecognitionState.LOST)
-            self.logger.warning(f"[STATE_CHANGE] -> LOST (连续失败: {self.consecutive_failures})")
-    
-    def _transition_to_searching(self):
-        """Transition to SEARCHING state"""
-        if self.recognition_state != RecognitionState.SEARCHING:
-            self.recognition_state = RecognitionState.SEARCHING
-            self.recognition_state_changed.emit(RecognitionState.SEARCHING)
-            self.logger.info(f"[STATE_CHANGE] -> SEARCHING")
+    def _set_recognition_state(self, state: str) -> None:
+        if self.recognition_state != state:
+            self.recognition_state = state
+            self.recognition_state_changed.emit(state)
+            self.logger.info(f"[STATE_CHANGE] -> {state}")
     
     def get_current_state(self) -> str:
         """Get current recognition state"""
         return self.recognition_state
-    
-    def get_last_coordinates(self) -> Optional[Tuple[int, int, int]]:
-        """Get last valid coordinates"""
-        return self.last_valid_coord
     
     def update_confidence_threshold(self, threshold: float):
         """Update confidence threshold dynamically"""
@@ -1754,22 +1257,6 @@ class OCRWorker(QThread):
                 self.symbol_confidence_threshold = float(params['symbol_confidence_threshold'])
                 self.logger.debug(f"符号置信度阈值更新为: {self.symbol_confidence_threshold}")
             
-            if 'max_speed_threshold' in params:
-                self.max_speed_threshold = params['max_speed_threshold']
-                self.logger.debug(f"最大速度阈值更新为: {self.max_speed_threshold}")
-            
-            if 'ema_alpha' in params:
-                self.ema_alpha = params['ema_alpha']
-                self.logger.debug(f"EMA平滑因子更新为: {self.ema_alpha}")
-            
-            if 'lost_threshold_frames' in params:
-                self.lost_threshold_frames = params['lost_threshold_frames']
-                self.logger.debug(f"丢失阈值帧数更新为: {self.lost_threshold_frames}")
-            
-            if 'z_axis_threshold' in params:
-                self.z_axis_threshold = params['z_axis_threshold']
-                self.logger.debug(f"Z轴异常阈值更新为: {self.z_axis_threshold}")
-            
             # 其他高级参数（这些参数在函数中动态读取）
             if 'char_spacing_threshold' in params:
                 self.logger.debug(f"字符间距阈值设置为: {params['char_spacing_threshold']}")
@@ -1788,12 +1275,6 @@ class OCRWorker(QThread):
     def update_capture_settings(self, capture_area: Dict[str, int], interval: int, window_name: str):
         """Update capture settings"""
         self.capture_area = capture_area
-        self.dynamic_roi_base_area = dict(capture_area) if isinstance(capture_area, dict) else None
-        self.dynamic_roi_anchor_center_global = None
-        self.dynamic_failure_count = 0
-        self.dynamic_roi_active = False
-        self.last_successful_bbox = None
-        self.consecutive_success_count = 0
         self.ocr_interval = interval
         self.target_window_name = window_name
         self._emit_capture_area_updated()

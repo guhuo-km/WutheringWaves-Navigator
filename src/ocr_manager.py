@@ -36,15 +36,15 @@ except ImportError:
     def tr(key, default=None, **kwargs):
         return default if default is not None else key
 
-from ocr_engine import OCRWorker, RecognitionState
+from ocr_engine import OCRWorker
 from ocr_region_calibrator import OCRRegionCalibrator
 from screen_capture import capture_region_callback
 from core import paths
 
 
-BUILTIN_OCR_MODEL_PATH = "models/coord_ocr.onnx"
+BUILTIN_OCR_MODEL_PATH = "models/coord_ocr.pt"
 LEGACY_BUILTIN_OCR_MODEL_PATHS = {
-    "models/coord_ocr.pt",
+    "models/coord_ocr.onnx",
 }
 
 
@@ -55,7 +55,7 @@ def _normalized_model_path_value(model_path: object) -> str:
 def resolve_ocr_model_path(model_path: object) -> Path:
     normalized = _normalized_model_path_value(model_path)
     if normalized == BUILTIN_OCR_MODEL_PATH:
-        return paths.model_file("coord_ocr.onnx")
+        return paths.model_file("coord_ocr.pt")
     return Path(model_path)
 
 
@@ -69,6 +69,9 @@ def normalize_builtin_ocr_model_path(config: Dict[str, Any]) -> Tuple[Dict[str, 
         return migrated, True
 
     if current_path == BUILTIN_OCR_MODEL_PATH:
+        if migrated.get("model_path") != BUILTIN_OCR_MODEL_PATH:
+            migrated["model_path"] = BUILTIN_OCR_MODEL_PATH
+            return migrated, True
         return migrated, False
 
     if current_path in LEGACY_BUILTIN_OCR_MODEL_PATHS:
@@ -247,54 +250,6 @@ class OCRAdvancedSettings(QDialog):
         
         layout.addWidget(detection_group)
         
-        # 坐标跟踪参数组
-        tracking_group = QGroupBox("坐标跟踪参数")
-        tracking_layout = QGridLayout(tracking_group)
-        
-        # 最大速度阈值
-        tracking_layout.addWidget(BodyLabel("最大移动速度:"), 0, 0)
-        self.max_speed_spinbox = SpinBox()
-        self.max_speed_spinbox.setRange(100, 5000)
-        self.max_speed_spinbox.setValue(1000)
-        tracking_layout.addWidget(self.max_speed_spinbox, 0, 1)
-        tracking_layout.addWidget(BodyLabel("(推荐: 1000, 范围: 100-5000)"), 0, 2)
-        
-        # 最大速度阈值说明
-        speed_desc = BodyLabel("检测传送跳跃的速度阈值。超过此值的坐标变化被视为瞬移")
-        speed_desc.setWordWrap(True)
-        speed_desc.setStyleSheet("color: #666; font-size: 11px; padding: 2px;")
-        tracking_layout.addWidget(speed_desc, 0, 3)
-        
-        # 丢失阈值帧数
-        tracking_layout.addWidget(BodyLabel("失联帧数阈值:"), 1, 0)
-        self.lost_frames_spinbox = SpinBox()
-        self.lost_frames_spinbox.setRange(1, 20)
-        self.lost_frames_spinbox.setValue(5)
-        tracking_layout.addWidget(self.lost_frames_spinbox, 1, 1)
-        tracking_layout.addWidget(BodyLabel("(推荐: 5, 范围: 1-20)"), 1, 2)
-        
-        # 丢失阈值帧数说明
-        lost_desc = BodyLabel("连续识别失败多少帧后重新搜索坐标。值越小越敏感")
-        lost_desc.setWordWrap(True)
-        lost_desc.setStyleSheet("color: #666; font-size: 11px; padding: 2px;")
-        tracking_layout.addWidget(lost_desc, 1, 3)
-        
-        # Z轴异常阈值
-        tracking_layout.addWidget(BodyLabel("垂直移动阈值:"), 2, 0)
-        self.z_threshold_spinbox = SpinBox()
-        self.z_threshold_spinbox.setRange(10, 200)
-        self.z_threshold_spinbox.setValue(50)
-        tracking_layout.addWidget(self.z_threshold_spinbox, 2, 1)
-        tracking_layout.addWidget(BodyLabel("(推荐: 50, 范围: 10-200)"), 2, 2)
-        
-        # Z轴异常阈值说明
-        z_desc = BodyLabel("垂直方向(Z轴)的异常移动检测。用于识别跳跃、飞行等动作")
-        z_desc.setWordWrap(True)
-        z_desc.setStyleSheet("color: #666; font-size: 11px; padding: 2px;")
-        tracking_layout.addWidget(z_desc, 2, 3)
-        
-        layout.addWidget(tracking_group)
-        
         # 调试日志设置组 - 恢复这个重要功能！
         debug_group = QGroupBox("调试日志设置")
         debug_layout = QGridLayout(debug_group)
@@ -355,11 +310,6 @@ class OCRAdvancedSettings(QDialog):
         # 基础识别参数
         self.confidence_spinbox.setValue(config.get('confidence_threshold', 0.45))
         
-        # 坐标跟踪参数
-        self.max_speed_spinbox.setValue(advanced.get('max_speed_threshold', 1000))
-        self.lost_frames_spinbox.setValue(advanced.get('lost_threshold_frames', 5))
-        self.z_threshold_spinbox.setValue(advanced.get('z_axis_threshold', 50))
-        
         # 调试日志设置
         self.verbose_debug_checkbox.setChecked(advanced.get('verbose_debug', False))
     
@@ -367,11 +317,6 @@ class OCRAdvancedSettings(QDialog):
         """重置为推荐值"""
         # 基础识别参数
         self.confidence_spinbox.setValue(0.45)
-        
-        # 坐标跟踪参数
-        self.max_speed_spinbox.setValue(1000)
-        self.lost_frames_spinbox.setValue(5)
-        self.z_threshold_spinbox.setValue(50)
         
         # 调试日志设置
         self.verbose_debug_checkbox.setChecked(False)
@@ -383,9 +328,6 @@ class OCRAdvancedSettings(QDialog):
         
         # 核心高级设置（包含调试日志）
         advanced_settings = {
-            'max_speed_threshold': self.max_speed_spinbox.value(),
-            'lost_threshold_frames': self.lost_frames_spinbox.value(),
-            'z_axis_threshold': self.z_threshold_spinbox.value(),
             'verbose_debug': self.verbose_debug_checkbox.isChecked()
         }
         
@@ -407,25 +349,16 @@ class OCRAdvancedSettings(QDialog):
         if preset_name == "high_accuracy":
             # 高精度模式：高置信度，严格阈值，启用详细日志
             self.confidence_spinbox.setValue(0.55)
-            self.max_speed_spinbox.setValue(800)
-            self.lost_frames_spinbox.setValue(3)
-            self.z_threshold_spinbox.setValue(30)
             self.verbose_debug_checkbox.setChecked(True)  # 高精度模式启用详细日志
             
         elif preset_name == "balanced":
             # 平衡模式：默认推荐设置
             self.confidence_spinbox.setValue(0.45)
-            self.max_speed_spinbox.setValue(1000)
-            self.lost_frames_spinbox.setValue(5)
-            self.z_threshold_spinbox.setValue(50)
             self.verbose_debug_checkbox.setChecked(False)  # 平衡模式关闭详细日志
             
         elif preset_name == "fast":
             # 快速模式：低置信度，宽松阈值，关闭详细日志提升性能
             self.confidence_spinbox.setValue(0.35)
-            self.max_speed_spinbox.setValue(1500)
-            self.lost_frames_spinbox.setValue(3)  
-            self.z_threshold_spinbox.setValue(80)
             self.verbose_debug_checkbox.setChecked(False)  # 快速模式关闭详细日志
 
 
@@ -782,9 +715,8 @@ class OCRControlPanel(QDialog):
     def update_state(self, state):
         """更新状态显示"""
         state_colors = {
-            'LOCKED': '#4CAF50',    # 绿色
-            'LOST': '#f44336',      # 红色
-            'SEARCHING': '#FF9800'  # 橙色
+            'SUCCESS': '#4CAF50',
+            'FAILED': '#f44336',
         }
         color = state_colors.get(state, '#0078D7')
         self.state_label.setText(tr('status_format', '状态: {state}', state=state))
@@ -944,9 +876,6 @@ class OCRManager(QObject):
             'ocr_capture_area_source': '',
             'manual_ocr_capture_area': None,
             'advanced_ocr_settings': {
-                'max_speed_threshold': 1000,
-                'lost_threshold_frames': 5,
-                'z_axis_threshold': 50,
                 'verbose_debug': False  # 默认关闭详细调试，需要时手动开启
             },
             'target_window_name': '',
@@ -1314,7 +1243,7 @@ class OCRManager(QObject):
         window_height = bottom - top
 
         region_width = max(1, window_width // 4)
-        region_height = max(1, window_height // 16)
+        region_height = max(1, window_height // 32)
         region_x = left
         region_y = bottom - region_height
 

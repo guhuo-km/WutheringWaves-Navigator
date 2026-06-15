@@ -24,9 +24,9 @@ def test_builtin_ocr_model_resolves_to_canonical_model_directory(monkeypatch):
     monkeypatch.setattr(paths.sys, "frozen", False, raising=False)
     monkeypatch.delattr(paths.sys, "_MEIPASS", raising=False)
 
-    assert BUILTIN_OCR_MODEL_PATH == "models/coord_ocr.onnx"
-    assert resolve_ocr_model_path(BUILTIN_OCR_MODEL_PATH) == paths.model_file("coord_ocr.onnx")
-    assert resolve_ocr_model_path(Path("models") / "coord_ocr.onnx") == paths.model_file("coord_ocr.onnx")
+    assert BUILTIN_OCR_MODEL_PATH == "models/coord_ocr.pt"
+    assert resolve_ocr_model_path(BUILTIN_OCR_MODEL_PATH) == paths.model_file("coord_ocr.pt")
+    assert resolve_ocr_model_path(Path("models") / "coord_ocr.pt") == paths.model_file("coord_ocr.pt")
 
 
 def test_custom_ocr_model_path_is_not_rewritten(tmp_path):
