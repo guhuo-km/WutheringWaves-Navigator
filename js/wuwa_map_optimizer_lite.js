@@ -4,13 +4,6 @@
 // @version      1.2.5-lite
 // @description  路径绘制(SVG/JSON) + 路线广场(搜索/下载/上传) Lite 版本。
 // @author       guhuo-km
-// @match        https://static-web.ghzs.com/*
-// @match        https://ghzs.com/*
-// @match        https://www.ghzs.com/*
-// @match        https://*.ghzs.com/*
-// @match        https://ghzs666.com/*
-// @match        https://www.ghzs666.com/*
-// @match        https://*.ghzs666.com/*
 // @match        http://localhost:58427/*
 // @match        http://127.0.0.1:58427/*
 // @resource     JSZIP https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js
@@ -1003,16 +996,22 @@
 
     const interceptMap = () => {
         console.log("[GM] Map interceptor started");
+        function captureMapInstance(map, source) {
+            if (!map) return false;
+            if (STATE.mapInstance === map && STATE.mainLayerGroup && STATE.mainLayerGroup._map === map) return true;
+            console.log(`%c[GM] Map instance captured via ${source}!`, "color: #00ff00; font-weight: bold;");
+            STATE.mapInstance = map;
+            if (typeof window !== 'undefined') window.discoveredMap = map;
+            initMapLogic(map);
+            return true;
+        }
         // Try immediately first
         const tryPatch = () => {
             // 1. Check if already discovered by universal injector
-            if (window.discoveredMap && !STATE.mapInstance) {
-                console.log("%c[GM] Found existing map via window.discoveredMap!", "color: #00ff00; font-weight: bold;");
+            if (window.discoveredMap) {
                 const LL = (globalScope && globalScope.L) ? globalScope.L : (typeof window !== 'undefined' ? window.L : null);
                 if (LL) L = LL;
-                STATE.mapInstance = window.discoveredMap;
-                initMapLogic(window.discoveredMap);
-                return true;
+                if (captureMapInstance(window.discoveredMap, 'window.discoveredMap')) return true;
             }
 
             const LL = (globalScope && globalScope.L) ? globalScope.L : (typeof window !== 'undefined' ? window.L : null);
@@ -1025,12 +1024,7 @@
                     const originalInitialize = LL.Map.prototype.initialize;
                     LL.Map.prototype.initialize = function(...args) {
                         const map = originalInitialize.apply(this, args);
-                        if (!STATE.mapInstance) {
-                            console.log("%c[GM] Map instance captured via constructor!", "color: #00ff00; font-weight: bold;");
-                            STATE.mapInstance = this;
-                            if (typeof window !== 'undefined') window.discoveredMap = this;
-                            initMapLogic(this);
-                        }
+                        captureMapInstance(this, 'constructor');
                         return map;
                     };
                     LL.Map.prototype.initialize._patched = true;
@@ -1038,12 +1032,8 @@
 
                 // 3. Last resort: Look for existing map objects in common places or DOM
                 // (Leaflet doesn't have a global registry, but we can check if window.map exists)
-                if (window.map && window.map instanceof LL.Map && !STATE.mapInstance) {
-                    console.log("[GM] Found map in window.map");
-                    STATE.mapInstance = window.map;
-                    window.discoveredMap = window.map;
-                    initMapLogic(window.map);
-                    return true;
+                if (window.map && window.map instanceof LL.Map) {
+                    if (captureMapInstance(window.map, 'window.map')) return true;
                 }
             }
             return false;
@@ -1088,24 +1078,45 @@
         setupDragAndDrop();
     }
 
-    function mapControlFailure(reason) {
-        return { ok: false, reason };
+    function mapControlFailure(reason, extra = {}) {
+        return Object.assign({ ok: false, reason }, extra);
     }
 
     function mapControlSuccess(extra = {}) {
         return Object.assign({ ok: true }, extra);
     }
 
+    function setViewViaControl(map, latNum, lngNum) {
+        try {
+            map.setView([latNum, lngNum]);
+            return mapControlSuccess({ action: 'jumpToLatLng' });
+        } catch (e) {
+            if (STATE.mapInstance === map) STATE.mapInstance = null;
+            if (typeof window !== 'undefined' && window.discoveredMap === map) window.discoveredMap = null;
+            return mapControlFailure('map_setview_exception', {
+                name: e && e.name ? String(e.name) : '',
+                message: e && e.message ? String(e.message) : String(e || ''),
+                stack: e && e.stack ? String(e.stack) : ''
+            });
+        }
+    }
+
     function jumpToLatLngViaControl(lat, lng, options = {}) {
-        const map = STATE.mapInstance;
+        let map = STATE.mapInstance;
         if (!map || typeof map.setView !== 'function') return mapControlFailure('map_not_ready');
 
         const latNum = Number(lat);
         const lngNum = Number(lng);
         if (!Number.isFinite(latNum) || !Number.isFinite(lngNum)) return mapControlFailure('invalid_latlng');
 
-        map.setView([latNum, lngNum]);
-        return mapControlSuccess({ action: 'jumpToLatLng' });
+        const LL = getLeafletForRecapture();
+        if (!isUsableMapCandidate(map, LL)) {
+            const recaptured = recaptureMapViaControl();
+            if (!recaptured || !recaptured.captured) return mapControlFailure('map_not_ready');
+            map = STATE.mapInstance;
+            if (!isUsableMapCandidate(map, LL)) return mapControlFailure('map_not_ready');
+        }
+        return setViewViaControl(map, latNum, lngNum);
     }
 
     function jumpToGameViaControl(x, y, options = {}) {
@@ -1138,8 +1149,26 @@
         return LL;
     }
 
+    function hasUsableMapPane(map) {
+        if (!map) return false;
+        try {
+            if (typeof map.getContainer === 'function') {
+                const container = map.getContainer();
+                if (!container || container.isConnected === false) return false;
+            }
+            let pane = null;
+            if (typeof map.getPane === 'function') pane = map.getPane('mapPane');
+            if (!pane && map._mapPane) pane = map._mapPane;
+            if (!pane || pane.isConnected === false) return false;
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
     function isUsableMapCandidate(map, LL) {
         if (!map || typeof map.setView !== 'function') return false;
+        if (!hasUsableMapPane(map)) return false;
         if (LL && LL.Map && map instanceof LL.Map) return true;
         if (typeof map.getContainer === 'function') {
             try {
@@ -1178,7 +1207,11 @@
         const cmd = command || {};
         const options = { source: cmd.source || 'manual' };
 
-        if (cmd.type === 'jumpToGame') return jumpToGameViaControl(cmd.x, cmd.y, options);
+        if (cmd.type === 'jumpToGame') {
+            const latLng = gameToLatLng(cmd.x, cmd.y);
+            if (!latLng) return mapControlFailure('invalid_game_coord');
+            return jumpToLatLngViaControl(latLng[0], latLng[1], options);
+        }
         if (cmd.type === 'jumpToLatLng') return jumpToLatLngViaControl(cmd.lat, cmd.lng, options);
         if (cmd.type === 'zoom') return zoomViaControl(cmd.delta, options);
         if (cmd.type === 'recaptureMap') return recaptureMapViaControl();

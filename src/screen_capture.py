@@ -6,6 +6,9 @@ Screen Capture Module for WutheringWaves Navigator
 """
 
 import os
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict, List
+
 import numpy as np
 import win32gui
 import win32ui
@@ -14,8 +17,25 @@ import win32api
 import win32process
 from PIL import Image
 import cv2
-from typing import Optional, Tuple, Dict, List
 import logging
+
+
+@dataclass(frozen=True)
+class CapturedFrameRegion:
+    frame: np.ndarray
+    crop: np.ndarray
+    origin: Tuple[int, int]
+    source: str = "unknown"
+    target_window_name: str = ""
+
+
+def crop_image_region(image: np.ndarray, x: int, y: int, width: int, height: int) -> np.ndarray:
+    image_height, image_width = image.shape[:2]
+    left = max(0, int(x))
+    top = max(0, int(y))
+    right = min(image_width, left + max(0, int(width)))
+    bottom = min(image_height, top + max(0, int(height)))
+    return image[top:bottom, left:right].copy()
 
 
 class ScreenCapture:
@@ -64,11 +84,84 @@ class ScreenCapture:
         Returns:
             numpy.ndarray: 截图图像，BGR格式，或None如果失败
         """
+        result = self.capture_frame_and_region(x, y, width, height, mode, target_window_name)
+        return result.crop if result is not None else None
+
+    def capture_frame_and_region(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        mode: str = 'BitBlt',
+        target_window_name: str = '',
+    ) -> Optional[CapturedFrameRegion]:
+        """Capture one shared frame and crop the requested OCR region from it."""
         try:
             if mode == 'PrintWindow' and target_window_name:
-                return self._capture_window_region(x, y, width, height, target_window_name)
+                frame_result = self._capture_window_frame(target_window_name)
+                if frame_result is None:
+                    crop = self._capture_window_region(x, y, width, height, target_window_name)
+                    if crop is None:
+                        return None
+                    return CapturedFrameRegion(
+                        frame=crop,
+                        crop=crop,
+                        origin=(int(x), int(y)),
+                        source="fallback_region",
+                        target_window_name=target_window_name,
+                    )
+                frame, window_rect = frame_result
+                window_x, window_y, _, _ = window_rect
+                crop = crop_image_region(frame, x - window_x, y - window_y, width, height)
+                if crop.size == 0:
+                    return None
+                return CapturedFrameRegion(
+                    frame=frame,
+                    crop=crop,
+                    origin=(int(window_x), int(window_y)),
+                    source="window",
+                    target_window_name=target_window_name,
+                )
+
+            frame_origin_x = 0
+            frame_origin_y = 0
+            if target_window_name:
+                window_rect = self._find_window_rect_by_name(target_window_name)
+                if window_rect is not None:
+                    frame_origin_x, frame_origin_y, right, bottom = window_rect
+                    frame = self._capture_screen_region(
+                        frame_origin_x,
+                        frame_origin_y,
+                        right - frame_origin_x,
+                        bottom - frame_origin_y,
+                    )
+                else:
+                    frame = None
             else:
-                return self._capture_screen_region(x, y, width, height)
+                screen_width, screen_height = self.get_screen_size()
+                frame = self._capture_screen_region(0, 0, screen_width, screen_height)
+
+            if frame is None:
+                frame = self._capture_screen_region(x, y, width, height)
+                if frame is None:
+                    return None
+                return CapturedFrameRegion(
+                    frame=frame,
+                    crop=frame,
+                    origin=(int(x), int(y)),
+                    source="fallback_region",
+                    target_window_name=target_window_name,
+                )
+            crop = crop_image_region(frame, x - frame_origin_x, y - frame_origin_y, width, height)
+            source = "window" if target_window_name else "fullscreen"
+            return CapturedFrameRegion(
+                frame=frame,
+                crop=crop,
+                origin=(frame_origin_x, frame_origin_y),
+                source=source,
+                target_window_name=target_window_name,
+            )
         except Exception as e:
             self.logger.error(f"截图失败: {e}")
             return None
@@ -248,6 +341,78 @@ class ScreenCapture:
         win32gui.EnumWindows(enum_windows_callback, windows)
         
         return windows[0] if windows else None
+
+    def _find_window_rect_by_name(self, window_name: str) -> Optional[Tuple[int, int, int, int]]:
+        hwnd = win32gui.FindWindow(None, window_name)
+        if not hwnd:
+            hwnd = self._find_window_partial(window_name)
+        if not hwnd:
+            return None
+        return win32gui.GetWindowRect(hwnd)
+
+    def _capture_window_frame(self, window_name: str) -> Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]:
+        """Capture a full target window with PrintWindow and return it with its screen rect."""
+        hwnd = None
+        window_dc = None
+        mem_dc = None
+        save_dc = None
+        save_bitmap = None
+        try:
+            hwnd = win32gui.FindWindow(None, window_name)
+            if not hwnd:
+                hwnd = self._find_window_partial(window_name)
+                if not hwnd:
+                    self.logger.warning(f"未找到窗口: {window_name}")
+                    return None
+
+            window_rect = win32gui.GetWindowRect(hwnd)
+            window_x, window_y, window_right, window_bottom = window_rect
+            window_width = window_right - window_x
+            window_height = window_bottom - window_y
+            if window_width <= 0 or window_height <= 0:
+                return None
+
+            window_dc = win32gui.GetWindowDC(hwnd)
+            mem_dc = win32ui.CreateDCFromHandle(window_dc)
+            save_dc = mem_dc.CreateCompatibleDC()
+            save_bitmap = win32ui.CreateBitmap()
+            save_bitmap.CreateCompatibleBitmap(mem_dc, window_width, window_height)
+            save_dc.SelectObject(save_bitmap)
+
+            result = win32gui.PrintWindow(hwnd, save_dc.GetSafeHdc(), 3)
+            if not result:
+                return None
+
+            bmp_info = save_bitmap.GetInfo()
+            bmp_str = save_bitmap.GetBitmapBits(True)
+            image = np.frombuffer(bmp_str, dtype=np.uint8)
+            image = image.reshape((bmp_info['bmHeight'], bmp_info['bmWidth'], 4))
+            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+            return image, window_rect
+        except Exception as e:
+            self.logger.error(f"PrintWindow整窗截图失败: {e}")
+            return None
+        finally:
+            if save_bitmap is not None:
+                try:
+                    win32gui.DeleteObject(save_bitmap.GetHandle())
+                except Exception:
+                    pass
+            if save_dc is not None:
+                try:
+                    save_dc.DeleteDC()
+                except Exception:
+                    pass
+            if mem_dc is not None:
+                try:
+                    mem_dc.DeleteDC()
+                except Exception:
+                    pass
+            if hwnd and window_dc is not None:
+                try:
+                    win32gui.ReleaseDC(hwnd, window_dc)
+                except Exception:
+                    pass
     
     def get_screen_size(self) -> Tuple[int, int]:
         """
@@ -480,3 +645,16 @@ def capture_region_callback(x: int, y: int, width: int, height: int,
     """
     screen_capture = get_screen_capture()
     return screen_capture.capture_region(x, y, width, height, mode, target_window_name)
+
+
+def capture_frame_and_region_callback(
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    mode: str,
+    target_window_name: str,
+) -> Optional[CapturedFrameRegion]:
+    """Capture one shared frame and the requested OCR crop."""
+    screen_capture = get_screen_capture()
+    return screen_capture.capture_frame_and_region(x, y, width, height, mode, target_window_name)

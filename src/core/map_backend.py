@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import json
 import base64
-import threading
+from concurrent.futures import ThreadPoolExecutor
 import requests
 
 from PySide6.QtCore import QObject, Signal, Slot
@@ -11,11 +11,13 @@ class MapBackend(QObject):
     statusUpdated = Signal(float, float, int)
     localMapChangedSignal = Signal(str)
     proxyResponse = Signal(str, int, str, str)
+    tileMetadataChangedSignal = Signal(str)
     
     _internalProxyResponse = Signal(str, int, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._proxy_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="map-proxy")
         self._internalProxyResponse.connect(self._do_emit_proxy_response)
 
     def _do_emit_proxy_response(self, req_id, status_code, resp_data, resp_headers_str):
@@ -32,6 +34,10 @@ class MapBackend(QObject):
     @Slot(str)
     def localMapChanged(self, map_name):
         self.localMapChangedSignal.emit(map_name)
+
+    @Slot(str)
+    def notifyTileMetadataChanged(self, updated_at: str):
+        self.tileMetadataChangedSignal.emit(str(updated_at or ""))
 
     @Slot(str, str, str, str, str, str)
     def proxyRequest(self, req_id, method, url, headers_json, body, response_type="text"):
@@ -77,4 +83,7 @@ class MapBackend(QObject):
                 print(f"[Proxy] Error: {e}")
                 self._internalProxyResponse.emit(req_id, 0, str(e), "")
 
-        threading.Thread(target=run_req, daemon=True).start()
+        self._proxy_executor.submit(run_req)
+
+    def shutdown(self):
+        self._proxy_executor.shutdown(wait=False, cancel_futures=True)

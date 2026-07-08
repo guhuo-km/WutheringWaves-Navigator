@@ -27,7 +27,7 @@ class NavigationInterface(SingleDirectionScrollArea):
     ocr_start_requested = Signal()
     ocr_stop_requested = Signal()
     ocr_calibrate_requested = Signal()
-    map_source_changed = Signal(str)  # 'official', 'aura', 'local'
+    map_source_changed = Signal(str)  # 'official', 'local'
     map_calibrate_requested = Signal()
     map_recapture_requested = Signal()
     dot_size_changed = Signal(float)
@@ -202,10 +202,6 @@ class NavigationInterface(SingleDirectionScrollArea):
         self.radio_official.setChecked(True)
         self.radio_official.toggled.connect(lambda checked: checked and self.map_source_changed.emit('official'))
         card_layout.addWidget(self.radio_official)
-
-        self.radio_aura = RadioButton()
-        self.radio_aura.toggled.connect(lambda checked: checked and self.map_source_changed.emit('aura'))
-        card_layout.addWidget(self.radio_aura)
 
         self.radio_local = RadioButton()
         self.radio_local.toggled.connect(lambda checked: checked and self.map_source_changed.emit('local'))
@@ -557,7 +553,6 @@ class NavigationInterface(SingleDirectionScrollArea):
         self.map_title_label.setText(tr("nav_map_control_title", "地图控制"))
         self.map_source_label.setText(tr("nav_map_source", "地图源:"))
         self.radio_official.setText(tr("nav_map_source_official", "库街区"))
-        self.radio_aura.setText(tr("nav_map_source_aura", "光环助手"))
         self.radio_local.setText(tr("nav_map_source_local", "本地"))
         self.map_calibrate_btn.setText(tr("nav_map_calibration", "地图校准"))
         self.map_recapture_btn.setText(tr("nav_map_recapture", "重新捕获"))

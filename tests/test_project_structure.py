@@ -33,7 +33,7 @@ def test_canonical_static_resources_exist_once():
         PROJECT_ROOT / "assets" / "ico.ico",
         PROJECT_ROOT / "assets" / "ico.png",
         PROJECT_ROOT / "models" / "class_names.txt",
-        PROJECT_ROOT / "models" / "coord_ocr.pt",
+        PROJECT_ROOT / "models" / "coord_ocr.onnx",
         PROJECT_ROOT / "languages" / "zh_CN.json",
         PROJECT_ROOT / "languages" / "en_US.json",
     ]
@@ -44,15 +44,9 @@ def test_canonical_static_resources_exist_once():
 
 
 def test_legacy_ocr_model_files_are_not_tracked_static_resources():
-    legacy_model_files = [
-        PROJECT_ROOT / "models" / "coord_ocr.onnx",
-        PROJECT_ROOT / "src" / "models" / "coord_ocr.pt",
-        PROJECT_ROOT / "src" / "models" / "coord_ocr.onnx",
-    ]
-
-    existing = [path.relative_to(PROJECT_ROOT).as_posix() for path in legacy_model_files if path.exists()]
-
-    assert existing == []
+    source = (PROJECT_ROOT / "scripts" / "smart_build.py").read_text(encoding="utf-8")
+    assert "coord_ocr.pt" not in source
+    assert "coord_ocr.onnx" in source
 
 
 def test_pyinstaller_spec_files_are_generated_artifacts():

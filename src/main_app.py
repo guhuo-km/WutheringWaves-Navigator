@@ -24,6 +24,28 @@ if vendored_fluent.is_dir():
     sys.path.insert(0, str(vendored_fluent))
 
 
+DEBUG_RECOGNITION_ARG = "--debug-recognition"
+
+
+def configure_debug_recognition_from_argv(argv: list[str] | None = None) -> list[str]:
+    """Enable developer-only recognition diagnostics from a startup flag."""
+    args = list(sys.argv if argv is None else argv)
+    if DEBUG_RECOGNITION_ARG not in args:
+        return args
+
+    filtered = [arg for arg in args if arg != DEBUG_RECOGNITION_ARG]
+    settings_cls = globals().get("SettingsManager")
+    if settings_cls is None:
+        from core.settings_manager import SettingsManager as settings_cls
+    settings = settings_cls()
+    settings.set("logging.detailed_ocr_enabled", True, save=False)
+    settings.set("logging.save_minimap_frame_packages", True, save=False)
+    settings.set("diagnostics.resource_probe_enabled", True, save=False)
+    settings.save()
+    print("[DEBUG_RECOGNITION] enabled")
+    return filtered
+
+
 def _ensure_stdio_streams() -> None:
     """Ensure stdio streams exist in frozen/windowed environments.
 
@@ -44,6 +66,7 @@ def _ensure_stdio_streams() -> None:
 def main():
     multiprocessing.freeze_support()
     _ensure_stdio_streams()
+    sys.argv = configure_debug_recognition_from_argv(sys.argv)
     try:
         from core.crash_diagnostics import install_crash_diagnostics
         crash_log_path = install_crash_diagnostics()

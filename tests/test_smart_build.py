@@ -61,6 +61,36 @@ def test_smart_builder_prunes_known_large_unused_artifacts(tmp_path):
     assert kept_pak.exists()
 
 
+def test_smart_builder_exports_clean_prebuilt_minimap_cache(tmp_path):
+    source = tmp_path / "source"
+    area = source / "906"
+    tile = area / "standard" / "default" / "base" / "1_2.png"
+    sift = area / "indexes" / "sift_tiles" / "sift.npz"
+    db = area / "indexes" / "minimap_index.sqlite3"
+    state = area / "indexes" / "tile_index_state.json"
+    tmp_file = area / "indexes" / "tile_index_state.json.tmp"
+    wal = area / "indexes" / "minimap_index.sqlite3-wal"
+    shm = area / "indexes" / "minimap_index.sqlite3-shm"
+    for path in (tile, sift, db, state, tmp_file, wal, shm):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+
+    builder = SmartBuilder.__new__(SmartBuilder)
+    builder.project_root = tmp_path
+    builder.prebuilt_minimap_cache = source
+
+    assert builder.export_prebuilt_minimap_cache() is True
+
+    target = tmp_path / "dist" / "WutheringWaves-Navigator-Smart" / "cache" / "minimap_tiles"
+    assert (target / "906" / "standard" / "default" / "base" / "1_2.png").exists()
+    assert (target / "906" / "indexes" / "sift_tiles" / "sift.npz").exists()
+    assert (target / "906" / "indexes" / "minimap_index.sqlite3").exists()
+    assert (target / "906" / "indexes" / "tile_index_state.json").exists()
+    assert not (target / "906" / "indexes" / "tile_index_state.json.tmp").exists()
+    assert not (target / "906" / "indexes" / "minimap_index.sqlite3-wal").exists()
+    assert not (target / "906" / "indexes" / "minimap_index.sqlite3-shm").exists()
+
+
 def test_parse_build_args_fast_expands_development_shortcuts():
     args = parse_build_args(["--fast"])
 
@@ -75,6 +105,12 @@ def test_parse_build_args_allows_independent_speed_flags():
     assert args.no_clean is True
     assert args.skip_updater is True
     assert args.skip_deps is True
+
+
+def test_parse_build_args_accepts_prebuilt_minimap_cache_path():
+    args = parse_build_args(["--prebuilt-minimap-cache", "C:/cache/minimap_tiles"])
+
+    assert args.prebuilt_minimap_cache == "C:/cache/minimap_tiles"
 
 
 def test_no_clean_omits_pyinstaller_clean_flag(tmp_path):
@@ -147,7 +183,7 @@ def test_default_build_uses_canonical_static_resource_locations():
             "dest": "models",
             "candidates": ["models"],
             "required": True,
-            "include_files": ["class_names.txt", "coord_ocr.pt"],
+            "include_files": ["class_names.txt", "coord_ocr.onnx"],
         }
     ]
     assert "src/ocr_config.json" not in builder.project_config["runtime_data_files"]

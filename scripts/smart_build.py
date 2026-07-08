@@ -32,6 +32,7 @@ class SmartBuilder:
         include_images=False,
         include_runtime_configs=False,
         update_base_url=None,
+        prebuilt_minimap_cache=None,
         no_clean=False,
         skip_deps=False,
         skip_updater=False,
@@ -44,6 +45,8 @@ class SmartBuilder:
         self.include_images = include_images
         self.include_runtime_configs = include_runtime_configs
         self.update_base_url = (update_base_url or os.environ.get("WUWA_UPDATE_BASE_URL") or "").rstrip("/")
+        configured_prebuilt_cache = prebuilt_minimap_cache or os.environ.get("WUWA_PREBUILT_MINIMAP_CACHE") or ""
+        self.prebuilt_minimap_cache = Path(configured_prebuilt_cache) if configured_prebuilt_cache else None
         self.no_clean = no_clean
         self.skip_deps = skip_deps
         self.skip_updater = skip_updater
@@ -73,7 +76,7 @@ class SmartBuilder:
                     'dest': 'models',
                     'candidates': ['models'],
                     'required': True,
-                    'include_files': ['class_names.txt', 'coord_ocr.pt'],
+                    'include_files': ['class_names.txt', 'coord_ocr.onnx'],
                 },
                 {
                     'dest': 'templates',
@@ -138,8 +141,7 @@ class SmartBuilder:
             'opencv-python>=4.8.0',
             'Pillow>=10.0.0',
             'numpy>=1.24.0',
-            'torch>=2.0.0',
-            'ultralytics>=8.0.0',
+            'onnxruntime>=1.23.0',
             'requests>=2.31.0'
         ]
         
@@ -502,7 +504,7 @@ class SmartBuilder:
             args.append(f'--add-binary={python_dll}{os.pathsep}.')
         
         # 收集依赖
-        collect_packages = ['torch', 'torchvision', 'ultralytics', 'cv2', 'qfluentwidgets', 'qframelesswindow']
+        collect_packages = ['onnxruntime', 'cv2', 'qfluentwidgets', 'qframelesswindow']
         for package in collect_packages:
             if self.check_package_installed(package):
                 args.append(f'--collect-all={package}')
@@ -609,9 +611,7 @@ class SmartBuilder:
             "--exclude-module",
             "cv2",
             "--exclude-module",
-            "torch",
-            "torchvision",
-            "ultralytics",
+            "onnxruntime",
             str(updater_script),
         ]
         print("[BUILD] 正在构建独立更新器...")
@@ -654,6 +654,44 @@ class SmartBuilder:
                 print(f"[PRUNE] 删除无用打包文件: {path.relative_to(dist_dir)} ({size / 1024 / 1024:.1f} MB)")
 
         print(f"[PRUNE] 共删除 {removed_count} 个文件，节省 {removed_bytes / 1024 / 1024:.1f} MB")
+        return True
+
+    def export_prebuilt_minimap_cache(self):
+        """Copy a clean prebuilt minimap tile cache into the packaged app."""
+        source_root = Path(self.prebuilt_minimap_cache) if self.prebuilt_minimap_cache else None
+        if source_root is None:
+            print("[INFO] 未配置预置小地图瓦片缓存，跳过")
+            return True
+        if not source_root.exists() or not source_root.is_dir():
+            print(f"[WARN] 预置小地图瓦片缓存不存在，跳过: {source_root}")
+            return True
+
+        dist_root = self.project_root / "dist" / "WutheringWaves-Navigator-Smart"
+        target_root = dist_root / "cache" / "minimap_tiles"
+        if target_root.exists():
+            shutil.rmtree(target_root)
+        target_root.mkdir(parents=True, exist_ok=True)
+
+        excluded_suffixes = (".tmp", ".wal", ".shm", "-wal", "-shm")
+        copied_count = 0
+        copied_bytes = 0
+        for path in source_root.rglob("*"):
+            if not path.is_file():
+                continue
+            name = path.name.lower()
+            if name.endswith(excluded_suffixes):
+                continue
+            relative = path.relative_to(source_root)
+            target = target_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            copied_count += 1
+            copied_bytes += target.stat().st_size
+
+        print(
+            f"[OK] 已导出预置小地图瓦片缓存: {copied_count} 个文件, "
+            f"{copied_bytes / 1024 / 1024:.1f} MB -> {target_root}"
+        )
         return True
 
     def verify_build(self):
@@ -804,6 +842,9 @@ class SmartBuilder:
         if not self.prune_packaged_artifacts():
             return False
 
+        if not self.export_prebuilt_minimap_cache():
+            return False
+
         # 验证结果
         if not self.verify_build():
             return False
@@ -824,6 +865,11 @@ def parse_build_args(argv=None):
     parser.add_argument('--no-clean', action='store_true', help='不清理 build/dist，不传 PyInstaller --clean，复用缓存')
     parser.add_argument('--skip-deps', action='store_true', help='跳过 requirements 安装/依赖检查')
     parser.add_argument('--skip-updater', action='store_true', help='跳过独立更新器打包，复用现有更新器')
+    parser.add_argument(
+        '--prebuilt-minimap-cache',
+        default=None,
+        help='预置小地图瓦片缓存目录，例如已建好索引的 cache/minimap_tiles；也可用 WUWA_PREBUILT_MINIMAP_CACHE',
+    )
     parser.add_argument(
         '--update-base-url',
         default=None,
@@ -863,6 +909,7 @@ def main():
                 include_images=include_images,
                 include_runtime_configs=include_runtime_configs,
                 update_base_url=args.update_base_url,
+                prebuilt_minimap_cache=args.prebuilt_minimap_cache,
                 no_clean=args.no_clean,
                 skip_deps=args.skip_deps,
                 skip_updater=args.skip_updater,
@@ -877,6 +924,7 @@ def main():
                 include_images=include_images,
                 include_runtime_configs=include_runtime_configs,
                 update_base_url=args.update_base_url,
+                prebuilt_minimap_cache=args.prebuilt_minimap_cache,
                 no_clean=args.no_clean,
                 skip_deps=args.skip_deps,
                 skip_updater=args.skip_updater,
@@ -888,6 +936,7 @@ def main():
                 include_images=include_images,
                 include_runtime_configs=include_runtime_configs,
                 update_base_url=args.update_base_url,
+                prebuilt_minimap_cache=args.prebuilt_minimap_cache,
                 no_clean=args.no_clean,
                 skip_deps=args.skip_deps,
                 skip_updater=args.skip_updater,

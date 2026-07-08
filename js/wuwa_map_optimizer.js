@@ -77,7 +77,8 @@
                 sideMenu: getStore('SM_UI_SIDE_MENU', false),
                 leftTop: getStore('SM_UI_LEFT_TOP', false),
                 zoomControl: getStore('SM_UI_ZOOM_CONTROL', false),
-                mobile: getStore('SM_UI_MOBILE', false)
+                mobile: getStore('SM_UI_MOBILE', false),
+                syncMarker: getStore('SM_UI_SYNC_MARKER', false)
             },
             markerOptimization: getStore('SM_MARKER_OPT', false),
             pauseTrackingWhenPopupOpen: getStore('SM_PAUSE_TRACKING_WHEN_POPUP_OPEN', true)
@@ -103,6 +104,18 @@
         _coordCalibDone: false,
         _coordCalibLastLog: '',
         _coordCalibReason: '',
+        tileMetadata: {
+            standardTiles: new Map(),
+            layeredTiles: new Map(),
+            gravityTiles: new Map(),
+            tileBaseUrl: '',
+            ossParams: '',
+            tileWidth: 1024,
+            currentAreaId: '',
+            updatedAt: 0,
+            changed: false,
+            resourceObserverInstalled: false
+        },
         currentDetail: null,
         pageState: new Map(),
         observer: null,
@@ -407,6 +420,220 @@
         return STATE.coordTransform || getDefaultCoordTransform();
     }
 
+    function getTileProjectionContext() {
+        const tileSize = Number(STATE.tileMetadata.tileWidth || 1024);
+        const map = STATE.mapInstance;
+        const crs = map && map.options ? map.options.crs : null;
+        const transformation = crs && crs.transformation ? crs.transformation : null;
+        const scaleX = transformation && Number.isFinite(Number(transformation._a)) ? Number(transformation._a) : null;
+        const scaleY = transformation && Number.isFinite(Number(transformation._c)) ? Number(transformation._c) : null;
+        return {
+            tileSize,
+            crsScaleX: scaleX,
+            crsScaleY: scaleY,
+            mapUnitsPerTileX: scaleX && scaleX !== 0 ? tileSize / scaleX : null,
+            mapUnitsPerTileY: scaleY && scaleY !== 0 ? tileSize / scaleY : null
+        };
+    }
+
+    function getMapContext() {
+        return {
+            areaId: String(STATE.tileMetadata.currentAreaId || ''),
+            coordTransform: STATE.coordTransform || getDefaultCoordTransform(),
+            tileSize: 1024,
+            tileProjection: getTileProjectionContext(),
+            mapProvider: 'official_map'
+        };
+    }
+
+    function getOssParamsFromUrl(url) {
+        try {
+            const parsed = new URL(String(url), window.location.href);
+            return parsed.search ? parsed.search.slice(1) : '';
+        } catch (e) {
+            const raw = String(url || '');
+            const idx = raw.indexOf('?');
+            return idx >= 0 ? raw.slice(idx + 1) : '';
+        }
+    }
+
+    function normalizeTileUrl(url) {
+        try {
+            const parsed = new URL(String(url), window.location.href);
+            return {
+                cleanUrl: `${parsed.origin}${parsed.pathname}`,
+                fullUrl: parsed.href
+            };
+        } catch (e) {
+            const raw = String(url || '');
+            return {
+                cleanUrl: raw.split('?')[0].split('#')[0],
+                fullUrl: raw
+            };
+        }
+    }
+
+    function parseTileMetadataFromUrl(url) {
+        const raw = String(url || '');
+        if (!raw || !raw.includes('.png')) return null;
+
+        const normalized = normalizeTileUrl(raw);
+        const cleanUrl = normalized.cleanUrl;
+        const common = {
+            url: normalized.fullUrl,
+            ossParams: getOssParamsFromUrl(raw),
+            tileWidth: 1024
+        };
+
+        let match = cleanUrl.match(/^(.*)\/(\d+)\/\2_(-?\d+)_(-?\d+)\.png$/);
+        if (match) {
+            return Object.assign(common, {
+                type: 'standard',
+                tileBaseUrl: match[1],
+                regionId: match[2],
+                x: Number(match[3]),
+                y: Number(match[4])
+            });
+        }
+
+        match = cleanUrl.match(/^(.*)\/(\d+)\/(\d+)\/(-?\d+)\/(-?\d+)_(-?\d+)\.png$/);
+        if (match) {
+            return Object.assign(common, {
+                type: 'layered',
+                tileBaseUrl: match[1],
+                regionId: match[2],
+                layerId: match[3],
+                zLevel: Number(match[4]),
+                x: Number(match[5]),
+                y: Number(match[6])
+            });
+        }
+
+        match = cleanUrl.match(/^(.*)\/(\d+)\/(\d+)\/(-?\d+)_(-?\d+)_(-?\d+)\.png$/);
+        if (match) {
+            return Object.assign(common, {
+                type: 'layered',
+                tileBaseUrl: match[1],
+                regionId: match[2],
+                layerId: match[3],
+                zLevel: Number(match[4]),
+                x: Number(match[5]),
+                y: Number(match[6])
+            });
+        }
+
+        match = cleanUrl.match(/^(.*)\/(\d+)\/(\d+)\/(-?\d+)_(-?\d+)\.png$/);
+        if (match) {
+            return Object.assign(common, {
+                type: 'gravity',
+                tileBaseUrl: match[1],
+                regionId: match[2],
+                layerId: match[3],
+                zLevel: 0,
+                x: Number(match[4]),
+                y: Number(match[5])
+            });
+        }
+
+        return null;
+    }
+
+    function getTileMetadataStore(kind) {
+        if (kind === 'standard') return STATE.tileMetadata.standardTiles;
+        if (kind === 'layered') return STATE.tileMetadata.layeredTiles;
+        if (kind === 'gravity') return STATE.tileMetadata.gravityTiles;
+        return null;
+    }
+
+    function tileMetadataKey(tile) {
+        return [
+            tile.type,
+            tile.regionId || '',
+            tile.layerId || 'default',
+            tile.zLevel === undefined || tile.zLevel === null ? 'base' : tile.zLevel,
+            tile.x,
+            tile.y
+        ].join(':');
+    }
+
+    function notifyTileMetadataChanged(updatedAt) {
+        try {
+            globalScope.__WuwaTileMetadataUpdatedAt = updatedAt;
+            globalScope.dispatchEvent(new CustomEvent('wuwaTileMetadataChanged', { detail: { updatedAt } }));
+        } catch (e) {}
+    }
+
+    function attachLeafletTileCoords(tile, coords) {
+        if (!coords || typeof coords !== 'object') return tile;
+        const leafletTileX = Number(coords.x);
+        const leafletTileY = Number(coords.y);
+        const leafletTileZ = Number(coords.z);
+        if (Number.isFinite(leafletTileX)) tile.leafletTileX = leafletTileX;
+        if (Number.isFinite(leafletTileY)) tile.leafletTileY = leafletTileY;
+        if (Number.isFinite(leafletTileZ)) tile.leafletTileZ = leafletTileZ;
+        return tile;
+    }
+
+    function observeTileMetadataUrl(url, coords = null) {
+        const parsed = parseTileMetadataFromUrl(url);
+        if (!parsed) return false;
+
+        const store = getTileMetadataStore(parsed.type);
+        if (!store) return false;
+
+        const updatedAt = Date.now();
+        const tile = attachLeafletTileCoords(Object.assign({}, parsed, { updatedAt }), coords);
+        store.set(tileMetadataKey(tile), tile);
+
+        STATE.tileMetadata.currentAreaId = String(tile.regionId || STATE.tileMetadata.currentAreaId || '');
+        STATE.tileMetadata.tileBaseUrl = tile.tileBaseUrl || STATE.tileMetadata.tileBaseUrl;
+        STATE.tileMetadata.ossParams = tile.ossParams || STATE.tileMetadata.ossParams;
+        STATE.tileMetadata.tileWidth = tile.tileWidth || 1024;
+        STATE.tileMetadata.updatedAt = updatedAt;
+        STATE.tileMetadata.changed = true;
+        notifyTileMetadataChanged(updatedAt);
+        return true;
+    }
+
+    function getTileMetadataSnapshot() {
+        const metadata = STATE.tileMetadata;
+        return {
+            mapContext: getMapContext(),
+            standardTiles: Array.from(metadata.standardTiles.values()),
+            layeredTiles: Array.from(metadata.layeredTiles.values()),
+            gravityTiles: Array.from(metadata.gravityTiles.values()),
+            tileBaseUrl: metadata.tileBaseUrl,
+            ossParams: metadata.ossParams,
+            tileWidth: metadata.tileWidth,
+            tileProjection: getTileProjectionContext(),
+            updatedAt: metadata.updatedAt,
+            changed: metadata.changed
+        };
+    }
+
+    function installTileMetadataResourceObserver() {
+        if (STATE.tileMetadata.resourceObserverInstalled) return;
+        STATE.tileMetadata.resourceObserverInstalled = true;
+
+        try {
+            if (window.performance && typeof window.performance.getEntriesByType === 'function') {
+                for (const entry of window.performance.getEntriesByType('resource') || []) {
+                    if (entry && entry.name) observeTileMetadataUrl(entry.name);
+                }
+            }
+        } catch (e) {}
+
+        try {
+            if (typeof PerformanceObserver !== 'function') return;
+            const observer = new PerformanceObserver((list) => {
+                for (const entry of list.getEntries() || []) {
+                    if (entry && entry.name) observeTileMetadataUrl(entry.name);
+                }
+            });
+            observer.observe({ type: 'resource', buffered: true });
+        } catch (e) {}
+    }
+
     // 暴露到全局供 Python 端读取
     window.getCoordTransform = getCoordTransform;
 
@@ -592,6 +819,7 @@
         body.hide-mobile .location-selector, body.hide-mobile .m-right-top-btn-group, body.hide-mobile .mobile-btn-group, body.hide-mobile .mobile-bottom-group, body.hide-mobile .mobile-btn { display: none !important; }
         body.hide-clean-ui .leaflet-top, body.hide-clean-ui .leaflet-bottom { display: none !important; }
         body.hide-switch-tools .switch-tools-cells { display: none !important; }
+        body.hide-sync-marker .leaflet-sync-pane .player-marker { display: none !important; visibility: hidden !important; pointer-events: none !important; opacity: 0 !important; }
 
         #sm-sidebar { position: fixed; top: 0; left: -320px; width: 320px; height: 100vh; background: var(--sm-bg); z-index: 99999; transition: left 0.3s; color: #eee; font-size: 13px; display: flex; flex-direction: column; }
         #sm-sidebar.active { left: 0; }
@@ -1392,10 +1620,12 @@
             if (url.includes('/position.json')) processBulkData(data);
             else if (url.includes('/getDetail')) processDetailData(data);
         };
+        installTileMetadataResourceObserver();
 
         const originalFetch = globalScope.fetch;
         globalScope.fetch = function(input, init) {
             const url = (typeof input === 'string' ? input : input.url) || '';
+            observeTileMetadataUrl(url);
             if (shouldProcessUrl(url)) {
                 return originalFetch.apply(this, arguments).then(response => {
                     if (!response.ok) return response;
@@ -1413,6 +1643,7 @@
 
         const originalOpen = XMLHttpRequest.prototype.open;
         XMLHttpRequest.prototype.open = function(method, url) {
+            observeTileMetadataUrl(url);
             this.addEventListener('load', function() {
                 if (this.status === 200) {
                     try {
@@ -1426,16 +1657,22 @@
 
     const interceptMap = () => {
         console.log("[GM] Map interceptor started");
+        function captureMapInstance(map, source) {
+            if (!map) return false;
+            if (STATE.mapInstance === map && STATE.mainLayerGroup && STATE.mainLayerGroup._map === map) return true;
+            console.log(`%c[GM] Map instance captured via ${source}!`, "color: #00ff00; font-weight: bold;");
+            STATE.mapInstance = map;
+            if (typeof window !== 'undefined') window.discoveredMap = map;
+            initMapLogic(map);
+            return true;
+        }
         // Try immediately first
         const tryPatch = () => {
             // 1. Check if already discovered by universal injector
-            if (window.discoveredMap && !STATE.mapInstance) {
-                console.log("%c[GM] Found existing map via window.discoveredMap!", "color: #00ff00; font-weight: bold;");
+            if (window.discoveredMap) {
                 const LL = (globalScope && globalScope.L) ? globalScope.L : (typeof window !== 'undefined' ? window.L : null);
                 if (LL) L = LL;
-                STATE.mapInstance = window.discoveredMap;
-                initMapLogic(window.discoveredMap);
-                return true;
+                if (captureMapInstance(window.discoveredMap, 'window.discoveredMap')) return true;
             }
 
             const LL = (globalScope && globalScope.L) ? globalScope.L : (typeof window !== 'undefined' ? window.L : null);
@@ -1448,12 +1685,7 @@
                     const originalInitialize = LL.Map.prototype.initialize;
                     LL.Map.prototype.initialize = function(...args) {
                         const map = originalInitialize.apply(this, args);
-                        if (!STATE.mapInstance) {
-                            console.log("%c[GM] Map instance captured via constructor!", "color: #00ff00; font-weight: bold;");
-                            STATE.mapInstance = this;
-                            if (typeof window !== 'undefined') window.discoveredMap = this;
-                            initMapLogic(this);
-                        }
+                        captureMapInstance(this, 'constructor');
                         return map;
                     };
                     LL.Map.prototype.initialize._patched = true;
@@ -1461,12 +1693,8 @@
 
                 // 3. Last resort: Look for existing map objects in common places or DOM
                 // (Leaflet doesn't have a global registry, but we can check if window.map exists)
-                if (window.map && window.map instanceof LL.Map && !STATE.mapInstance) {
-                    console.log("[GM] Found map in window.map");
-                    STATE.mapInstance = window.map;
-                    window.discoveredMap = window.map;
-                    initMapLogic(window.map);
-                    return true;
+                if (window.map && window.map instanceof LL.Map) {
+                    if (captureMapInstance(window.map, 'window.map')) return true;
                 }
             }
             return false;
@@ -1524,16 +1752,31 @@
         return STATE.toggles.pauseTrackingWhenPopupOpen && isPointPopupOpenForControl();
     }
 
-    function mapControlFailure(reason) {
-        return { ok: false, reason };
+    function mapControlFailure(reason, extra = {}) {
+        return Object.assign({ ok: false, reason }, extra);
     }
 
     function mapControlSuccess(extra = {}) {
         return Object.assign({ ok: true }, extra);
     }
 
+    function setViewViaControl(map, latNum, lngNum) {
+        try {
+            map.setView([latNum, lngNum]);
+            return mapControlSuccess({ action: 'jumpToLatLng' });
+        } catch (e) {
+            if (STATE.mapInstance === map) STATE.mapInstance = null;
+            if (typeof window !== 'undefined' && window.discoveredMap === map) window.discoveredMap = null;
+            return mapControlFailure('map_setview_exception', {
+                name: e && e.name ? String(e.name) : '',
+                message: e && e.message ? String(e.message) : String(e || ''),
+                stack: e && e.stack ? String(e.stack) : ''
+            });
+        }
+    }
+
     function jumpToLatLngViaControl(lat, lng, options = {}) {
-        const map = STATE.mapInstance;
+        let map = STATE.mapInstance;
         if (!map || typeof map.setView !== 'function') return mapControlFailure('map_not_ready');
         if (options && options.source === 'tracking' && shouldPauseTrackingMove()) return mapControlFailure('point_popup_open');
 
@@ -1541,8 +1784,14 @@
         const lngNum = Number(lng);
         if (!Number.isFinite(latNum) || !Number.isFinite(lngNum)) return mapControlFailure('invalid_latlng');
 
-        map.setView([latNum, lngNum]);
-        return mapControlSuccess({ action: 'jumpToLatLng' });
+        const LL = getLeafletForRecapture();
+        if (!isUsableMapCandidate(map, LL)) {
+            const recaptured = recaptureMapViaControl();
+            if (!recaptured || !recaptured.captured) return mapControlFailure('map_not_ready');
+            map = STATE.mapInstance;
+            if (!isUsableMapCandidate(map, LL)) return mapControlFailure('map_not_ready');
+        }
+        return setViewViaControl(map, latNum, lngNum);
     }
 
     function jumpToGameViaControl(x, y, options = {}) {
@@ -1575,8 +1824,26 @@
         return LL;
     }
 
+    function hasUsableMapPane(map) {
+        if (!map) return false;
+        try {
+            if (typeof map.getContainer === 'function') {
+                const container = map.getContainer();
+                if (!container || container.isConnected === false) return false;
+            }
+            let pane = null;
+            if (typeof map.getPane === 'function') pane = map.getPane('mapPane');
+            if (!pane && map._mapPane) pane = map._mapPane;
+            if (!pane || pane.isConnected === false) return false;
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
     function isUsableMapCandidate(map, LL) {
         if (!map || typeof map.setView !== 'function') return false;
+        if (!hasUsableMapPane(map)) return false;
         if (LL && LL.Map && map instanceof LL.Map) return true;
         if (typeof map.getContainer === 'function') {
             try {
@@ -1615,24 +1882,34 @@
         const cmd = command || {};
         const options = { source: cmd.source || 'manual' };
 
-        if (cmd.type === 'jumpToGame') return jumpToGameViaControl(cmd.x, cmd.y, options);
+        if (cmd.type === 'jumpToGame') {
+            const latLng = gameToLatLng(cmd.x, cmd.y);
+            if (!latLng) return mapControlFailure('invalid_game_coord');
+            return jumpToLatLngViaControl(latLng[0], latLng[1], options);
+        }
         if (cmd.type === 'jumpToLatLng') return jumpToLatLngViaControl(cmd.lat, cmd.lng, options);
         if (cmd.type === 'zoom') return zoomViaControl(cmd.delta, options);
         if (cmd.type === 'recaptureMap') return recaptureMapViaControl();
         if (cmd.type === 'isPointPopupOpen') return mapControlSuccess({ open: isPointPopupOpenForControl() });
+        if (cmd.type === 'getMapContext') return mapControlSuccess({ data: getMapContext() });
+        if (cmd.type === 'getTileMetadataSnapshot') return mapControlSuccess({ data: getTileMetadataSnapshot() });
 
         return mapControlFailure('unknown_command');
     }
 
     function installMapControlApi() {
-        window.__WuwaMapControl = {
+        const api = {
             handleCommand: handleMapControlCommand,
             jumpToGame: jumpToGameViaControl,
             jumpToLatLng: jumpToLatLngViaControl,
             zoom: zoomViaControl,
             recaptureMap: recaptureMapViaControl,
-            isPointPopupOpen: isPointPopupOpenForControl
+            isPointPopupOpen: isPointPopupOpenForControl,
+            getMapContext: getMapContext,
+            getTileMetadataSnapshot: getTileMetadataSnapshot
         };
+        globalScope.__WuwaMapControl = api;
+        if (typeof window !== 'undefined') window.__WuwaMapControl = api;
     }
 
     // ==============================
@@ -5573,7 +5850,7 @@
     }
 
     function keyToLabel(key) {
-        const map = { switchTools: '开关组', sideMenu: '侧边栏', leftTop: '左上角按钮组', zoomControl: '缩放滑块', mobile: '移动端控件' };
+        const map = { switchTools: '开关组', sideMenu: '侧边栏', leftTop: '左上角按钮组', zoomControl: '缩放滑块', mobile: '移动端控件', syncMarker: '位置同步标记' };
         return map[key] || key;
     }
 

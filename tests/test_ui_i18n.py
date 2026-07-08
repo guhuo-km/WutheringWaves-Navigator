@@ -97,7 +97,6 @@ REQUIRED_LANGUAGE_KEYS = [
     "nav_map_control_title",
     "nav_map_source",
     "nav_map_source_official",
-    "nav_map_source_aura",
     "nav_map_source_local",
     "nav_map_calibration",
     "nav_map_recapture",
@@ -162,7 +161,6 @@ REQUIRED_LANGUAGE_KEYS = [
     "ocr_select_error_message",
     "map_source_title",
     "map_source_official_full",
-    "map_source_aura_full",
     "map_source_local",
     "map_local_management",
     "map_add",
@@ -262,6 +260,128 @@ def test_settings_interface_uses_language_manager_api_for_supported_languages():
     assert "get_supported_languages()" in text
 
 
+def test_minimap_visual_controls_move_from_map_settings_to_ocr_settings():
+    text = (INTERFACES / "map_settings_interface.py").read_text(encoding="utf-8")
+    ocr_text = (INTERFACES / "ocr_settings_interface.py").read_text(encoding="utf-8")
+
+    removed_from_map_names = [
+        "minimap_visual_title_label",
+        "minimap_roi_x_spin",
+        "minimap_roi_y_spin",
+        "minimap_roi_w_spin",
+        "minimap_roi_h_spin",
+        "minimap_shape_circle_radio",
+        "minimap_shape_ellipse_radio",
+        "minimap_manual_calibrate_btn",
+        "minimap_auto_recalibrate_btn",
+    ]
+    for name in removed_from_map_names:
+        assert name not in text
+
+    expected_ocr_names = [
+        "minimap_auto_calibration_label",
+        "minimap_auto_calibration_switch",
+        "minimap_manual_calibrate_btn",
+        "coordinate_agreement_x_threshold_spin",
+        "coordinate_agreement_y_threshold_spin",
+        "history_x_threshold_spin",
+        "history_y_threshold_spin",
+        "auto_roi_lock_tolerance_spin",
+        "rough_candidate_limit_spin",
+        "heading_recognition_enabled_switch",
+    ]
+    for name in expected_ocr_names:
+        assert name in ocr_text
+
+    removed_ocr_names = [
+        "minimap_detect_interval_spin",
+        "heading_recognition_interval_spin",
+    ]
+    for name in removed_ocr_names:
+        assert name not in ocr_text
+
+    expected_settings = [
+        "minimap_roi.auto_calibration_enabled",
+        "minimap_stability.coordinate_agreement_x_threshold",
+        "minimap_stability.coordinate_agreement_y_threshold",
+        "minimap_stability.history_x_threshold",
+        "minimap_stability.history_y_threshold",
+        "minimap_stability.auto_roi_lock_tolerance_px",
+        "minimap_stability.rough_candidate_limit",
+        "minimap_stability.heading_recognition_enabled",
+    ]
+    for key in expected_settings:
+        assert key in ocr_text
+
+    removed_settings = [
+        "minimap_roi.detect_interval_ms",
+        "minimap_stability.heading_recognition_interval_ms",
+    ]
+    for key in removed_settings:
+        assert key not in ocr_text
+
+    assert "preview_button" in ocr_text
+    assert ocr_text.count("preview_button") >= 1
+
+
+def test_ocr_settings_interface_updates_dark_theme_backgrounds():
+    ocr_text = (INTERFACES / "ocr_settings_interface.py").read_text(encoding="utf-8")
+    main_window_text = MAIN_WINDOW.read_text(encoding="utf-8")
+
+    assert "def update_theme(self):" in ocr_text
+    assert "ThemeManager.get_page_background_style()" in ocr_text
+    assert "ThemeManager.get_card_widget_style()" in ocr_text
+    assert "self.basic_card" in ocr_text
+    assert "self.status_divider" in ocr_text
+    assert "self.params_divider" in ocr_text
+    assert "findChildren(QFrame)" not in ocr_text
+    assert "self._ocr_settings_interface.update_theme()" in main_window_text
+
+
+def test_aura_helper_is_removed_from_map_source_ui():
+    nav_text = (PROJECT_ROOT / "src" / "ui" / "interfaces" / "navigation_interface.py").read_text(encoding="utf-8")
+    settings_text = (PROJECT_ROOT / "src" / "ui" / "interfaces" / "map_settings_interface.py").read_text(encoding="utf-8")
+    constants_text = (PROJECT_ROOT / "src" / "core" / "constants.py").read_text(encoding="utf-8")
+    calibration_text = (PROJECT_ROOT / "src" / "ui" / "dialogs" / "calibration_window.py").read_text(encoding="utf-8")
+    zh_text = (PROJECT_ROOT / "languages" / "zh_CN.json").read_text(encoding="utf-8")
+    en_text = (PROJECT_ROOT / "languages" / "en_US.json").read_text(encoding="utf-8")
+
+    for text in (nav_text, settings_text, constants_text, calibration_text):
+        assert "aura" not in text
+        assert "aura_helper" not in text
+        assert "ghzs" not in text
+
+    assert "光环助手" not in zh_text
+    assert "Aura" not in en_text
+
+
+def test_calibration_window_uses_current_local_map_server_port():
+    text = (PROJECT_ROOT / "src" / "ui" / "dialogs" / "calibration_window.py").read_text(encoding="utf-8")
+
+    assert "http://localhost:58427/index.html" in text
+    assert "http://localhost:8000/index.html" not in text
+
+
+def test_minimap_calibration_buttons_are_connected_to_main_window():
+    map_settings_text = (INTERFACES / "map_settings_interface.py").read_text(encoding="utf-8")
+    ocr_settings_text = (INTERFACES / "ocr_settings_interface.py").read_text(encoding="utf-8")
+    main_window_text = MAIN_WINDOW.read_text(encoding="utf-8")
+
+    assert "minimap_manual_calibration_requested" not in map_settings_text
+    assert "minimap_auto_calibration_toggled" not in map_settings_text
+
+    assert "minimap_manual_calibration_requested" in ocr_settings_text
+    assert "minimap_auto_calibration_toggled" in ocr_settings_text
+
+    assert "_ocr_settings_interface.minimap_manual_calibration_requested.connect(self._setup_minimap_region)" in main_window_text
+    assert "_ocr_settings_interface.minimap_auto_calibration_toggled.connect(self._on_minimap_auto_calibration_toggled)" in main_window_text
+    assert "minimap_roi_locked.connect(self._on_minimap_roi_locked)" in main_window_text
+    assert "def _on_minimap_roi_locked(self, payload):" in main_window_text
+    assert 'self._settings.set("minimap_roi.status", "locked"' in main_window_text
+    assert 'start_minimap_auto_search' in main_window_text
+    assert 'stop_minimap_auto_search' in main_window_text
+
+
 def test_new_ui_i18n_keys_exist_in_both_language_files():
     zh = json.loads((LANGUAGES / "zh_CN.json").read_text(encoding="utf-8"))
     en = json.loads((LANGUAGES / "en_US.json").read_text(encoding="utf-8"))
@@ -271,6 +391,21 @@ def test_new_ui_i18n_keys_exist_in_both_language_files():
 
     assert missing_zh == []
     assert missing_en == []
+
+
+def test_log_ui_uses_recognition_log_wording():
+    zh = json.loads((LANGUAGES / "zh_CN.json").read_text(encoding="utf-8"))
+    en = json.loads((LANGUAGES / "en_US.json").read_text(encoding="utf-8"))
+    log_interface_text = (INTERFACES / "log_interface.py").read_text(encoding="utf-8")
+    main_window_text = MAIN_WINDOW.read_text(encoding="utf-8")
+
+    assert zh["log_ocr"] == "识别日志"
+    assert zh["log_detailed_ocr"] == "详细识别日志:"
+    assert en["log_ocr"] == "Recognition Log"
+    assert en["log_detailed_ocr"] == "Detailed recognition log:"
+    assert "OCR 日志" not in log_interface_text
+    assert "详细OCR日志" not in log_interface_text
+    assert "详细OCR日志" not in main_window_text
 
 
 def test_all_interface_tr_keys_exist_in_both_language_files():

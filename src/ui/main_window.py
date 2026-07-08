@@ -2,8 +2,9 @@
 import os
 import sys
 import json
+import math
 import subprocess
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Any, Dict
 from urllib.parse import urlparse, parse_qs
@@ -44,18 +45,40 @@ try:
     from core.app_state import AppState
     from core.constants import get_map_urls, DEFAULT_HOTKEYS
     from core.calibration import TransformMatrix
-    from core.map_control_bridge import build_map_control_command
+    from core.map_provider_capabilities import capabilities_for_current_map
+    from core.map_control_bridge import (
+        build_map_control_command,
+        build_tile_metadata_update_listener,
+        build_tile_metadata_snapshot_query,
+    )
     from core.update_provider import HttpUpdateProvider, UpdateResult
     from core.utils import get_assets_path
     from core.version import find_version_file, load_version_info
+    from core.vision_context import build_vision_snapshot, map_context_from_js
+    from minimap_stitched_resources import publish_stitched_resources_from_snapshot
+    from minimap_tile_indexer import TileIndexQueue
+    from minimap_tile_snapshot import parse_tile_metadata_snapshot_result
+    from minimap_tile_sync_service import MinimapTileSyncService
+    from minimap_roi import MinimapRoi
 except ImportError:
     from ..core.app_state import AppState
     from ..core.constants import get_map_urls, DEFAULT_HOTKEYS
     from ..core.calibration import TransformMatrix
-    from ..core.map_control_bridge import build_map_control_command
+    from ..core.map_provider_capabilities import capabilities_for_current_map
+    from ..core.map_control_bridge import (
+        build_map_control_command,
+        build_tile_metadata_update_listener,
+        build_tile_metadata_snapshot_query,
+    )
     from ..core.update_provider import HttpUpdateProvider, UpdateResult
     from ..core.utils import get_assets_path
     from ..core.version import find_version_file, load_version_info
+    from ..core.vision_context import build_vision_snapshot, map_context_from_js
+    from ..minimap_stitched_resources import publish_stitched_resources_from_snapshot
+    from ..minimap_tile_indexer import TileIndexQueue
+    from ..minimap_tile_snapshot import parse_tile_metadata_snapshot_result
+    from ..minimap_tile_sync_service import MinimapTileSyncService
+    from ..minimap_roi import MinimapRoi
 
 
 def build_updater_command(
@@ -87,6 +110,7 @@ def build_updater_command(
 
 class MainWindow(FluentWindow):
     _update_check_finished = Signal(object, str, str)
+    _system_log_requested = Signal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -98,6 +122,8 @@ class MainWindow(FluentWindow):
         self._managers_initialized = False
         self._server_startup_error: Optional[str] = None
         self._auto_calibration_fetching = False
+        self._latest_tile_snapshot_result = None
+        self._tile_metadata_refresh_pending = False
         self._auto_calibration_polling_timer = QTimer(self)
         self._auto_calibration_polling_timer.setInterval(1000)
         self._auto_calibration_polling_timer.timeout.connect(self.fetch_auto_calibration)
@@ -106,10 +132,25 @@ class MainWindow(FluentWindow):
         self._log_version_source()
         from core.settings_manager import SettingsManager
         self._settings = SettingsManager()
+        self._minimap_region_calibrator = None
         self._about_nav_item = None
         self._about_nav_badge = None
         self._update_check_in_progress = False
         self._last_update_result: Optional[UpdateResult] = None
+        self._python_download_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="python-download")
+        self._update_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="update-check")
+        self._system_log_requested.connect(self._app_state.append_system_log)
+        self._minimap_tile_index_queue = TileIndexQueue(
+            paths.minimap_tile_cache_dir(),
+            max_workers=1,
+            auto_start=True,
+            on_error=self._on_minimap_tile_index_error,
+        )
+        self._minimap_tile_sync_service = MinimapTileSyncService(
+            index_queue=self._minimap_tile_index_queue,
+            tile_root_provider=paths.minimap_tile_cache_dir,
+            on_summary=self._on_minimap_tile_sync_summary,
+        )
         self._update_provider = HttpUpdateProvider(
             latest_url=self._version_info.update_base_url,
             artifact_key=self._get_update_artifact_key(),
@@ -236,6 +277,10 @@ class MainWindow(FluentWindow):
                 )
             except Exception:
                 pass
+            try:
+                self._ocr_manager.minimap_roi_locked.connect(self._on_minimap_roi_locked)
+            except Exception:
+                pass
         except ImportError:
             print("OCR manager not available")
         
@@ -296,6 +341,7 @@ class MainWindow(FluentWindow):
             self._backend.statusUpdated.connect(self._on_map_status_updated)
             self._backend.localMapChangedSignal.connect(self._on_local_map_changed)
             self._backend.proxyResponse.connect(self._deliver_proxy_response_via_js)
+            self._backend.tileMetadataChangedSignal.connect(self._on_tile_metadata_changed)
         except ImportError:
             self._backend = None
             print("MapBackend not available")
@@ -305,16 +351,7 @@ class MainWindow(FluentWindow):
             # 清除旧脚本防止重复
             self._web_profile.scripts().clear()
 
-            user_scripts = []
-
-            # 优先加载 Lite（光环助手/本地地图），同时兼容保留原版（官方地图）
-            for script_name in ["wuwa_map_optimizer_lite.js", "wuwa_map_optimizer.js"]:
-                user_script_path = paths.resource_root() / "js" / script_name
-                if os.path.exists(user_script_path):
-                    user_scripts.append(str(user_script_path))
-                    print(f"✓ 发现用户脚本: {user_script_path}")
-                else:
-                    print(f"⚠ 未发现用户脚本: {user_script_path}")
+            user_scripts = self._provider_user_scripts()
 
             # 获取标准脚本 + 用户脚本
             scripts = self._gm_manager.get_standard_scripts(user_scripts=user_scripts)
@@ -324,6 +361,29 @@ class MainWindow(FluentWindow):
                 self._web_profile.scripts().insert(script)
 
             print(f"✅ 已成功注册 {len(scripts)} 个注入脚本到 WebProfile")
+
+    def _provider_user_scripts(self) -> list[str]:
+        """Return scripts for supported map providers; @match keeps URL-level isolation."""
+        supported_caps = [
+            capabilities_for_current_map("online", "official_map"),
+            capabilities_for_current_map("local", self._app_state.current_map_provider),
+        ]
+        script_names = []
+        for caps in supported_caps:
+            if caps.supports_official_ui_cleanup and caps.uses_full_userscript:
+                script_names.append("wuwa_map_optimizer.js")
+            if caps.supports_local_affine_calibration and caps.uses_lite_userscript:
+                script_names.append("wuwa_map_optimizer_lite.js")
+
+        user_scripts = []
+        for script_name in dict.fromkeys(script_names):
+            user_script_path = paths.resource_root() / "js" / script_name
+            if os.path.exists(user_script_path):
+                user_scripts.append(str(user_script_path))
+                print(f"✓ 发现用户脚本: {user_script_path}")
+            else:
+                print(f"⚠ 未发现用户脚本: {user_script_path}")
+        return user_scripts
 
     def _build_kmp_runtime_payload(self) -> Dict[str, Any]:
         """Build userscript runtime payload: token/mapKey/matrix/user."""
@@ -430,7 +490,215 @@ class MainWindow(FluentWindow):
     def _on_web_load_finished(self, ok: bool):
         if not ok:
             return
+        self._refresh_python_overlay_after_web_load()
         self._inject_kmp_runtime()
+        if self._supports_official_tile_metadata():
+            self._install_tile_metadata_update_listener()
+            QTimer.singleShot(1000, self._refresh_minimap_tile_cache)
+        else:
+            self._clear_ocr_vision_context()
+
+    def _refresh_python_overlay_after_web_load(self):
+        """Keep the Python-drawn center marker above QWebEngine after page reloads."""
+        if not self._overlay_manager:
+            return
+        self._overlay_manager.show_overlay()
+        QTimer.singleShot(300, self._overlay_manager.show_overlay)
+
+    def _current_map_capabilities(self):
+        return capabilities_for_current_map(
+            self._app_state.current_mode,
+            self._app_state.current_map_provider,
+        )
+
+    def _supports_official_tile_metadata(self) -> bool:
+        return bool(self._current_map_capabilities().supports_official_tile_metadata)
+
+    def _supports_minimap_visual_location(self) -> bool:
+        return bool(self._current_map_capabilities().supports_minimap_visual_location)
+
+    def _clear_ocr_vision_context(self):
+        self._latest_tile_snapshot_result = None
+        if self._ocr_manager and hasattr(self._ocr_manager, "update_vision_context"):
+            self._ocr_manager.update_vision_context(None)
+
+    def _install_tile_metadata_update_listener(self):
+        if not self._web_view or not self._web_view.page():
+            return
+        js = build_tile_metadata_update_listener()
+        self._web_view.page().runJavaScript(js)
+
+    @Slot(str)
+    def _on_tile_metadata_changed(self, updated_at: str):
+        if not self._supports_official_tile_metadata():
+            return
+        self._app_state.append_system_log(f"小地图瓦片变更通知: updatedAt={updated_at or 'unknown'}", "INFO")
+        if self._tile_metadata_refresh_pending:
+            return
+        self._tile_metadata_refresh_pending = True
+        QTimer.singleShot(500, self._refresh_minimap_tile_cache_from_notification)
+
+    def _refresh_minimap_tile_cache_from_notification(self):
+        self._tile_metadata_refresh_pending = False
+        self._refresh_minimap_tile_cache()
+
+    def _refresh_minimap_tile_cache(self):
+        if not self._supports_official_tile_metadata():
+            self._clear_ocr_vision_context()
+            return
+        if not self._web_view or not self._web_view.page():
+            return
+        js = build_tile_metadata_snapshot_query()
+        self._web_view.page().runJavaScript(js, self._on_tile_metadata_snapshot_received)
+
+    def _on_tile_metadata_snapshot_received(self, result):
+        if not self._supports_official_tile_metadata():
+            self._clear_ocr_vision_context()
+            return
+        if not result:
+            self._app_state.append_system_log("小地图瓦片快照: 无结果", "WARNING")
+            return
+        self._latest_tile_snapshot_result = result
+        self._log_tile_metadata_snapshot_summary(result)
+        self._update_ocr_vision_context_from_tile_snapshot(result)
+        self._minimap_tile_sync_service.submit_snapshot(result)
+
+    def _log_tile_metadata_snapshot_summary(self, result):
+        try:
+            snapshot = parse_tile_metadata_snapshot_result(result)
+            if snapshot is None:
+                self._app_state.append_system_log("小地图瓦片快照: 解析失败", "WARNING")
+                return
+            parts = []
+            for field, label in (
+                ("standardTiles", "standard"),
+                ("layeredTiles", "layered"),
+                ("gravityTiles", "gravity"),
+            ):
+                tiles = snapshot.get(field, []) or []
+                if tiles:
+                    xs = [int(tile.get("x")) for tile in tiles if tile.get("x") is not None]
+                    ys = [int(tile.get("y")) for tile in tiles if tile.get("y") is not None]
+                    area_ids = sorted({str(tile.get("regionId")) for tile in tiles if tile.get("regionId") is not None})
+                    x_range = f"{min(xs)}..{max(xs)}" if xs else "n/a"
+                    y_range = f"{min(ys)}..{max(ys)}" if ys else "n/a"
+                    area_text = ",".join(area_ids[:5])
+                    if len(area_ids) > 5:
+                        area_text += f"+{len(area_ids) - 5}"
+                    parts.append(f"{label}={len(tiles)} area={area_text or 'n/a'} x={x_range} y={y_range}")
+                else:
+                    parts.append(f"{label}=0")
+            self._app_state.append_system_log(f"小地图瓦片快照: {'; '.join(parts)}", "INFO")
+        except Exception as exc:
+            self._app_state.append_system_log(f"小地图瓦片快照日志失败: {exc}", "WARNING")
+
+    def _update_ocr_vision_context_from_tile_snapshot(self, result):
+        if not self._ocr_manager:
+            return
+        try:
+            envelope = json.loads(result) if isinstance(result, str) else result
+            if not isinstance(envelope, dict) or not envelope.get("ok"):
+                return
+            data = envelope.get("data")
+            if not isinstance(data, dict):
+                return
+            context = map_context_from_js(data.get("mapContext"))
+            if context is None:
+                return
+            self._ocr_manager.update_vision_context(
+                build_vision_snapshot(context, paths.minimap_tile_cache_dir())
+            )
+        except Exception as e:
+            self._app_state.append_system_log(f"小地图视觉上下文更新失败: {e}", "ERROR")
+
+    def _on_minimap_tile_sync_summary(self, summary):
+        if getattr(summary, "error", None):
+            self._append_system_log_threadsafe(f"小地图瓦片缓存更新失败: {summary.error}", "ERROR")
+            return
+
+        changed = list(getattr(summary, "changed_area_ids", ()) or ())
+        failures = int(getattr(summary, "failure_count", 0) or 0)
+        downloaded = int(getattr(summary, "downloaded_count", 0) or 0)
+        pending = int(getattr(summary, "index_pending_count", 0) or 0)
+        self._append_system_log_threadsafe(
+            (
+                "小地图瓦片下载检查: "
+                f"输入{int(getattr(summary, 'input_count', 0) or 0)}个, "
+                f"跳过{int(getattr(summary, 'skipped_count', 0) or 0)}个, "
+                f"下载{downloaded}个, 失败{failures}个, 区域{changed}"
+            ),
+            "INFO" if not failures else "WARNING",
+        )
+        if downloaded or failures:
+            self._append_system_log_threadsafe(
+                f"小地图瓦片缓存更新: 下载{downloaded}个, 失败{failures}个, 区域{changed}",
+                "INFO" if not failures else "WARNING",
+            )
+        queued_tiles = int(getattr(summary, "index_queued_tiles", 0) or 0)
+        if queued_tiles:
+            self._append_system_log_threadsafe(
+                f"小地图瓦片索引队列: 新增{queued_tiles}个瓦片, 待处理{pending}项",
+                "INFO",
+            )
+        stale_tiles = int(getattr(summary, "stale_queued_tiles", 0) or 0)
+        if stale_tiles:
+            self._append_system_log_threadsafe(
+                f"小地图SIFT过期索引修复队列: 新增{stale_tiles}个瓦片, 待处理{pending}项",
+                "INFO",
+            )
+        missing_items = int(getattr(summary, "missing_queued_items", 0) or 0)
+        if missing_items:
+            self._append_system_log_threadsafe(
+                f"小地图索引补偿队列: 新增{missing_items}项, 待处理{pending}项",
+                "INFO",
+            )
+        for area_id in changed:
+            index_summary = self._minimap_tile_index_queue.health_summary(area_id)
+            self._append_system_log_threadsafe(
+                (
+                    f"小地图索引状态: 区域{area_id} "
+                    f"tiles={index_summary.get('tiles', 0)} "
+                    f"rough_ready={index_summary.get('rough_ready', 0)} "
+                    f"sift_ready={index_summary.get('sift_ready', 0)} "
+                    f"rough_missing={index_summary.get('rough_missing', 0)} "
+                    f"sift_missing={index_summary.get('sift_missing', 0)} "
+                    f"failed={index_summary.get('failed', 0)}"
+                ),
+                "INFO",
+            )
+
+    def _append_system_log_threadsafe(self, message: str, level: str = "INFO"):
+        self._system_log_requested.emit(str(message), str(level))
+
+    def _on_minimap_tile_index_error(self, message):
+        QTimer.singleShot(
+            0,
+            lambda: self._app_state.append_system_log(f"小地图瓦片索引失败: {message}", "WARNING"),
+        )
+
+    def _refresh_minimap_stitched_resources(self, changed_area_ids):
+        snapshot = parse_tile_metadata_snapshot_result(self._latest_tile_snapshot_result)
+        if snapshot is None:
+            return
+        context = map_context_from_js(snapshot.get("mapContext"))
+        if context is None:
+            return
+        manifests = publish_stitched_resources_from_snapshot(
+            snapshot,
+            context=context,
+            cache_root=paths.minimap_tile_cache_dir(),
+            output_root=paths.minimap_tile_cache_dir(),
+            changed_area_ids={str(area_id) for area_id in changed_area_ids},
+        )
+        if manifests:
+            count = len(manifests)
+            QTimer.singleShot(
+                0,
+                lambda: self._app_state.append_system_log(
+                    f"小地图匹配资源已刷新: {context.area_id}，{count}个候选",
+                    "INFO",
+                ),
+            )
 
     def _connect_web_download_handler(self):
         try:
@@ -539,12 +807,7 @@ class MainWindow(FluentWindow):
             index += 1
 
     def _start_python_download(self, url: str, destination: str):
-        worker = threading.Thread(
-            target=self._run_python_download,
-            args=(url, destination),
-            daemon=True,
-        )
-        worker.start()
+        self._python_download_executor.submit(self._run_python_download, url, destination)
 
     def _run_python_download(self, url: str, destination: str):
         try:
@@ -651,7 +914,7 @@ class MainWindow(FluentWindow):
         self._navigation_i18n = [
             (self._home_interface, "nav_home", "首页"),
             (self._navigation_interface, "nav_navigation", "导航"),
-            (self._ocr_settings_interface, "nav_ocr_settings", "OCR设置"),
+            (self._ocr_settings_interface, "nav_ocr_settings", "识别设置"),
             (self._map_settings_interface, "nav_map_settings", "地图设置"),
             (self._route_settings_interface, "nav_route_recording", "路线录制"),
             (self._hotkey_interface, "nav_hotkeys", "快捷键"),
@@ -662,7 +925,7 @@ class MainWindow(FluentWindow):
 
         self.addSubInterface(self._home_interface, FIF.HOME, tr("nav_home", "首页"))
         self.addSubInterface(self._navigation_interface, FIF.SEND, tr("nav_navigation", "导航"))
-        self.addSubInterface(self._ocr_settings_interface, CustomFluentIcon.OCR_SETTINGS, tr("nav_ocr_settings", "OCR设置"))
+        self.addSubInterface(self._ocr_settings_interface, CustomFluentIcon.OCR_SETTINGS, tr("nav_ocr_settings", "识别设置"))
         self.addSubInterface(self._map_settings_interface, CustomFluentIcon.MAP_SETTINGS, tr("nav_map_settings", "地图设置"))
         self.addSubInterface(self._route_settings_interface, CustomFluentIcon.ROUTE_RECORDING, tr("nav_route_recording", "路线录制"))
         self.addSubInterface(self._hotkey_interface, CustomFluentIcon.HOTKEY, tr("nav_hotkeys", "快捷键"))
@@ -769,6 +1032,9 @@ class MainWindow(FluentWindow):
         # OCR Settings signals
         self._ocr_settings_interface.settings_changed.connect(self._reload_ocr_config)
         self._ocr_settings_interface.auto_detect_toggled.connect(self._on_ocr_auto_detect_toggled)
+        self._ocr_settings_interface.window_select_requested.connect(self._setup_ocr_region)
+        self._ocr_settings_interface.minimap_manual_calibration_requested.connect(self._setup_minimap_region)
+        self._ocr_settings_interface.minimap_auto_calibration_toggled.connect(self._on_minimap_auto_calibration_toggled)
         
         # Connect OCR preview hover signals
         self._ocr_settings_interface.preview_hover_enter.connect(self._show_ocr_preview)
@@ -928,12 +1194,7 @@ class MainWindow(FluentWindow):
             "INFO"
         )
 
-        worker = threading.Thread(
-            target=self._run_update_check_thread,
-            args=(trigger,),
-            daemon=True
-        )
-        worker.start()
+        self._update_check_executor.submit(self._run_update_check_thread, trigger)
 
     def _run_update_check_thread(self, trigger: str):
         try:
@@ -1286,12 +1547,6 @@ class MainWindow(FluentWindow):
             parsed_url = urlparse(url_string)
             query_params = parse_qs(parsed_url.query)
             new_area_id = query_params.get('state', [None])[0] or "8"
-        elif ("ghzs.com" in url_string or "ghzs666.com" in url_string) and "#/?map=" in url_string:
-            try:
-                new_area_id = url_string.split('#/?map=')[1]
-            except IndexError:
-                new_area_id = "default"
-
         if not new_area_id:
             return
 
@@ -1299,6 +1554,8 @@ class MainWindow(FluentWindow):
             self._app_state.append_system_log(
                 f"检测到区域切换: {self._app_state.current_area_id} -> {new_area_id}", "INFO"
             )
+            if self._ocr_manager and hasattr(self._ocr_manager, "reset_coordinate_continuity"):
+                self._ocr_manager.reset_coordinate_continuity("area_changed")
             self._app_state.current_area_id = new_area_id
             self._recapture_map()
             QTimer.singleShot(1000, self._load_or_fetch_calibration_for_current_map)
@@ -1348,15 +1605,15 @@ class MainWindow(FluentWindow):
             # 映射UI发送的简短名称到实际的provider key
             provider_map = {
                 "official": "official_map",
-                "aura": "aura_helper"
             }
             actual_provider = provider_map.get(provider, provider)
+            if actual_provider != "official_map":
+                actual_provider = "official_map"
             self._app_state.current_map_provider = actual_provider
 
             # 用户友好的提供商名称
             provider_names = {
                 "official_map": "库街区",
-                "aura_helper": "光环助手"
             }
             provider_name = provider_names.get(actual_provider, actual_provider)
             self._app_state.append_system_log(f"切换到在线地图: {provider_name}", "INFO")
@@ -1500,11 +1757,17 @@ class MainWindow(FluentWindow):
     def _recapture_map(self):
         js = build_map_control_command({"type": "recaptureMap", "source": "manual"})
         self._web_view.page().runJavaScript(js)
+        QTimer.singleShot(1000, self._refresh_minimap_tile_cache)
     
     def _start_ocr(self):
         if self._ocr_manager and not self._app_state.ocr_running:
             success = self._ocr_manager.start_ocr()
             if success:
+                if (
+                    self._ocr_settings_interface
+                    and self._ocr_settings_interface.is_minimap_auto_calibration_enabled()
+                ):
+                    self._request_minimap_auto_recalibration()
                 self._app_state.ocr_running = True
                 self._app_state.append_system_log("OCR识别已启动", "INFO")
             else:
@@ -1555,6 +1818,7 @@ class MainWindow(FluentWindow):
             digit_conf = self._ocr_settings_interface.get_digit_confidence_threshold()
             symbol_conf = self._ocr_settings_interface.get_symbol_confidence_threshold()
             auto_detect_enabled = self._ocr_settings_interface.is_auto_detect_enabled()
+            heading_enabled = self._ocr_settings_interface.is_heading_recognition_enabled()
 
             self._ocr_manager.ocr_config['screenshot_mode'] = screenshot_mode
             self._ocr_manager.ocr_config['ocr_interval'] = int(interval)
@@ -1562,6 +1826,7 @@ class MainWindow(FluentWindow):
             self._ocr_manager.ocr_config['digit_confidence_threshold'] = float(digit_conf)
             self._ocr_manager.ocr_config['symbol_confidence_threshold'] = float(symbol_conf)
             self._ocr_manager.ocr_config['auto_detect_region_enabled'] = bool(auto_detect_enabled)
+            self._settings.set("minimap_stability.heading_recognition_enabled", bool(heading_enabled))
             self._ocr_manager.save_config()
 
             worker = self._ocr_manager.ocr_worker
@@ -1592,7 +1857,7 @@ class MainWindow(FluentWindow):
             return
         self._ocr_manager.set_detailed_ocr_logging(enabled)
         self._app_state.append_system_log(
-            f"详细OCR日志已{'开启' if enabled else '关闭'}", "INFO"
+            f"详细识别日志已{'开启' if enabled else '关闭'}", "INFO"
         )
 
     @Slot(bool)
@@ -1673,7 +1938,83 @@ class MainWindow(FluentWindow):
         if self._ocr_manager:
             self._app_state.append_system_log("OCR区域校准已启动", "INFO")
             self._ocr_manager.setup_ocr_region()
-    
+
+    def _setup_minimap_region(self):
+        """启动小地图区域校准（手动框选）"""
+        try:
+            from ocr_region_calibrator import OCRRegionCalibrator
+
+            if self._minimap_region_calibrator is not None:
+                self._minimap_region_calibrator.close()
+                self._minimap_region_calibrator = None
+
+            self._minimap_region_calibrator = OCRRegionCalibrator(
+                QApplication.instance(),
+                region_label="小地图区域",
+                selection_shape="circle",
+                shift_forces_circle=True,
+            )
+            self._minimap_region_calibrator.region_shape_selected.connect(self._on_minimap_region_selected)
+            self._minimap_region_calibrator.selection_cancelled.connect(self._on_minimap_region_cancelled)
+            self._minimap_region_calibrator.show()
+            self._minimap_region_calibrator.raise_()
+            self._minimap_region_calibrator.activateWindow()
+            self._app_state.append_system_log("小地图位置手动校准已启动", "INFO")
+        except Exception as e:
+            self._minimap_region_calibrator = None
+            self._app_state.append_system_log(f"启动小地图位置校准失败: {e}", "ERROR")
+
+    @Slot(int, int, int, int, str)
+    def _on_minimap_region_selected(self, x: int, y: int, width: int, height: int, shape: str = "circle"):
+        if self._ocr_manager and hasattr(self._ocr_manager, "normalize_minimap_manual_selection"):
+            roi = self._ocr_manager.normalize_minimap_manual_selection(x, y, width, height)
+        else:
+            roi = MinimapRoi(int(x), int(y), int(width), int(height), "circle", "manual")
+
+        self._settings.set("minimap_roi.x", int(roi.x), save=False)
+        self._settings.set("minimap_roi.y", int(roi.y), save=False)
+        self._settings.set("minimap_roi.width", int(roi.width), save=False)
+        self._settings.set("minimap_roi.height", int(roi.height), save=False)
+        self._settings.set("minimap_roi.shape", "circle", save=False)
+        self._settings.set("minimap_roi.source", "manual", save=False)
+        self._settings.set("minimap_roi.status", "locked", save=False)
+        self._settings.save()
+
+        self._app_state.append_system_log(
+            f"小地图位置已保存: x={roi.x}, y={roi.y}, width={roi.width}, height={roi.height}",
+            "INFO",
+        )
+        self._minimap_region_calibrator = None
+
+    def _on_minimap_region_cancelled(self):
+        self._app_state.append_system_log("小地图位置手动校准已取消", "INFO")
+        self._minimap_region_calibrator = None
+
+    def _request_minimap_auto_recalibration(self):
+        if self._ocr_manager:
+            self._ocr_manager.start_minimap_auto_search()
+        self._app_state.append_system_log("小地图自动校准已开始", "INFO")
+
+    def _on_minimap_auto_calibration_toggled(self, enabled: bool):
+        if enabled:
+            self._request_minimap_auto_recalibration()
+            return
+        if self._ocr_manager:
+            self._ocr_manager.stop_minimap_auto_search()
+        self._app_state.append_system_log("小地图自动校准已关闭", "INFO")
+
+    @Slot(dict)
+    def _on_minimap_roi_locked(self, payload):
+        try:
+            self._app_state.append_system_log(
+                "小地图位置自动校准已锁定: "
+                f"x={payload.get('x')}, y={payload.get('y')}, "
+                f"width={payload.get('width')}, height={payload.get('height')}",
+                "INFO",
+            )
+        except Exception:
+            pass
+
     @Slot(int, int, int)
     def _on_ocr_coordinates_detected(self, x: int, y: int, z: int):
         if self._resource_probe:
@@ -1694,6 +2035,22 @@ class MainWindow(FluentWindow):
         # 更新覆盖层的Z值，用于颜色映射（Z轴颜色映射默认启用）
         if self._overlay_manager:
             self._overlay_manager.set_z_value(z)
+            heading_candidate = (
+                getattr(self._ocr_manager, "latest_heading_candidate", None)
+                if self._ocr_manager is not None
+                else None
+            )
+            if isinstance(heading_candidate, dict):
+                try:
+                    heading_degrees = float(heading_candidate.get("angle_degrees"))
+                    if math.isfinite(heading_degrees):
+                        self._overlay_manager.set_heading_degrees(heading_degrees)
+                    else:
+                        self._overlay_manager.clear_heading()
+                except (TypeError, ValueError):
+                    self._overlay_manager.clear_heading()
+            else:
+                self._overlay_manager.clear_heading()
     
     @Slot(str)
     def _on_ocr_state_changed(self, state: str):
@@ -1725,6 +2082,7 @@ class MainWindow(FluentWindow):
         if not self._ocr_manager:
             return
 
+        areas = []
         area = None
         worker = getattr(self._ocr_manager, 'ocr_worker', None)
         if worker is not None and getattr(worker, 'is_running', False):
@@ -1735,15 +2093,28 @@ class MainWindow(FluentWindow):
         if area is None:
             area = self._ocr_manager.ocr_config.get('ocr_capture_area')
         
-        # Validate area has required keys and positive dimensions
         if area and isinstance(area, dict):
             if all(k in area for k in ('x', 'y', 'width', 'height')):
                 if area['width'] > 0 and area['height'] > 0:
-                    self._ocr_preview_overlay.show_preview(area)
-                    return
-        
-        # If no valid area, don't show overlay (or show mask only)
-        # For now, just don't show anything if area is invalid
+                    areas.append(area)
+
+        minimap_area = self._build_minimap_preview_area()
+        if minimap_area is not None:
+            areas.append(minimap_area)
+
+        if areas:
+            self._ocr_preview_overlay.show_preview(areas)
+
+    def _build_minimap_preview_area(self):
+        try:
+            if not self._ocr_manager:
+                return None
+            get_area = getattr(self._ocr_manager, "get_minimap_preview_area", None)
+            if callable(get_area):
+                return get_area()
+            return None
+        except Exception:
+            return None
     
     def _hide_ocr_preview(self):
         """Hide OCR preview overlay on hover leave."""
@@ -1802,14 +2173,13 @@ class MainWindow(FluentWindow):
             matrix = self._app_state.transform_matrix
         
         if matrix:
-            js = build_map_control_command(
-                {
-                    "type": "jumpToGame",
-                    "x": x,
-                    "y": y,
-                    "source": "tracking",
-                }
-            )
+            command = {
+                "type": "jumpToGame",
+                "x": x,
+                "y": y,
+                "source": "tracking",
+            }
+            js = build_map_control_command(command)
 
             def _on_jump_result(result):
                 if isinstance(result, str):
@@ -1830,8 +2200,18 @@ class MainWindow(FluentWindow):
                         "INFO",
                     )
                 else:
+                    detail_parts = []
+                    if isinstance(result, dict):
+                        for key in ("name", "message", "stack"):
+                            value = result.get(key)
+                            if value:
+                                text = str(value)
+                                if key == "stack":
+                                    text = text.replace("\n", " | ")[:600]
+                                detail_parts.append(f"{key}={text}")
+                    detail = f" ({'; '.join(detail_parts)})" if detail_parts else ""
                     self._app_state.append_system_log(
-                        f"OCR自动跳转失败: {reason}",
+                        f"OCR自动跳转失败: {reason}{detail}",
                         "ERROR",
                     )
 
@@ -2075,6 +2455,9 @@ class MainWindow(FluentWindow):
         # 更新地图设置列表
         self._map_settings_interface.update_theme()
 
+        # 更新识别设置背景和卡片
+        self._ocr_settings_interface.update_theme()
+
         # 更新日志文本框
         self._log_interface.update_theme()
 
@@ -2290,6 +2673,21 @@ class MainWindow(FluentWindow):
                     self._hotkey_manager.cleanup()
                 else:
                     self._hotkey_manager.unregister_all()
+
+            if self._minimap_tile_sync_service:
+                self._minimap_tile_sync_service.shutdown(timeout=1.0)
+
+            if self._minimap_tile_index_queue:
+                self._minimap_tile_index_queue.shutdown()
+
+            if self._python_download_executor:
+                self._python_download_executor.shutdown(wait=False, cancel_futures=True)
+
+            if self._update_check_executor:
+                self._update_check_executor.shutdown(wait=False, cancel_futures=True)
+
+            if self._backend and hasattr(self._backend, "shutdown"):
+                self._backend.shutdown()
 
             if self._log_manager:
                 self._log_manager.stop()

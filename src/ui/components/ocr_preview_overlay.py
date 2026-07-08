@@ -22,7 +22,7 @@ class OCRPreviewOverlay(QWidget):
             Qt.WindowType.Tool
         )
         
-        self.area_rect = None
+        self.area_rects = []
         
         # Default to primary screen geometry
         self.update_geometry()
@@ -33,14 +33,18 @@ class OCRPreviewOverlay(QWidget):
         if screen:
             self.setGeometry(screen.geometry())
 
-    def show_preview(self, area: dict):
+    def show_preview(self, area: dict | list[dict]):
         """
-        Show overlay with red rectangle at area coordinates.
+        Show overlay with red rectangles at area coordinates.
         
         Args:
-            area: dict with keys {x, y, width, height} or None
+            area: dict or list of dicts with keys {x, y, width, height}
         """
-        if area and all(k in area for k in ('x', 'y', 'width', 'height')):
+        areas = area if isinstance(area, list) else [area]
+        self.area_rects = []
+        for item in areas:
+            if not item or not all(k in item for k in ('x', 'y', 'width', 'height')):
+                continue
             # 预览层使用 Qt 逻辑坐标，OCR 区域配置是物理像素坐标。
             # 仅在“预览”中做 DPI 缩放换算（除以缩放比），不影响真实截图区域设置逻辑。
             screen = QApplication.primaryScreen()
@@ -48,14 +52,12 @@ class OCRPreviewOverlay(QWidget):
             if scale <= 0:
                 scale = 1.0
 
-            x = int(round(float(area['x']) / scale))
-            y = int(round(float(area['y']) / scale))
-            width = max(1, int(round(float(area['width']) / scale)))
-            height = max(1, int(round(float(area['height']) / scale)))
+            x = int(round(float(item['x']) / scale))
+            y = int(round(float(item['y']) / scale))
+            width = max(1, int(round(float(item['width']) / scale)))
+            height = max(1, int(round(float(item['height']) / scale)))
 
-            self.area_rect = QRect(x, y, width, height)
-        else:
-            self.area_rect = None
+            self.area_rects.append(QRect(x, y, width, height))
             
         self.update_geometry()
         self.show()
@@ -74,18 +76,21 @@ class OCRPreviewOverlay(QWidget):
         overlay_path = QPainterPath()
         overlay_path.addRect(QRectF(self.rect()))
         
-        # Subtract area rect if valid to create "cutout"
-        if self.area_rect and not self.area_rect.isNull():
+        # Subtract area rects if valid to create cutouts.
+        for area_rect in self.area_rects:
+            if area_rect.isNull():
+                continue
             selection_path = QPainterPath()
-            selection_path.addRect(QRectF(self.area_rect))
+            selection_path.addRect(QRectF(area_rect))
             overlay_path -= selection_path
         
         # Fill mask with semi-transparent black
         painter.fillPath(overlay_path, QColor(0, 0, 0, 120))
         
         # Draw red rectangle border
-        if self.area_rect and not self.area_rect.isNull():
-            pen = QPen(QColor("#FF0000"), 2, Qt.PenStyle.SolidLine)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(self.area_rect)
+        pen = QPen(QColor("#FF0000"), 2, Qt.PenStyle.SolidLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        for area_rect in self.area_rects:
+            if not area_rect.isNull():
+                painter.drawRect(area_rect)

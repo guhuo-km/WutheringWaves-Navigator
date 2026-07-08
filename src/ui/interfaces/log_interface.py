@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-日志页面 - 三个标签页：系统日志、OCR日志、调试日志
+日志页面 - 三个标签页：系统日志、识别日志、调试日志
 日志写入改为文件异步写入，UI 按需加载当前会话日志。
 """
 
@@ -91,7 +91,7 @@ class LogInterface(QWidget):
 
         self.segment = SegmentedWidget()
         self.segment.addItem("system", "")
-        self.segment.addItem("ocr", "")
+        self.segment.addItem("recognition", "")
         self.segment.addItem("debug", "")
         self.segment.setCurrentItem("system")
         self.segment.currentItemChanged.connect(self.on_tab_changed)
@@ -189,7 +189,7 @@ class LogInterface(QWidget):
     def _init_log_state(self):
         self._log_state = {
             "system": {"offset": 0, "loaded": 0, "path": self._get_log_path("system")},
-            "ocr": {"offset": 0, "loaded": 0, "path": self._get_log_path("ocr")},
+            "recognition": {"offset": 0, "loaded": 0, "path": self._get_log_path("recognition")},
             "debug": {"offset": 0, "loaded": 0, "path": self._get_log_path("debug")},
         }
         self._load_initial_log("system")
@@ -201,7 +201,7 @@ class LogInterface(QWidget):
 
     def _current_key(self) -> str:
         # SegmentedWidget.currentItem() returns SegmentedItem widget,
-        # while we need the route key string ('system'/'ocr'/'debug').
+        # while we need the route key string ('system'/'recognition'/'debug').
         try:
             key = self.segment.currentRouteKey()
         except Exception:
@@ -211,7 +211,7 @@ class LogInterface(QWidget):
         return key
 
     def _current_editor(self) -> QTextEdit:
-        if self._current_key() == "ocr":
+        if self._current_key() == "recognition":
             return self.ocr_log_edit
         if self._current_key() == "debug":
             return self.debug_log_edit
@@ -238,6 +238,24 @@ class LogInterface(QWidget):
         editor = self._editor_for_key(key)
         if not path or not editor:
             return
+
+        if self._log_manager and hasattr(self._log_manager, "query_recent"):
+            try:
+                rows = self._log_manager.query_recent(key, limit=max_lines or 500)
+            except Exception:
+                rows = []
+            if rows:
+                text = "\n".join(str(row.get("message", "")) for row in rows if row.get("message"))
+                if text:
+                    editor.setPlainText(text)
+                    editor.horizontalScrollBar().setValue(0)
+                    if self._reverse_order:
+                        editor.verticalScrollBar().setValue(editor.verticalScrollBar().minimum())
+                    else:
+                        editor.verticalScrollBar().setValue(editor.verticalScrollBar().maximum())
+                    self._log_state[key]["loaded"] = len(rows)
+                    return
+
         if not os.path.exists(path):
             editor.setPlainText(tr("log_missing_file", "日志文件不存在"))
             return
@@ -299,7 +317,7 @@ class LogInterface(QWidget):
     def _editor_for_key(self, key: str) -> Optional[QTextEdit]:
         if key == "system":
             return self.system_log_edit
-        if key == "ocr":
+        if key == "recognition":
             return self.ocr_log_edit
         if key == "debug":
             return self.debug_log_edit
@@ -323,7 +341,7 @@ class LogInterface(QWidget):
         if editor == self.system_log_edit:
             return "system"
         if editor == self.ocr_log_edit:
-            return "ocr"
+            return "recognition"
         if editor == self.debug_log_edit:
             return "debug"
         return None
@@ -362,7 +380,7 @@ class LogInterface(QWidget):
 
     def on_tab_changed(self, key: str):
         self.system_log_edit.setVisible(key == "system")
-        self.ocr_log_edit.setVisible(key == "ocr")
+        self.ocr_log_edit.setVisible(key == "recognition")
         self.debug_log_edit.setVisible(key == "debug")
         self._load_initial_log(key)
 
@@ -414,11 +432,11 @@ class LogInterface(QWidget):
     def retranslate_ui(self):
         self.title_label.setText(tr("log_title", "运行日志"))
         self.segment.setItemText("system", tr("log_system", "系统日志"))
-        self.segment.setItemText("ocr", tr("log_ocr", "OCR 日志"))
+        self.segment.setItemText("recognition", tr("log_ocr", "识别日志"))
         self.segment.setItemText("debug", tr("log_debug", "调试日志"))
         self.auto_refresh_label.setText(tr("log_auto_refresh", "自动刷新:"))
         self.refresh_interval_label.setText(tr("log_refresh_interval_1s", "刷新间隔: 1s"))
-        self.detailed_ocr_label.setText(tr("log_detailed_ocr", "详细OCR日志:"))
+        self.detailed_ocr_label.setText(tr("log_detailed_ocr", "详细识别日志:"))
         self.manual_refresh_btn.setText(tr("log_manual_refresh", "手动刷新"))
         self.clear_btn.setText(tr("log_clear", "清空日志"))
         self.save_btn.setText(tr("log_save", "保存日志"))

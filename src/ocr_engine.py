@@ -11,10 +11,9 @@ import logging
 import numpy as np
 import numpy.typing as npt
 import cv2
-from typing import ClassVar, Optional, List, Tuple, Dict, Any
+from typing import Callable, ClassVar, Optional, List, Tuple, Dict, Any
 from pathlib import Path
-import torch
-from ultralytics import YOLO
+import onnxruntime as ort
 import re
 import traceback
 from PySide6.QtCore import QThread, Signal
@@ -216,12 +215,12 @@ class OCRWorker(QThread):
     """
     OCR Worker implementing advanced predictive tracking algorithm
     
-    This worker runs an Ultralytics YOLO model on CPU and provides highly accurate coordinate
+    This worker runs an ONNXRuntime model on CPU and provides highly accurate coordinate
     tracking with state management and dynamic template adaptation.
     """
     
     # Static class names for global function access
-    _class_names_static: ClassVar[List[str]] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ',', ':', '-', '+']
+    _class_names_static: ClassVar[List[str]] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ',', ':', '-']
 
     # Qt Signals
     coordinates_detected = Signal(int, int, int)  # x, y, z coordinates
@@ -229,6 +228,8 @@ class OCRWorker(QThread):
     error_occurred = Signal(str)  # Error message
     ocr_output_updated = Signal(str)  # Raw OCR output text
     capture_area_updated = Signal(dict)  # Runtime capture area updates
+    captured_frame_ready = Signal(object)  # Shared full frame plus OCR crop
+    frame_recognition_completed = Signal(object)  # Per-frame OCR result, coords may be None
     
     def __init__(self, config_dict=None, capture_callback=None):
         """
@@ -241,14 +242,20 @@ class OCRWorker(QThread):
         super().__init__()
         self.config_dict = config_dict or {}
         self.capture_callback = capture_callback
+        self.frame_capture_callback = None
         self.logger = logging.getLogger(__name__)
         
         # Worker control
         self.is_running = False
         self.should_stop = False
         
-        # YOLOv8 model
+        # ONNXRuntime model
         self.model = None
+        self.model_input_name = ""
+        self.model_input_shape: Tuple[int, int] = (64, 640)
+        self._last_onnx_scale: Tuple[float, float] = (1.0, 1.0)
+        self._last_onnx_pad: Tuple[float, float] = (0.0, 0.0)
+        self._last_onnx_source_shape: Tuple[int, int] = (0, 0)
         
         # Class names mapping
         self.class_names = self._load_class_names()
@@ -260,6 +267,7 @@ class OCRWorker(QThread):
         self._last_inference_debug: Dict[str, Any] = {}
         self._last_candidate_clusters: List[Dict[str, Any]] = []
         self._last_selection_details: List[Dict[str, Any]] = []
+        self._last_capture_frame_result = None
 
         self._capture_error_count = 0
         
@@ -274,12 +282,17 @@ class OCRWorker(QThread):
         self.ocr_interval = 1000  # milliseconds
         self.target_window_name = ""  # Target window name for screenshot
         self.detailed_ocr_logging = bool(config.get('detailed_ocr_logging', False))
+        self._detailed_log_sink: Optional[Callable[[str], None]] = None
         
         self.logger.info("OCR工作线程初始化完成")
 
     def set_detailed_ocr_logging(self, enabled: bool):
         """Enable/disable detailed OCR pipeline logs at runtime."""
         self.detailed_ocr_logging = bool(enabled)
+
+    def set_detailed_log_sink(self, sink: Optional[Callable[[str], None]]) -> None:
+        """Route verbose OCR diagnostics away from UI signals when a sink is available."""
+        self._detailed_log_sink = sink
 
     def _is_detailed_debug_enabled(self) -> bool:
         legacy_verbose = bool(
@@ -326,7 +339,7 @@ class OCRWorker(QThread):
             if roi:
                 roi_str = f"({roi.get('x', '-')},{roi.get('y', '-')},{roi.get('width', '-')},{roi.get('height', '-')})"
 
-            self.ocr_output_updated.emit(
+            self._emit_detailed_log_line(
                 f"[OCR-RAW] state={state} roi={roi_str} model_total={infer_dbg.get('total_boxes', 0)} kept={infer_dbg.get('kept_boxes', 0)} filtered={infer_dbg.get('filtered_boxes', 0)}"
             )
 
@@ -337,7 +350,7 @@ class OCRWorker(QThread):
                     y1 = float(e.get('y1', 0.0) or 0.0)
                     x2 = float(e.get('x2', 0.0) or 0.0)
                     y2 = float(e.get('y2', 0.0) or 0.0)
-                    self.ocr_output_updated.emit(
+                    self._emit_detailed_log_line(
                         "[OCR-RAW-DET] "
                         f"#{idx} char='{e.get('char', '?')}' "
                         f"bbox=({x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}) "
@@ -349,7 +362,7 @@ class OCRWorker(QThread):
             clusters = self._last_candidate_clusters if isinstance(self._last_candidate_clusters, list) else []
             if clusters:
                 cw = [f"'{c.get('word', '')}'({len(c.get('detections', []))})" for c in clusters]
-                self.ocr_output_updated.emit(f"[OCR-CLUSTERS] count={len(clusters)} words={' '.join(cw)}")
+                self._emit_detailed_log_line(f"[OCR-CLUSTERS] count={len(clusters)} words={' '.join(cw)}")
 
             sel = self._last_selection_details if isinstance(self._last_selection_details, list) else []
             if sel:
@@ -359,11 +372,11 @@ class OCRWorker(QThread):
                     reason = d.get('reason', '')
                     matched = '✓' if d.get('matched') else '✗'
                     sw.append(f"'{cleaned}':{reason}{matched}")
-                self.ocr_output_updated.emit(f"[OCR-SELECT] {' | '.join(sw)}")
+                self._emit_detailed_log_line(f"[OCR-SELECT] {' | '.join(sw)}")
 
             groups = b_meta.get('groups') if isinstance(b_meta, dict) else None
             trimmed = b_meta.get('trimmed_groups') if isinstance(b_meta, dict) else None
-            self.ocr_output_updated.emit(
+            self._emit_detailed_log_line(
                 "[OCR-PATH-B] "
                 f"success={b_success} coords={b_coord} method={b_meta.get('method', 'unknown')} "
                 f"avg_conf={float(b_meta.get('avg_confidence', 0.0)):.3f} "
@@ -371,11 +384,21 @@ class OCRWorker(QThread):
             )
 
             suffix = f" note={note}" if note else ""
-            self.ocr_output_updated.emit(
+            self._emit_detailed_log_line(
                 f"[OCR-FINAL] parser=path_b success={final_success} coords={final_coords}{suffix}"
             )
         except Exception as e:
             self.logger.debug(f"[OCR-DETAILED-LOG] emit failed: {e}")
+
+    def _emit_detailed_log_line(self, line: str) -> None:
+        sink = self._detailed_log_sink
+        if sink is not None:
+            try:
+                sink(line)
+                return
+            except Exception:
+                pass
+        self.ocr_output_updated.emit(line)
     
     def set_capture_callback(self, capture_callback):
         """Set screen capture callback function
@@ -386,6 +409,10 @@ class OCRWorker(QThread):
                              Should return: numpy array of captured image or None if failed
         """
         self.capture_callback = capture_callback
+
+    def set_frame_capture_callback(self, capture_callback):
+        """Set callback that returns the shared full frame plus OCR crop."""
+        self.frame_capture_callback = capture_callback
     
     def _remove_timestamp_from_coord_string(self, coord_str: str) -> str:
         """
@@ -857,19 +884,19 @@ class OCRWorker(QThread):
         except Exception as e:
             self.logger.error(f"加载类别名称失败: {e}")
             # Fallback to hardcoded mapping
-            class_names = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ',', ':', '-', '+']
+            class_names = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ',', ':', '-']
             OCRWorker._class_names_static = class_names
             return class_names
     
     def load_model(self, model_path=None) -> bool:
-        """Load YOLOv8 coordinate recognition model."""
+        """Load FP32 ONNX coordinate recognition model."""
         try:
             if model_path is None:
-                model_path = self.config_dict.get('model_path', paths.model_file("coord_ocr.pt"))
+                model_path = self.config_dict.get('model_path', paths.model_file("coord_ocr.onnx"))
 
             model_path = Path(model_path)
-            if str(model_path).replace("\\", "/") == "models/coord_ocr.pt":
-                model_path = paths.model_file("coord_ocr.pt")
+            if str(model_path).replace("\\", "/") == "models/coord_ocr.onnx":
+                model_path = paths.model_file("coord_ocr.onnx")
             
             if not model_path.exists():
                 error_msg = f"模型文件不存在: {model_path}"
@@ -877,27 +904,16 @@ class OCRWorker(QThread):
                 self.error_occurred.emit(error_msg)
                 return False
 
-            original_torch_load = torch.load
+            self.model = ort.InferenceSession(str(model_path), providers=['CPUExecutionProvider'])
+            inputs = self.model.get_inputs()
+            if not inputs:
+                raise ValueError("ONNX model has no inputs")
+            self.model_input_name = inputs[0].name
+            shape = inputs[0].shape
+            if len(shape) >= 4 and isinstance(shape[2], int) and isinstance(shape[3], int):
+                self.model_input_shape = (int(shape[2]), int(shape[3]))
 
-            def _compat_torch_load(*args, **kwargs):
-                kwargs['weights_only'] = False
-                return original_torch_load(*args, **kwargs)
-
-            try:
-                import ultralytics.utils  # noqa: F401
-                from ultralytics.utils import GIT as _UL_GIT  # noqa: F401
-            except Exception as _e:
-                self.logger.warning(f"Ultralytics utils preload failed (non-fatal): {_e}")
-
-            torch.load = _compat_torch_load
-            try:
-                self.model = YOLO(str(model_path))
-            finally:
-                torch.load = original_torch_load
-
-            self.model.to('cpu')
-
-            self.logger.info(f"YOLOv8模型加载成功: {model_path}")
+            self.logger.info(f"ONNX OCR模型加载成功: {model_path}")
             return True
             
         except Exception as e:
@@ -993,7 +1009,7 @@ class OCRWorker(QThread):
         
         # Load model and settings
         if not self.load_model():
-            self.ocr_output_updated.emit("❌ 模型加载失败，请检查models/coord_ocr.pt文件")
+            self.ocr_output_updated.emit("❌ 模型加载失败，请检查models/coord_ocr.onnx文件")
             self.error_occurred.emit("OCR模型加载失败")
             self.is_running = False
             return
@@ -1023,7 +1039,7 @@ class OCRWorker(QThread):
                     continue
                 
                 # 模型推理
-                detections = self._run_yolo_inference(screenshot)
+                detections = self._run_onnx_inference(screenshot)
                 
                 # 应用跟踪算法
                 success, final_coords = self._apply_tracking_algorithm(detections)
@@ -1045,7 +1061,7 @@ class OCRWorker(QThread):
     def _capture_ocr_region(self) -> Optional[npt.NDArray[np.uint8]]:
         """Capture the OCR region from screen"""
         try:
-            if self.capture_callback is None:
+            if self.capture_callback is None and self.frame_capture_callback is None:
                 self.logger.error("No capture callback provided")
                 return None
 
@@ -1063,15 +1079,28 @@ class OCRWorker(QThread):
             else:
                 mode = 'BitBlt'
             
-            # Use callback function to capture screen region
-            screenshot = self.capture_callback(
+            args = (
                 int(self.capture_area.get('x', 0) or 0),
                 int(self.capture_area.get('y', 0) or 0),
                 int(self.capture_area.get('width', 0) or 0),
                 int(self.capture_area.get('height', 0) or 0),
                 mode,
-                self.target_window_name
+                self.target_window_name,
             )
+
+            if self.frame_capture_callback is not None:
+                result = self.frame_capture_callback(*args)
+                self._last_capture_frame_result = result
+                if result is None:
+                    return None
+                try:
+                    self.captured_frame_ready.emit(result)
+                except Exception:
+                    pass
+                return result.crop
+
+            # Use callback function to capture screen region
+            screenshot = self.capture_callback(*args)
             
             return screenshot
             
@@ -1083,10 +1112,10 @@ class OCRWorker(QThread):
             
             return None
 
-    def _run_yolo_inference(self, image: npt.NDArray[np.uint8]) -> List[Dict[str, Any]]:
+    def _run_onnx_inference(self, image: npt.NDArray[np.uint8]) -> List[Dict[str, Any]]:
         try:
             if self.model is None:
-                self.logger.error("YOLO model is not loaded")
+                self.logger.error("ONNX OCR model is not loaded")
                 self._last_inference_debug = {
                     'roi': dict(self.capture_area) if isinstance(self.capture_area, dict) else None,
                     'total_boxes': 0,
@@ -1096,69 +1125,16 @@ class OCRWorker(QThread):
                 }
                 return []
 
-            results = self.model(image, verbose=False)
-            detections: List[Dict[str, Any]] = []
-            collect_debug = self._is_detailed_debug_enabled()
-            debug_entries: List[Dict[str, Any]] = []
-            total_boxes = 0
-            kept_boxes = 0
-            for result in results:
-                boxes = result.boxes
-                if boxes is None:
-                    continue
-                for i in range(len(boxes)):
-                    total_boxes += 1
-                    confidence = float(boxes.conf[i])
-                    class_id = int(boxes.cls[i])
-                    char = OCRWorker._class_id_to_char_static(class_id) or '?'
-                    threshold = self._get_confidence_threshold_for_class(class_id)
-                    kept = confidence >= threshold
-                    x1 = float(boxes.xyxy[i][0].item())
-                    y1 = float(boxes.xyxy[i][1].item())
-                    x2 = float(boxes.xyxy[i][2].item())
-                    y2 = float(boxes.xyxy[i][3].item())
-                    if collect_debug and len(debug_entries) < 120:
-                        debug_entries.append({
-                            'char': char,
-                            'class_id': class_id,
-                            'confidence': confidence,
-                            'threshold': threshold,
-                            'x': x1,
-                            'x1': x1,
-                            'y1': y1,
-                            'x2': x2,
-                            'y2': y2,
-                            'kept': kept,
-                        })
-                    if kept:
-                        kept_boxes += 1
-                        detections.append({
-                            'class': class_id,
-                            'bbox': boxes.xyxy[i].cpu().numpy(),
-                            'confidence': confidence,
-                        })
-            debug = {
-                'total_boxes': total_boxes,
-                'kept_boxes': kept_boxes,
-                'filtered_boxes': max(0, total_boxes - kept_boxes),
-                'entries': debug_entries,
-            }
+            input_tensor = self._prepare_onnx_input(image)
+            outputs = self.model.run(None, {self.model_input_name: input_tensor})
+            detections, debug = self._parse_onnx_output(outputs[0])
             self._last_inference_debug = {
                 **debug,
                 'roi': dict(self.capture_area) if isinstance(self.capture_area, dict) else None,
             }
             return detections
         except Exception as e:
-            try:
-                import sys as _sys
-                import ultralytics as _ul
-                ul_ver = getattr(_ul, '__version__', 'unknown')
-                ul_file = getattr(_ul, '__file__', 'unknown')
-                self.logger.error(
-                    f"YOLO推理失败: {e} | ultralytics={ul_ver} ({ul_file}) | python={_sys.executable}"
-                )
-            except Exception:
-                self.logger.error(f"YOLO推理失败: {e}")
+            self.logger.error(f"ONNX OCR推理失败: {e}")
             self._last_inference_debug = {
                 'roi': dict(self.capture_area) if isinstance(self.capture_area, dict) else None,
                 'total_boxes': 0,
@@ -1167,6 +1143,157 @@ class OCRWorker(QThread):
                 'entries': [],
             }
             return []
+
+    def _run_yolo_inference(self, image: npt.NDArray[np.uint8]) -> List[Dict[str, Any]]:
+        """Backward-compatible alias for the previous method name."""
+        return self._run_onnx_inference(image)
+
+    def _prepare_onnx_input(self, image: npt.NDArray[np.uint8]) -> npt.NDArray[np.float32]:
+        target_h, target_w = self.model_input_shape
+        source_h, source_w = image.shape[:2]
+        self._last_onnx_source_shape = (int(source_h), int(source_w))
+
+        scale = min(float(target_w) / float(source_w), float(target_h) / float(source_h))
+        resized_w = int(round(source_w * scale))
+        resized_h = int(round(source_h * scale))
+        resized = cv2.resize(image, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
+
+        canvas = np.full((target_h, target_w, 3), 114, dtype=np.uint8)
+        pad_x = max(0.0, (float(target_w) - float(resized_w)) / 2.0)
+        pad_y = max(0.0, (float(target_h) - float(resized_h)) / 2.0)
+        left = int(round(pad_x - 0.1))
+        top = int(round(pad_y - 0.1))
+        canvas[top:top + resized_h, left:left + resized_w] = resized
+
+        self._last_onnx_scale = (1.0 / scale, 1.0 / scale)
+        self._last_onnx_pad = (float(pad_x), float(pad_y))
+
+        image_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        tensor = np.ascontiguousarray(image_rgb.transpose(2, 0, 1), dtype=np.float32) / 255.0
+        return np.expand_dims(tensor, axis=0)
+
+    def _parse_onnx_output(self, output: npt.NDArray[np.float32]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        arr = np.asarray(output)
+        if arr.ndim == 3:
+            arr = arr[0]
+
+        detections: List[Dict[str, Any]] = []
+        debug_entries: List[Dict[str, Any]] = []
+        total_boxes = 0
+        kept_boxes = 0
+        collect_debug = self._is_detailed_debug_enabled()
+
+        def _build_candidate(class_id: int, confidence: float, x1: float, y1: float, x2: float, y2: float) -> Dict[str, Any]:
+            threshold = self._get_confidence_threshold_for_class(class_id)
+            scale_x, scale_y = self._last_onnx_scale
+            pad_x, pad_y = self._last_onnx_pad
+            x1 = (float(x1) - pad_x) * scale_x
+            y1 = (float(y1) - pad_y) * scale_y
+            x2 = (float(x2) - pad_x) * scale_x
+            y2 = (float(y2) - pad_y) * scale_y
+            source_h, source_w = self._last_onnx_source_shape
+            if source_h > 0 and source_w > 0:
+                x1_clamped = max(0.0, min(float(source_w), x1))
+                x2_clamped = max(0.0, min(float(source_w), x2))
+                y1_clamped = max(0.0, min(float(source_h), y1))
+                y2_clamped = max(0.0, min(float(source_h), y2))
+            else:
+                x1_clamped, y1_clamped, x2_clamped, y2_clamped = x1, y1, x2, y2
+            valid_box = (x2_clamped - x1_clamped) >= 1.0 and (y2_clamped - y1_clamped) >= 1.0
+            kept = confidence >= threshold and valid_box
+            return {
+                'class_id': class_id,
+                'confidence': confidence,
+                'threshold': threshold,
+                'x1': x1_clamped,
+                'y1': y1_clamped,
+                'x2': x2_clamped,
+                'y2': y2_clamped,
+                'kept': kept,
+            }
+
+        def _append_candidate(candidate: Dict[str, Any]) -> None:
+            nonlocal kept_boxes
+            class_id = int(candidate['class_id'])
+            if collect_debug and len(debug_entries) < 120:
+                debug_entries.append({
+                    'char': OCRWorker._class_id_to_char_static(class_id) or '?',
+                    'class_id': class_id,
+                    'confidence': float(candidate['confidence']),
+                    'threshold': float(candidate['threshold']),
+                    'x': float(candidate['x1']),
+                    'x1': float(candidate['x1']),
+                    'y1': float(candidate['y1']),
+                    'x2': float(candidate['x2']),
+                    'y2': float(candidate['y2']),
+                    'kept': bool(candidate['kept']),
+                })
+
+            if candidate['kept']:
+                kept_boxes += 1
+                detections.append({
+                    'class': class_id,
+                    'bbox': np.array([candidate['x1'], candidate['y1'], candidate['x2'], candidate['y2']], dtype=np.float32),
+                    'confidence': float(candidate['confidence']),
+                })
+
+        if arr.ndim == 2 and arr.shape[1] == 6:
+            for row in arr:
+                total_boxes += 1
+                x1, y1, x2, y2, confidence, class_id_float = row[:6]
+                candidate = _build_candidate(int(round(float(class_id_float))), float(confidence), float(x1), float(y1), float(x2), float(y2))
+                _append_candidate(candidate)
+        elif arr.ndim == 2 and arr.shape[0] >= 5:
+            class_count = len(self.class_names)
+            box_count = arr.shape[1]
+            candidates: List[Dict[str, Any]] = []
+            for i in range(box_count):
+                total_boxes += 1
+                cx, cy, w, h = [float(v) for v in arr[:4, i]]
+                scores = arr[4:4 + class_count, i]
+                class_id = int(np.argmax(scores))
+                confidence = float(scores[class_id])
+                x1 = cx - w / 2.0
+                y1 = cy - h / 2.0
+                x2 = cx + w / 2.0
+                y2 = cy + h / 2.0
+                candidate = _build_candidate(class_id, confidence, x1, y1, x2, y2)
+                if candidate['kept']:
+                    candidates.append(candidate)
+
+            if candidates:
+                boxes = [
+                    [
+                        float(candidate['x1']),
+                        float(candidate['y1']),
+                        float(candidate['x2']) - float(candidate['x1']),
+                        float(candidate['y2']) - float(candidate['y1']),
+                    ]
+                    for candidate in candidates
+                ]
+                scores = [float(candidate['confidence']) for candidate in candidates]
+                indexes = cv2.dnn.NMSBoxes(boxes, scores, float(self.confidence_threshold), 0.7)
+                kept_indexes = set(np.array(indexes).reshape(-1).tolist()) if len(indexes) else set()
+                for index, candidate in enumerate(candidates):
+                    if index not in kept_indexes:
+                        candidate = {**candidate, 'kept': False}
+                    _append_candidate(candidate)
+        else:
+            flat = arr.reshape(-1)
+            if flat.size % 6 == 0:
+                rows = flat.reshape(-1, 6)
+                for row in rows:
+                    total_boxes += 1
+                    x1, y1, x2, y2, confidence, class_id_float = row[:6]
+                    candidate = _build_candidate(int(round(float(class_id_float))), float(confidence), float(x1), float(y1), float(x2), float(y2))
+                    _append_candidate(candidate)
+
+        return detections, {
+            'total_boxes': total_boxes,
+            'kept_boxes': kept_boxes,
+            'filtered_boxes': max(0, total_boxes - kept_boxes),
+            'entries': debug_entries,
+        }
     
     def _apply_tracking_algorithm(self, raw_detections: List[Dict[str, Any]]) -> Tuple[bool, Optional[Tuple[int, int, int]]]:
         """Parse one OCR frame without reusing previous recognition results."""
@@ -1193,6 +1320,10 @@ class OCRWorker(QThread):
                 note="current_frame_success",
             )
             self.coordinates_detected.emit(*new_coords)
+            self.frame_recognition_completed.emit({
+                "ocr_coord": new_coords,
+                "frame_result": self._last_capture_frame_result,
+            })
             final_output = f"✓ 坐标: ({new_coords[0]}, {new_coords[1]}, {new_coords[2]})"
             self.ocr_output_updated.emit(final_output)
             return True, new_coords
@@ -1220,6 +1351,10 @@ class OCRWorker(QThread):
             else:
                 debug_info += f" -> 无匹配 ✗"
             self.ocr_output_updated.emit(debug_info)
+        self.frame_recognition_completed.emit({
+            "ocr_coord": None,
+            "frame_result": self._last_capture_frame_result,
+        })
         return False, None
 
     def _set_recognition_state(self, state: str) -> None:

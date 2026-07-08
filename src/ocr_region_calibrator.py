@@ -11,6 +11,17 @@ from PySide6.QtCore import Qt, QRect, QRectF, QPoint, QSize, Signal
 from PySide6.QtGui import QPainter, QColor, QScreen, QPen, QBrush, QPainterPath, QFont, QCursor
 
 
+def constrained_selection_rect(start: QPoint, end: QPoint, *, force_square: bool = False) -> QRect:
+    if not force_square:
+        return QRect(start, end).normalized()
+    dx = end.x() - start.x()
+    dy = end.y() - start.y()
+    side = max(abs(dx), abs(dy))
+    left = start.x() if dx >= 0 else start.x() - side
+    top = start.y() if dy >= 0 else start.y() - side
+    return QRect(left, top, side, side)
+
+
 # 定义八个控制点的位置
 class HandleOptions:
     TOP_LEFT = 1
@@ -31,10 +42,11 @@ class OCRRegionCalibrator(QWidget):
     
     # 信号：当用户确认选择区域时发射 (x, y, width, height)
     region_selected = Signal(int, int, int, int)
+    region_shape_selected = Signal(int, int, int, int, str)
     # 信号：当用户取消选择时发射
     selection_cancelled = Signal()
     
-    def __init__(self, app=None):
+    def __init__(self, app=None, region_label="OCR区域", selection_shape="rect", shift_forces_circle=False):
         super().__init__()
         if app is None:
             self.app = QApplication.instance()
@@ -45,6 +57,10 @@ class OCRRegionCalibrator(QWidget):
             
         self.screen = self.app.primaryScreen()
         self.desktop_pixmap = None
+        self.region_label = region_label
+        self.selection_shape = selection_shape if selection_shape in ("rect", "circle", "ellipse") else "rect"
+        self.shift_forces_circle = bool(shift_forces_circle)
+        self._last_shape_forced_by_shift = False
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint | 
@@ -103,7 +119,10 @@ class OCRRegionCalibrator(QWidget):
         overlay_path.addRect(QRectF(self.rect()))
         if not self.selection_rect.isNull():
             selection_path = QPainterPath()
-            selection_path.addRect(QRectF(self.selection_rect))
+            if self._current_paint_shape() in ("circle", "ellipse"):
+                selection_path.addEllipse(QRectF(self.selection_rect))
+            else:
+                selection_path.addRect(QRectF(self.selection_rect))
             overlay_path -= selection_path
         painter.drawPixmap(self.rect(), self.desktop_pixmap)
         painter.fillPath(overlay_path, QColor(0, 0, 0, 120))
@@ -111,7 +130,10 @@ class OCRRegionCalibrator(QWidget):
             pen = QPen(QColor("#0078D7"), 2, Qt.PenStyle.DashLine)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(self.selection_rect)
+            if self._current_paint_shape() in ("circle", "ellipse"):
+                painter.drawEllipse(self.selection_rect)
+            else:
+                painter.drawRect(self.selection_rect)
             handle_rects = list(self.get_handle_rects().values())
             if handle_rects:
                 painter.setPen(Qt.PenStyle.NoPen)
@@ -131,7 +153,7 @@ class OCRRegionCalibrator(QWidget):
         physical_height = int(rect.height() * device_pixel_ratio)
         
         # 创建显示文本（显示物理坐标，这是实际截图坐标）
-        info_text = f"OCR区域: {physical_x}, {physical_y} - {physical_width}x{physical_height}"
+        info_text = f"{self.region_label}: {physical_x}, {physical_y} - {physical_width}x{physical_height}"
         if device_pixel_ratio != 1.0:
             info_text += f" (缩放: {device_pixel_ratio})"
         
@@ -218,8 +240,19 @@ class OCRRegionCalibrator(QWidget):
 
     def mouseMoveEvent(self, event):
         self.update_cursor_shape(event.pos())
+        modifiers = event.modifiers()
+        force_square = self.selection_shape == "circle" or (
+            self.shift_forces_circle and bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        )
+        self._last_shape_forced_by_shift = bool(
+            self.shift_forces_circle and bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        )
         if self.is_selecting:
-            self.selection_rect = QRect(self.selection_start_pos, event.pos()).normalized()
+            self.selection_rect = constrained_selection_rect(
+                self.selection_start_pos,
+                event.pos(),
+                force_square=force_square,
+            )
         elif self.active_handle:
             self.resize_selection(event.pos())
             self.update_toolbar_position()
@@ -266,17 +299,24 @@ class OCRRegionCalibrator(QWidget):
         physical_width = int(rect.width() * device_pixel_ratio)
         physical_height = int(rect.height() * device_pixel_ratio)
         
-        print(f"OCR区域已选择 (逻辑坐标): x={rect.x()}, y={rect.y()}, width={rect.width()}, height={rect.height()}")
+        print(f"{self.region_label}已选择 (逻辑坐标): x={rect.x()}, y={rect.y()}, width={rect.width()}, height={rect.height()}")
         print(f"DPI缩放比例: {device_pixel_ratio}")
-        print(f"OCR区域转换 (物理坐标): x={physical_x}, y={physical_y}, width={physical_width}, height={physical_height}")
+        print(f"{self.region_label}转换 (物理坐标): x={physical_x}, y={physical_y}, width={physical_width}, height={physical_height}")
         
         # 发射物理坐标信号
         self.region_selected.emit(physical_x, physical_y, physical_width, physical_height)
+        self.region_shape_selected.emit(
+            physical_x,
+            physical_y,
+            physical_width,
+            physical_height,
+            self._shape_for_modifiers(Qt.KeyboardModifier.ShiftModifier if self._last_shape_forced_by_shift else Qt.KeyboardModifier.NoModifier),
+        )
         self.close()
     
     def cancel_selection(self):
         """取消选择"""
-        print("OCR区域选择已取消")
+        print(f"{self.region_label}选择已取消")
         self.selection_cancelled.emit()
         self.close()
         
@@ -342,6 +382,14 @@ class OCRRegionCalibrator(QWidget):
             toolbar_y = self.selection_rect.bottom() - 40
         self.cancel_button.move(toolbar_x, toolbar_y)
         self.confirm_button.move(toolbar_x + 35, toolbar_y)
+
+    def _shape_for_modifiers(self, modifiers):
+        if self.shift_forces_circle and bool(modifiers & Qt.KeyboardModifier.ShiftModifier):
+            return "circle"
+        return self.selection_shape
+
+    def _current_paint_shape(self):
+        return "circle" if self._last_shape_forced_by_shift else self.selection_shape
 
 
 if __name__ == '__main__':

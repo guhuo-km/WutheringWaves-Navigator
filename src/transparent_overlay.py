@@ -6,9 +6,25 @@
 """
 
 import math
+from PySide6.QtCore import QByteArray
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QWidget
-from PySide6.QtCore import Qt, Signal, QTimer, QObject, QRectF
-from PySide6.QtGui import QPainter, QPen, QBrush, QColor
+from PySide6.QtCore import Qt, Signal, QObject, QRectF
+from PySide6.QtGui import QPainter, QColor
+
+
+SVG_CIRCLE_CX = 50.0
+SVG_CIRCLE_CY = 64.0
+SVG_CIRCLE_R = 16.0
+SVG_VIEWBOX_SIZE = 128.0
+PLAYER_MARKER_ARROW_PATH = '<path d="M 63.44,50.56 A 19,19 0 0,1 63.44,77.44 L 83,64 Z" fill="{fill}">\n</path>'
+PLAYER_MARKER_SVG_TEMPLATE = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="100" height="100">
+                <!-- Solid Circle (Player Center) -->
+                <circle cx="50" cy="64" r="16" fill="{fill}">
+</circle>
+                <!-- Directional Arrow, path is dynamically injected by Python -->
+                {arrow_path}
+            </svg>"""
 
 
 class TransparentOverlay(QWidget):
@@ -29,6 +45,7 @@ class TransparentOverlay(QWidget):
         self.circle_color = QColor(255, 0, 0)  # 默认红色
         self.z_color_mapping = False  # Z轴颜色映射开关
         self.current_z_value = 0  # 当前Z值
+        self.heading_degrees = None
         
         # 当前覆盖层没有连续动画；半径/Z值变化时由对应 setter 主动 update。
         self.animation_timer = None
@@ -48,6 +65,24 @@ class TransparentOverlay(QWidget):
         self.current_z_value = z_value
         if self.z_color_mapping:
             self.update_circle_color()
+
+    def set_heading_degrees(self, heading_degrees):
+        """设置人物朝向角度：北=0，顺时针增加。"""
+        try:
+            angle = float(heading_degrees)
+        except (TypeError, ValueError):
+            self.clear_heading()
+            return
+        if not math.isfinite(angle):
+            self.clear_heading()
+            return
+        self.heading_degrees = angle % 360.0
+        self.update()
+
+    def clear_heading(self):
+        """清除人物朝向指示。"""
+        self.heading_degrees = None
+        self.update()
     
     def update_circle_color(self):
         """根据Z值更新圆点颜色"""
@@ -85,20 +120,34 @@ class TransparentOverlay(QWidget):
         # 获取窗口中心
         center_x = self.width() // 2
         center_y = self.height() // 2
-        
-        # 绘制中心圆点
+
         if self.circle_radius > 0:
-            # 只绘制主圆点，边缘硬度100%，无阴影效果
-            painter.setPen(QPen(self.circle_color, 1))
-            painter.setBrush(QBrush(self.circle_color))
-            radius = float(self.circle_radius)
-            rect = QRectF(
-                float(center_x) - radius,
-                float(center_y) - radius,
-                radius * 2.0,
-                radius * 2.0,
-            )
-            painter.drawEllipse(rect)
+            self._draw_player_marker(painter, float(center_x), float(center_y))
+
+    def _draw_player_marker(self, painter: QPainter, center_x: float, center_y: float):
+        """Draw the unified SVG marker, scaled by the original dot radius."""
+        radius = float(self.circle_radius)
+        scale = radius / SVG_CIRCLE_R
+        svg_size = SVG_VIEWBOX_SIZE * scale
+        east_reference_degrees = 90.0
+        rotation_degrees = 0.0
+        if self.heading_degrees is not None:
+            rotation_degrees = float(self.heading_degrees) - east_reference_degrees
+        fill = QColor(self.circle_color).name()
+        arrow_path = PLAYER_MARKER_ARROW_PATH if self.heading_degrees is not None else ""
+        svg_text = PLAYER_MARKER_SVG_TEMPLATE.replace("{arrow_path}", arrow_path).replace("{fill}", fill)
+        renderer = QSvgRenderer(QByteArray(svg_text.encode("utf-8")))
+        if not renderer.isValid():
+            return
+
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.save()
+        painter.translate(center_x, center_y)
+        painter.rotate(rotation_degrees)
+        target = QRectF(-SVG_CIRCLE_CX * scale, -SVG_CIRCLE_CY * scale, svg_size, svg_size)
+        renderer.render(painter, target)
+        painter.restore()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
     
     def resizeEvent(self, event):
         """窗口大小改变事件"""
@@ -128,11 +177,6 @@ class OverlayManager(QObject):
         if self.web_view:
             self.web_view.installEventFilter(self)
             
-        # 创建定时器用于实时更新位置
-        self.position_timer = QTimer(self)
-        self.position_timer.timeout.connect(self.update_overlay_geometry)
-        self.position_timer.start(50)  # 每50ms更新一次位置
-    
     def update_overlay_geometry(self):
         """更新覆盖层的几何位置"""
         if self._resource_probe:
@@ -181,6 +225,16 @@ class OverlayManager(QObject):
         """设置Z值"""
         if self.overlay:
             self.overlay.set_z_value(z_value)
+
+    def set_heading_degrees(self, heading_degrees):
+        """设置人物朝向角度。"""
+        if self.overlay:
+            self.overlay.set_heading_degrees(heading_degrees)
+
+    def clear_heading(self):
+        """清除人物朝向指示。"""
+        if self.overlay:
+            self.overlay.clear_heading()
     
     def show_overlay(self):
         """显示覆盖层"""
@@ -200,11 +254,6 @@ class OverlayManager(QObject):
             self.overlay.animation_timer.stop()
             self.overlay.animation_timer = None
 
-        # 停止定时器
-        if hasattr(self, 'position_timer') and self.position_timer:
-            self.position_timer.stop()
-            self.position_timer = None
-            
         # 清理覆盖层
         if self.overlay:
             self.overlay.close()

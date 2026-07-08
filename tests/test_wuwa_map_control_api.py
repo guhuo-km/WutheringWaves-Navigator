@@ -17,12 +17,72 @@ def read_lite_script() -> str:
 def test_userscript_exposes_map_control_api():
     text = read_script()
 
+    assert "globalScope.__WuwaMapControl" in text
     assert "window.__WuwaMapControl" in text
     assert "function installMapControlApi()" in text
     assert "function handleMapControlCommand(command)" in text
     assert "function jumpToGameViaControl(x, y, options = {})" in text
     assert "function jumpToLatLngViaControl(lat, lng, options = {})" in text
     assert "function zoomViaControl(delta, options = {})" in text
+
+
+def test_userscript_exposes_map_context_api():
+    text = read_script()
+
+    assert "getMapContext" in text
+    assert "areaId" in text
+    assert "coordTransform" in text
+    assert "tileProjection" in text
+    assert "mapUnitsPerTileX" in text
+
+
+def test_userscript_exposes_incremental_tile_metadata_api():
+    text = read_script()
+
+    assert "getTileMetadataSnapshot" in text
+    assert "standardTiles" in text
+    assert "layeredTiles" in text
+    assert "gravityTiles" in text
+    assert "tileBaseUrl" in text
+
+
+def test_userscripts_parse_current_official_layered_tile_url_shape():
+    text = read_script()
+
+    assert (
+        "cleanUrl.match(/^(.*)\\/(\\d+)\\/(\\d+)\\/(-?\\d+)\\/(-?\\d+)_(-?\\d+)\\.png$/)"
+        in text
+    )
+    assert "type: 'layered'" in text
+    assert "layerId: match[3]" in text
+    assert "zLevel: Number(match[4])" in text
+    assert "x: Number(match[5])" in text
+    assert "y: Number(match[6])" in text
+
+
+def test_userscript_dispatches_tile_metadata_event_on_page_global_scope():
+    text = read_script()
+
+    assert "globalScope.__WuwaTileMetadataUpdatedAt = updatedAt" in text
+    assert "globalScope.dispatchEvent(new CustomEvent('wuwaTileMetadataChanged'" in text
+    assert "window.dispatchEvent(new CustomEvent('wuwaTileMetadataChanged'" not in text
+
+
+def test_userscript_does_not_patch_leaflet_tile_loading_lifecycle():
+    text = read_script()
+
+    assert "installTileMetadataGetTileUrlObserver" not in text
+    assert "LL.TileLayer.prototype.getTileUrl" not in text
+    assert "LL.TileLayer.prototype.createTile" not in text
+    assert "observeTileMetadataUrl(this.getTileUrl(coords), coords)" not in text
+
+
+def test_userscript_does_not_expose_python_controlled_notification_api():
+    text = read_script()
+
+    assert "showPythonNotificationViaControl" not in text
+    assert "showNotification: showPythonNotificationViaControl" not in text
+    assert "cmd.type === 'showNotification'" not in text
 
 
 def test_lite_userscript_exposes_map_control_api():
@@ -43,6 +103,29 @@ def test_userscripts_expose_map_recapture_control():
         assert "recaptureMap: recaptureMapViaControl" in text
         assert "cmd.type === 'recaptureMap'" in text
         assert "installMapControlApi();\n    interceptMap();" in text
+
+
+def test_userscripts_validate_leaflet_pane_before_accepting_map_candidate():
+    for text in (read_script(), read_lite_script()):
+        assert "function hasUsableMapPane(map)" in text
+        assert "if (!hasUsableMapPane(map)) return false;" in text
+        assert "if (LL && LL.Map && map instanceof LL.Map) return true;" in text
+
+
+def test_userscripts_return_structured_failure_when_setview_throws():
+    for text in (read_script(), read_lite_script()):
+        assert "function setViewViaControl(map, latNum, lngNum)" in text
+        assert "map_setview_exception" in text
+        assert "STATE.mapInstance = null;" in text
+        assert "return setViewViaControl(map, latNum, lngNum);" in text
+
+
+def test_userscripts_capture_recreated_leaflet_map_instances():
+    for text in (read_script(), read_lite_script()):
+        assert "function captureMapInstance(map, source)" in text
+        assert "captureMapInstance(this, 'constructor')" in text
+        assert "if (!STATE.mapInstance) {" not in text
+        assert "window.discoveredMap && !STATE.mapInstance" not in text
 
 
 def test_tracking_commands_pause_while_point_popup_is_open():
@@ -80,6 +163,15 @@ def test_jump_to_game_uses_latlng_array_returned_by_game_to_latlng():
     assert "return jumpToLatLngViaControl(latLng[0], latLng[1], options);" in text
     assert "latLng.lat" not in text
     assert "latLng.lng" not in text
+
+
+def test_userscripts_do_not_draw_python_overlay_heading_marker():
+    for text in (read_script(), read_lite_script()):
+        assert "trackingHeadingLayer" not in text
+        assert "function updateTrackingHeadingMarker" not in text
+        assert "createTrackingHeadingHtml" not in text
+        assert "cmd.headingDegrees" not in text
+        assert "kmp-tracking-heading" not in text
 
 
 def test_smart_undo_uses_successful_mark_history():

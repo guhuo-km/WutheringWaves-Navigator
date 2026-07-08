@@ -7,6 +7,8 @@ OCR管理器 - 负责协调OCR引擎和UI界面
 
 import json
 import os
+import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 from datetime import datetime
@@ -38,13 +40,29 @@ except ImportError:
 
 from ocr_engine import OCRWorker
 from ocr_region_calibrator import OCRRegionCalibrator
-from screen_capture import capture_region_callback
+from screen_capture import capture_frame_and_region_callback, capture_region_callback
 from core import paths
+from core.map_context import CoordinateCandidate
+from core.observation_evidence_log import route_observation_bundle
+from core.settings_manager import SettingsManager
+from coordinate_continuity import ContinuityState
+from coordinate_decision import choose_coordinate
+from minimap_frame_package import write_minimap_frame_package
+from minimap_observation_worker import MinimapObservationWorker
+from minimap_observation_pipeline import run_observation_paths
+from minimap_roi import (
+    MinimapRoi,
+    detect_minimap_circle_roi,
+    should_lock_auto_roi,
+)
+from minimap_stability_config import (
+    load_minimap_stability_config,
+)
 
 
-BUILTIN_OCR_MODEL_PATH = "models/coord_ocr.pt"
+BUILTIN_OCR_MODEL_PATH = "models/coord_ocr.onnx"
 LEGACY_BUILTIN_OCR_MODEL_PATHS = {
-    "models/coord_ocr.onnx",
+    "models/coord_ocr.pt",
 }
 
 
@@ -55,7 +73,7 @@ def _normalized_model_path_value(model_path: object) -> str:
 def resolve_ocr_model_path(model_path: object) -> Path:
     normalized = _normalized_model_path_value(model_path)
     if normalized == BUILTIN_OCR_MODEL_PATH:
-        return paths.model_file("coord_ocr.pt")
+        return paths.model_file("coord_ocr.onnx")
     return Path(model_path)
 
 
@@ -755,7 +773,7 @@ class OCRControlPanel(QDialog):
         self.state_label.setText(tr('status_region_set', '状态: 区域已设置 ({x}, {y}, {width}x{height})', x=x, y=y, width=width, height=height))
     
     def clear_ocr_logs(self):
-        """清空OCR日志"""
+        """清空识别日志"""
         self.output_text.clear()
         self.log_history.clear()
         
@@ -767,7 +785,7 @@ class OCRControlPanel(QDialog):
         self.output_text.append(clear_message)
     
     def save_ocr_logs(self):
-        """保存OCR日志到文件"""
+        """保存识别日志到文件"""
         if not self.log_history:
             QMessageBox.information(self, "保存日志", "没有日志可以保存")
             return
@@ -777,12 +795,12 @@ class OCRControlPanel(QDialog):
         import os
         
         # 默认文件名：包含当前日期时间
-        default_filename = f"OCR_日志_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        default_filename = f"识别日志_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         
         # 弹出保存对话框
         file_path, _ = QFileDialog.getSaveFileName(
             self,
-            "保存OCR日志",
+            "保存识别日志",
             default_filename,
             "日志文件 (*.log);;文本文件 (*.txt);;所有文件 (*.*)"
         )
@@ -790,7 +808,7 @@ class OCRControlPanel(QDialog):
         if file_path:
             try:
                 with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(f"OCR日志导出\n")
+                    f.write(f"识别日志导出\n")
                     f.write(f"导出时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                     f.write(f"总记录数: {len(self.log_history)}\n")
                     f.write("=" * 50 + "\n\n")
@@ -853,6 +871,7 @@ class OCRManager(QObject):
     error_occurred = Signal(str)  # 发生错误时发射
     auto_window_status_changed = Signal(dict)  # 自动窗口检测状态更新
     ocr_region_source_changed = Signal(str)  # 'none', 'auto', 'manual'
+    minimap_roi_locked = Signal(dict)  # 自动小地图 ROI 锁定后发射
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -912,15 +931,31 @@ class OCRManager(QObject):
 
         # 日志管理器引用（来自父窗口）
         self._log_manager = getattr(parent, "_log_manager", None) if parent else None
+        self._settings = SettingsManager()
         self._detailed_ocr_logging = False
         self.runtime_capture_area: Optional[Dict[str, int]] = None
+        self.latest_observation_frame = None
+        self.latest_heading_candidate = None
+        self._current_game_window_rect: Optional[tuple[int, int, int, int]] = None
+        self._vision_map_context = None
+        self._vision_tile_root: Optional[Path] = None
+        self._minimap_auto_candidates: list[MinimapRoi] = []
+        self._minimap_auto_search_active = False
+        self._coordinate_continuity = ContinuityState()
+        self._observation_worker = MinimapObservationWorker(self._collect_minimap_observation)
+        self._observation_worker.result_ready.connect(self._handle_observation_completed)
 
     def set_log_manager(self, log_manager):
         """注入日志管理器（可在主窗口初始化后补充设置）。"""
         self._log_manager = log_manager
+        if self.ocr_worker is not None:
+            try:
+                self.ocr_worker.set_detailed_log_sink(self._enqueue_detailed_ocr_log)
+            except Exception:
+                pass
 
     def set_detailed_ocr_logging(self, enabled: bool):
-        """设置详细OCR日志开关（运行中可动态生效）。"""
+        """设置详细识别日志开关（运行中可动态生效）。"""
         self._detailed_ocr_logging = bool(enabled)
         if self.ocr_worker is not None:
             try:
@@ -988,7 +1023,7 @@ class OCRManager(QObject):
                     return data.get('logs', [])
             return []
         except Exception as e:
-            print(f"加载OCR日志失败: {e}")
+            print(f"加载识别日志失败: {e}")
             return []
     
     def save_logs(self, logs: list):
@@ -1008,7 +1043,7 @@ class OCRManager(QObject):
                 json.dump(data, f, indent=2, ensure_ascii=False)
                 
         except Exception as e:
-            print(f"保存OCR日志失败: {e}")
+            print(f"保存识别日志失败: {e}")
     
     def show_control_panel(self):
         """显示控制面板"""
@@ -1141,6 +1176,12 @@ class OCRManager(QObject):
         window_title = result['title']
         window_mode = result['mode']
         region = self._calculate_default_region(rect)
+        self._current_game_window_rect = (
+            int(rect[0]),
+            int(rect[1]),
+            int(rect[2]),
+            int(rect[3]),
+        )
 
         self.ocr_config['ocr_capture_area'] = region
         self.ocr_config['ocr_capture_area_source'] = 'auto'
@@ -1173,6 +1214,9 @@ class OCRManager(QObject):
             y=rect[1]
         )
         self.ocr_region_source_changed.emit("auto")
+
+        if bool(self._settings.get("minimap_roi.auto_calibration_enabled", True)):
+            self.start_minimap_auto_search()
 
         print(
             f"Auto window detect: found '{window_title}', mode={window_mode}, "
@@ -1291,7 +1335,9 @@ class OCRManager(QObject):
             worker_config = dict(self.ocr_config)
             worker_config['detailed_ocr_logging'] = bool(self._detailed_ocr_logging)
             self.ocr_worker = OCRWorker(config_dict=worker_config)
+            self.ocr_worker.set_detailed_log_sink(self._enqueue_detailed_ocr_log)
             self.ocr_worker.set_capture_callback(capture_region_callback)
+            self.ocr_worker.set_frame_capture_callback(capture_frame_and_region_callback)
 
             try:
                 self.ocr_worker.update_confidence_thresholds(
@@ -1302,11 +1348,12 @@ class OCRManager(QObject):
                 pass
             
             # 连接信号
-            self.ocr_worker.coordinates_detected.connect(self.on_coordinates_detected)
+            self.ocr_worker.frame_recognition_completed.connect(self.on_recognition_frame_completed)
             self.ocr_worker.recognition_state_changed.connect(self.on_state_changed)
             self.ocr_worker.error_occurred.connect(self.on_error_occurred)
             self.ocr_worker.ocr_output_updated.connect(self.on_ocr_output_updated)
             self.ocr_worker.capture_area_updated.connect(self.on_capture_area_updated)
+            self.ocr_worker.captured_frame_ready.connect(self.on_observation_frame_captured)
             
             # 启动OCR
             self.ocr_worker.start_recognition()
@@ -1390,24 +1437,428 @@ class OCRManager(QObject):
     def set_jump_callback(self, callback):
         """设置坐标跳转回调函数"""
         self.jump_callback = callback
+
+    def reset_coordinate_continuity(self, reason: str):
+        """Reset accepted-coordinate continuity after an explicit segment break."""
+        self._coordinate_continuity.reset(reason)
+
+    def update_vision_context(self, snapshot: dict):
+        """Receive current map context and stitched-resource root for visual localization."""
+        if not isinstance(snapshot, dict):
+            if self._vision_map_context is not None:
+                self.reset_coordinate_continuity("map_context_unavailable")
+            self._vision_map_context = None
+            self._vision_tile_root = None
+            return
+        map_context = snapshot.get("map_context")
+        tile_root = snapshot.get("tile_root")
+        if map_context is None or tile_root is None:
+            if self._vision_map_context is not None:
+                self.reset_coordinate_continuity("map_context_unavailable")
+            self._vision_map_context = None
+            self._vision_tile_root = None
+            return
+        previous_context = self._vision_map_context
+        if (
+            previous_context is not None
+            and getattr(previous_context, "area_id", None) != getattr(map_context, "area_id", None)
+        ):
+            self.reset_coordinate_continuity("area_changed")
+        self._vision_map_context = map_context
+        self._vision_tile_root = Path(tile_root)
+
+    def start_minimap_auto_search(self):
+        """Start finding the minimap circle in the top-left search area of the game window."""
+        self._minimap_auto_candidates.clear()
+        self._minimap_auto_search_active = True
+        self._settings.set("minimap_roi.status", "searching", save=False)
+        try:
+            self._settings.save()
+        except Exception:
+            pass
+
+    def stop_minimap_auto_search(self):
+        """Stop finding the minimap circle; keep the last locked ROI if one exists."""
+        self._minimap_auto_candidates.clear()
+        self._minimap_auto_search_active = False
+        width = int(self._settings.get("minimap_roi.width", 0) or 0)
+        height = int(self._settings.get("minimap_roi.height", 0) or 0)
+        self._settings.set(
+            "minimap_roi.status",
+            "locked" if width > 0 and height > 0 else "uncalibrated",
+            save=False,
+        )
+        try:
+            self._settings.save()
+        except Exception:
+            pass
+
+    def _handle_minimap_auto_candidate(self, roi: MinimapRoi) -> bool:
+        if not self._minimap_auto_search_active:
+            return False
+
+        self._minimap_auto_candidates.append(roi)
+        self._minimap_auto_candidates = self._minimap_auto_candidates[-3:]
+        tolerance = int(self._settings.get("minimap_stability.auto_roi_lock_tolerance_px", 2) or 2)
+        if not should_lock_auto_roi(self._minimap_auto_candidates, required_frames=3, tolerance_px=tolerance):
+            return False
+
+        locked = self._minimap_auto_candidates[0]
+        self._settings.set("minimap_roi.x", int(locked.x), save=False)
+        self._settings.set("minimap_roi.y", int(locked.y), save=False)
+        self._settings.set("minimap_roi.width", int(locked.width), save=False)
+        self._settings.set("minimap_roi.height", int(locked.height), save=False)
+        self._settings.set("minimap_roi.shape", locked.shape, save=False)
+        self._settings.set("minimap_roi.source", "auto", save=False)
+        self._settings.set("minimap_roi.status", "locked", save=False)
+        try:
+            self._settings.save()
+        except Exception:
+            pass
+        self._minimap_auto_candidates.clear()
+        self._minimap_auto_search_active = False
+        self.minimap_roi_locked.emit(
+            {
+                "x": int(locked.x),
+                "y": int(locked.y),
+                "width": int(locked.width),
+                "height": int(locked.height),
+                "shape": locked.shape,
+                "source": "auto",
+                "status": "locked",
+            }
+        )
+        return True
     
     @Slot(int, int, int)
     def on_coordinates_detected(self, x, y, z):
         """坐标检测到时的处理"""
+        ocr_candidate = CoordinateCandidate(int(x), int(y), int(z), source="ocr")
+        self._submit_recognition_frame(ocr_candidate)
+
+    @Slot(object)
+    def on_recognition_frame_completed(self, payload):
+        """Handle one completed OCR frame; visual recognition still runs if OCR failed."""
+        ocr_candidate = None
+        if isinstance(payload, dict):
+            frame_result = payload.get("frame_result")
+            if frame_result is not None:
+                self.latest_observation_frame = frame_result
+            raw_coord = payload.get("ocr_coord")
+            if raw_coord is not None:
+                try:
+                    x, y, z = raw_coord
+                    ocr_candidate = CoordinateCandidate(int(x), int(y), int(z), source="ocr")
+                except Exception:
+                    ocr_candidate = None
+        self._submit_recognition_frame(ocr_candidate)
+
+    def _submit_recognition_frame(self, ocr_candidate: CoordinateCandidate | None):
+        self._observation_worker.submit(ocr_candidate)
+
+    @Slot(object)
+    def _handle_observation_completed(self, payload):
+        if not isinstance(payload, dict):
+            return
+        ocr_candidate = payload.get("ocr_candidate")
+        observation = payload.get("observation")
+        if not isinstance(observation, dict):
+            observation = {}
+        self._handle_recognition_frame(ocr_candidate, observation)
+
+    def _handle_recognition_frame(self, ocr_candidate: CoordinateCandidate | None, observation: dict | None = None):
+        if observation is None:
+            observation = self._collect_minimap_observation(ocr_candidate)
+        heading_candidate = observation.get("heading_candidate")
+        self.latest_heading_candidate = heading_candidate if isinstance(heading_candidate, dict) else None
+        visual_candidate = self._candidate_from_observation(observation.get("visual_candidate"))
+        stability_config = load_minimap_stability_config(self._settings)
+        decision = choose_coordinate(
+            ocr_candidate,
+            visual_candidate,
+            self._coordinate_continuity,
+            agreement_xy_threshold=(
+                stability_config.coordinate_agreement_x_threshold,
+                stability_config.coordinate_agreement_y_threshold,
+            ),
+            history_xy_threshold=(
+                stability_config.history_x_threshold,
+                stability_config.history_y_threshold,
+            ),
+        )
+        if decision.coord is None:
+            self._route_observation_evidence(ocr_candidate, visual_candidate, decision, observation)
+            return
+
+        final_x, final_y, final_z = decision.coord
+        self._route_observation_evidence(ocr_candidate, visual_candidate, decision, observation)
+        self._coordinate_continuity.accept(decision.coord)
+
         # 更新控制面板显示
         if self.control_panel:
-            self.control_panel.update_coordinates(x, y, z)
+            self.control_panel.update_coordinates(final_x, final_y, final_z)
         
         # 发射信号
-        self.coordinates_detected.emit(x, y, z)
+        self.coordinates_detected.emit(final_x, final_y, final_z)
         
         # 自动跳转功能
         if self.auto_jump_enabled and self.jump_callback:
             try:
-                self.jump_callback(x, y, z)
+                self.jump_callback(final_x, final_y, final_z)
             except Exception as e:
                 print(f"自动跳转失败: {e}")
-    
+
+    def _build_minimap_roi_from_settings(self) -> Optional[MinimapRoi]:
+        if self._minimap_auto_search_active:
+            return None
+        status = str(self._settings.get("minimap_roi.status", "") or "")
+        if status and status != "locked":
+            return None
+        width = int(self._settings.get("minimap_roi.width", 0) or 0)
+        height = int(self._settings.get("minimap_roi.height", 0) or 0)
+        if width <= 0 or height <= 0:
+            return None
+        shape = str(self._settings.get("minimap_roi.shape", "circle") or "circle")
+        if shape != "ellipse":
+            shape = "circle"
+        return MinimapRoi(
+            x=int(self._settings.get("minimap_roi.x", 0) or 0),
+            y=int(self._settings.get("minimap_roi.y", 0) or 0),
+            width=width,
+            height=height,
+            shape=shape,
+            source=str(self._settings.get("minimap_roi.source", "manual") or "manual"),
+        )
+
+    def _collect_minimap_observation(self, ocr_candidate: CoordinateCandidate | None) -> dict:
+        if self.latest_observation_frame is None:
+            return {
+                "visual_candidate": None,
+                "visual_result": None,
+                "heading_candidate": None,
+                "visual_failure_reason": "no_observation_frame",
+                "heading_failure_reason": "no_observation_frame",
+            }
+        frame = self._minimap_frame_from_capture(self.latest_observation_frame)
+        if self._minimap_auto_search_active:
+            candidate = detect_minimap_circle_roi(
+                frame,
+                self._minimap_search_rect(frame),
+                require_arrow_anchor=True,
+            )
+            if candidate is not None:
+                self._handle_minimap_auto_candidate(candidate)
+        roi = self._build_minimap_roi_from_settings()
+        if roi is None:
+            if self._minimap_auto_search_active:
+                return {
+                    "visual_candidate": None,
+                    "visual_result": None,
+                    "heading_candidate": None,
+                    "visual_failure_reason": "minimap_roi_searching",
+                    "heading_failure_reason": "minimap_roi_searching",
+                }
+            return {
+                "visual_candidate": None,
+                "visual_result": None,
+                "heading_candidate": None,
+                "visual_failure_reason": "no_minimap_roi",
+                "heading_failure_reason": "no_minimap_roi",
+            }
+        try:
+            map_context = self._vision_map_context
+            tile_root = self._vision_tile_root
+            stability_config = load_minimap_stability_config(self._settings)
+            heading_enabled = bool(stability_config.heading_recognition_enabled)
+            detect_heading_now = heading_enabled
+            frame_package_path = self._export_minimap_frame_package(
+                frame,
+                roi=roi,
+                ocr_candidate=ocr_candidate,
+                map_context=map_context,
+                tile_root=tile_root,
+            )
+            observation = run_observation_paths(
+                frame,
+                roi=roi,
+                map_context=map_context,
+                tile_root=tile_root,
+                ocr_candidate=ocr_candidate,
+                continuity=self._coordinate_continuity,
+                stability_config=stability_config,
+                detect_heading_enabled=detect_heading_now,
+            )
+            if not heading_enabled:
+                observation["heading_candidate"] = None
+                observation["heading_failure_reason"] = "heading_disabled"
+            observation["frame_package_path"] = frame_package_path
+            return observation
+        except Exception as e:
+            return {
+                "visual_candidate": None,
+                "visual_result": None,
+                "heading_candidate": None,
+                "visual_failure_reason": "observation_error",
+                "heading_failure_reason": "observation_error",
+                "error": str(e),
+            }
+
+    def _minimap_frame_from_capture(self, frame_result):
+        """Return the game-window-relative frame used by minimap ROI and vision paths."""
+        frame = getattr(frame_result, "frame", frame_result)
+        rect = self._current_game_window_rect
+        if frame is None or rect is None:
+            return frame
+
+        try:
+            frame_height, frame_width = frame.shape[:2]
+            origin_x, origin_y = getattr(frame_result, "origin", (0, 0))
+            left, top, right, bottom = [int(value) for value in rect]
+            rel_left = left - int(origin_x)
+            rel_top = top - int(origin_y)
+            rel_right = right - int(origin_x)
+            rel_bottom = bottom - int(origin_y)
+        except Exception:
+            return frame
+
+        if rel_left == 0 and rel_top == 0 and rel_right == frame_width and rel_bottom == frame_height:
+            return frame
+        if rel_left < 0 or rel_top < 0 or rel_right > frame_width or rel_bottom > frame_height:
+            return frame
+        if rel_right <= rel_left or rel_bottom <= rel_top:
+            return frame
+        return frame[rel_top:rel_bottom, rel_left:rel_right]
+
+    def _export_minimap_frame_package(
+        self,
+        frame,
+        *,
+        roi: MinimapRoi,
+        ocr_candidate: CoordinateCandidate | None,
+        map_context,
+        tile_root: Path | None,
+    ) -> str | None:
+        if not bool(self._settings.get("logging.save_minimap_frame_packages", False)):
+            return None
+        try:
+            stability_config = load_minimap_stability_config(self._settings)
+            label_parts = ["obs"]
+            if map_context is not None:
+                label_parts.append(str(getattr(map_context, "area_id", "area")))
+            if ocr_candidate is None:
+                label_parts.append("ocr_none")
+            else:
+                label_parts.append(f"{ocr_candidate.x}_{ocr_candidate.y}_{ocr_candidate.z}")
+            package_path = write_minimap_frame_package(
+                frame,
+                label="_".join(label_parts),
+                roi=roi,
+                ocr_candidate=ocr_candidate,
+                map_context=map_context,
+                tile_root=tile_root,
+                stability_config=stability_config,
+                extra={
+                    "continuity_previous_coordinate": self._coordinate_continuity.previous_coordinate,
+                    "runtime_capture_area": self.runtime_capture_area,
+                },
+                include_debug_artifacts=True,
+            )
+            return str(package_path)
+        except Exception as exc:
+            if self._log_manager is not None:
+                self._log_manager.enqueue("recognition", f"[MINIMAP-FRAME-PACKAGE] export_failed error={exc}")
+            return None
+
+    def _candidate_from_observation(self, payload) -> Optional[CoordinateCandidate]:
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return CoordinateCandidate(
+                x=int(payload["x"]),
+                y=int(payload["y"]),
+                z=payload.get("z"),
+                source=str(payload.get("source", "visual")),
+                confidence=payload.get("confidence"),
+            )
+        except Exception:
+            return None
+
+    def _minimap_search_rect(self, frame) -> Tuple[int, int, int, int]:
+        frame_height, frame_width = frame.shape[:2]
+        return (0, 0, max(1, int(frame_width / 8)), max(1, int(frame_height / 4)))
+
+    def _calculate_minimap_search_region(self, rect: Tuple[int, int, int, int]) -> Dict[str, int]:
+        left, top, right, bottom = rect
+        window_width = max(1, int(right) - int(left))
+        window_height = max(1, int(bottom) - int(top))
+        return {
+            "x": int(left),
+            "y": int(top),
+            "width": max(1, int(window_width / 8)),
+            "height": max(1, int(window_height / 4)),
+        }
+
+    def get_minimap_preview_area(self) -> Optional[Dict[str, int]]:
+        rect = self._current_game_window_rect
+        if rect is None:
+            return None
+        if self._minimap_auto_search_active:
+            return self._calculate_minimap_search_region(rect)
+        if str(self._settings.get("minimap_roi.status", "") or "") != "locked":
+            return None
+        roi = self._build_minimap_roi_from_settings()
+        if roi is None:
+            return None
+        left, top, _, _ = rect
+        return {
+            "x": int(left) + int(roi.x),
+            "y": int(top) + int(roi.y),
+            "width": int(roi.width),
+            "height": int(roi.height),
+        }
+
+    def normalize_minimap_manual_selection(self, x: int, y: int, width: int, height: int) -> MinimapRoi:
+        rect = self._current_game_window_rect
+        roi_x = int(x)
+        roi_y = int(y)
+        if rect is not None:
+            left, top, right, bottom = rect
+            if int(left) <= roi_x < int(right) and int(top) <= roi_y < int(bottom):
+                roi_x -= int(left)
+                roi_y -= int(top)
+        return MinimapRoi(
+            x=roi_x,
+            y=roi_y,
+            width=int(width),
+            height=int(height),
+            shape="circle",
+            source="manual",
+        )
+
+    def _route_observation_evidence(self, ocr_candidate, visual_candidate, decision, observation=None):
+        if not self._log_manager:
+            return
+        observation = observation or {}
+        bundle = {
+            "ocr": asdict(ocr_candidate) if ocr_candidate is not None else None,
+            "visual": asdict(visual_candidate) if visual_candidate is not None else None,
+            "visual_result": observation.get("visual_result"),
+            "visual_trace": observation.get("visual_trace"),
+            "visual_failure_reason": observation.get("visual_failure_reason"),
+            "error": observation.get("error"),
+            "heading": observation.get("heading_candidate"),
+            "heading_failure_reason": observation.get("heading_failure_reason"),
+            "timings_ms": observation.get("timings_ms"),
+            "previous_coordinate": self._coordinate_continuity.previous_coordinate,
+            "frame_package_path": observation.get("frame_package_path"),
+            "decision": asdict(decision),
+        }
+        for log_type, line in route_observation_bundle(
+            bundle,
+            detailed_debug=bool(self._detailed_ocr_logging),
+        ):
+            self._log_manager.enqueue(log_type, line)
+
     @Slot(str)
     def on_state_changed(self, state):
         """状态变化时的处理"""
@@ -1432,7 +1883,12 @@ class OCRManager(QObject):
             self.control_panel.update_ocr_output(output)
         if self._log_manager:
             timestamp = datetime.now().strftime("%H:%M:%S")
-            self._log_manager.enqueue("ocr", f"[{timestamp}] {output}")
+            self._log_manager.enqueue("recognition", f"[{timestamp}] {output}")
+
+    def _enqueue_detailed_ocr_log(self, output: str) -> None:
+        if self._log_manager:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self._log_manager.enqueue("recognition", f"[{timestamp}] {output}")
 
     @Slot(dict)
     def on_capture_area_updated(self, area: dict):
@@ -1444,6 +1900,11 @@ class OCRManager(QObject):
                 'width': int(area.get('width', 0) or 0),
                 'height': int(area.get('height', 0) or 0),
             }
+
+    @Slot(object)
+    def on_observation_frame_captured(self, frame_result):
+        """Store the latest shared full-frame capture for minimap observation."""
+        self.latest_observation_frame = frame_result
     
     def cleanup(self):
         """清理资源"""
@@ -1451,14 +1912,17 @@ class OCRManager(QObject):
         if self.control_panel and hasattr(self.control_panel, 'log_history'):
             try:
                 self.save_logs(self.control_panel.get_log_history())
-                print("OCR日志已保存到持久化存储")
+                print("识别日志已保存到持久化存储")
             except Exception as e:
-                print(f"保存OCR日志时出错: {e}")
+                print(f"保存识别日志时出错: {e}")
         
         self.stop_ocr()
+        if self._observation_worker is not None:
+            self._observation_worker.shutdown(timeout=1.0)
         if self.control_panel:
             self.control_panel.close()
             self.control_panel = None
         if self.region_calibrator:
             self.region_calibrator.close()
             self.region_calibrator = None
+

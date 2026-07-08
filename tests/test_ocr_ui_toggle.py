@@ -56,9 +56,10 @@ class TestOCRSettingsToggle(unittest.TestCase):
         mock_settings_cls.return_value = mock_settings
         mock_settings.get.side_effect = lambda k, d=None: d
         
-        # Setup mock switch to simulate state
+        # Setup mock switches to simulate OCR + minimap auto calibration switches.
         mock_switch_instance = MagicMock()
-        mock_switch.return_value = mock_switch_instance
+        mock_minimap_switch_instance = MagicMock()
+        mock_switch.side_effect = [mock_switch_instance, mock_minimap_switch_instance]
         # Default isChecked should be False unless set, but our code sets it
         mock_switch_instance.isChecked.return_value = True 
 
@@ -101,9 +102,10 @@ class TestOCRSettingsToggle(unittest.TestCase):
         mock_settings = MagicMock()
         mock_settings_cls.return_value = mock_settings
         
-        # Setup mock switch
+        # Setup mock switches to simulate OCR + minimap auto calibration switches.
         mock_switch_instance = MagicMock()
-        mock_switch.return_value = mock_switch_instance
+        mock_minimap_switch_instance = MagicMock()
+        mock_switch.side_effect = [mock_switch_instance, mock_minimap_switch_instance]
         
         # Initialize interface
         interface = OCRSettingsInterface()

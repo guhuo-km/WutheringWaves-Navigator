@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import os
 import queue
+import sqlite3
 import threading
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from . import paths
 from .settings_manager import SettingsManager
@@ -18,7 +19,8 @@ from .settings_manager import SettingsManager
 class LogManager:
     """Async log writer and session-based log file manager."""
 
-    _LOG_TYPES = ("system", "ocr", "debug")
+    _LOG_TYPES = ("system", "recognition", "debug")
+    _LOG_ALIASES = {"ocr": "recognition"}
 
     def __init__(
         self,
@@ -44,6 +46,7 @@ class LogManager:
         for log_type in self._LOG_TYPES:
             filename = f"{log_type}.log"
             self._paths[log_type] = os.path.join(self._log_dir, filename)
+        self._db_path = os.path.join(self._log_dir, "runtime_logs.sqlite3")
 
         self._queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
         self._stop_event = threading.Event()
@@ -51,10 +54,15 @@ class LogManager:
         self._thread.start()
 
         self._ensure_files()
+        self._ensure_database()
         self._cleanup_logs()
 
     def get_log_path(self, log_type: str) -> Optional[str]:
+        log_type = self._LOG_ALIASES.get(log_type, log_type)
         return self._paths.get(log_type)
+
+    def get_database_path(self) -> str:
+        return self._db_path
 
     def set_limits(self, max_files: int, max_file_size_mb: int) -> None:
         self._max_files = int(max_files)
@@ -63,11 +71,38 @@ class LogManager:
         self._cleanup_logs()
 
     def enqueue(self, log_type: str, line: str) -> None:
+        log_type = self._LOG_ALIASES.get(log_type, log_type)
         if log_type not in self._LOG_TYPES:
             return
         if not line:
             return
         self._queue.put((log_type, line))
+
+    def flush(self) -> None:
+        """Wait until all queued log lines have reached file and SQLite storage."""
+        self._queue.join()
+
+    def query_recent(self, log_type: str, limit: int = 500) -> List[Dict[str, object]]:
+        log_type = self._LOG_ALIASES.get(log_type, log_type)
+        if log_type not in self._LOG_TYPES:
+            return []
+        safe_limit = max(1, min(int(limit), 5000))
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """
+                    SELECT id, session, ts, type, level, tag, message
+                    FROM logs
+                    WHERE session = ? AND type = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (self._session_ts, log_type, safe_limit),
+                ).fetchall()
+            return [dict(row) for row in rows]
+        except Exception:
+            return []
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -90,14 +125,41 @@ class LogManager:
             except Exception:
                 pass
 
+    def _ensure_database(self) -> None:
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=30000")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session TEXT NOT NULL,
+                        ts TEXT NOT NULL,
+                        type TEXT NOT NULL,
+                        level TEXT,
+                        tag TEXT,
+                        message TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_logs_session_type_id "
+                    "ON logs(session, type, id DESC)"
+                )
+        except Exception:
+            pass
+
     def _writer_loop(self) -> None:
         file_handles: Dict[str, Optional[object]] = {t: None for t in self._LOG_TYPES}
         write_count = 0
+        db_conn = self._open_writer_database()
 
         while not self._stop_event.is_set() or not self._queue.empty():
             try:
                 log_type, line = self._queue.get(timeout=0.2)
             except queue.Empty:
+                self._commit_database(db_conn)
                 continue
 
             try:
@@ -110,9 +172,12 @@ class LogManager:
                     if not line.endswith("\n"):
                         line = line + "\n"
                     handle.write(line)
+                self._insert_database_line(db_conn, log_type, line.rstrip("\n"))
             except Exception:
                 pass
             finally:
+                if write_count % 50 == 49 or self._queue.empty():
+                    self._commit_database(db_conn)
                 self._queue.task_done()
 
             write_count += 1
@@ -126,6 +191,65 @@ class LogManager:
                     handle.close()
             except Exception:
                 pass
+        self._commit_database(db_conn)
+        try:
+            if db_conn:
+                db_conn.close()
+        except Exception:
+            pass
+
+    def _open_writer_database(self):
+        try:
+            conn = sqlite3.connect(self._db_path, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            return conn
+        except Exception:
+            return None
+
+    @staticmethod
+    def _commit_database(conn) -> None:
+        if not conn:
+            return
+        try:
+            conn.commit()
+        except Exception:
+            pass
+
+    def _insert_database_line(self, conn, log_type: str, line: str) -> None:
+        if not conn:
+            return
+        ts, level, tag = self._parse_line_metadata(line)
+        try:
+            conn.execute(
+                """
+                INSERT INTO logs(session, ts, type, level, tag, message)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (self._session_ts, ts, log_type, level, tag, line),
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _parse_line_metadata(line: str) -> Tuple[str, Optional[str], Optional[str]]:
+        ts = datetime.now().strftime("%H:%M:%S")
+        level = None
+        tag = None
+        if line.startswith("["):
+            end = line.find("]")
+            if end > 1:
+                ts = line[1:end]
+                rest = line[end + 1 :].lstrip()
+                if rest.startswith("["):
+                    end2 = rest.find("]")
+                    if end2 > 1:
+                        token = rest[1:end2]
+                        if token in {"INFO", "WARNING", "ERROR", "DEBUG"}:
+                            level = token
+                        else:
+                            tag = token
+        return ts, level, tag
 
     def _cleanup_logs(self) -> None:
         for log_type in self._LOG_TYPES:

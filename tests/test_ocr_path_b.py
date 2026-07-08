@@ -92,6 +92,18 @@ class TestPathBParsing:
         assert coords is None
         assert ocr_worker.get_current_state() == "FAILED"
 
+    def test_current_frame_failure_emits_frame_completion(self, ocr_worker):
+        emitted = []
+        ocr_worker.frame_recognition_completed.connect(emitted.append)
+
+        success, coords = ocr_worker._apply_tracking_algorithm([])
+
+        assert success is False
+        assert coords is None
+        assert len(emitted) == 1
+        assert emitted[0]["ocr_coord"] is None
+        assert "frame_result" in emitted[0]
+
     def test_timestamp_noise_with_timezone(self, ocr_worker):
         detections = build_ocr_string_detections("-500,100,50 2026-02-07 16:20:33 +8")
         success, coords, metadata = ocr_worker._parse_path_b_spacing_dominant(detections)

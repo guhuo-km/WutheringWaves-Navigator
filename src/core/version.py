@@ -34,14 +34,15 @@ def _project_root_from_here() -> Path:
 def _candidate_version_files(project_root: str | Path | None = None) -> list[Path]:
     if project_root is not None:
         root = Path(project_root)
-        return [root / "version.json", root / "_internal" / "version.json"]
+        return [root / "_internal" / "version.json", root / "version.json"]
 
     candidates: list[Path] = []
     if getattr(sys, "frozen", False):
-        candidates.append(Path(sys.executable).resolve().parent / "version.json")
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
             candidates.append(Path(meipass).resolve() / "version.json")
+        candidates.append(Path(sys.executable).resolve().parent / "_internal" / "version.json")
+        candidates.append(Path(sys.executable).resolve().parent / "version.json")
 
     candidates.append(_project_root_from_here() / "version.json")
     candidates.append(Path.cwd() / "version.json")

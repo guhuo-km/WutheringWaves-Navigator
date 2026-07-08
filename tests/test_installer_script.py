@@ -38,6 +38,30 @@ def test_upgrade_does_not_run_old_uninstaller():
     assert "检测到已安装版本，将执行覆盖升级并保留用户数据。" in text
 
 
+def test_core_install_overwrites_existing_program_files():
+    text = installer_text()
+    core_section = text.split('Section "核心程序文件" SEC01', 1)[1].split("SectionEnd", 1)[0]
+
+    assert "SetOverwrite on" in core_section
+    assert core_section.index("SetOverwrite on") < core_section.index('File /r "..\\dist\\WutheringWaves-Navigator-Smart\\*.*"')
+
+
+def test_core_install_removes_stale_root_version_before_copying_files():
+    text = installer_text()
+    core_section = text.split('Section "核心程序文件" SEC01', 1)[1].split("SectionEnd", 1)[0]
+
+    assert 'Delete "$INSTDIR\\version.json"' in core_section
+    assert core_section.index('Delete "$INSTDIR\\version.json"') < core_section.index('File /r "..\\dist\\WutheringWaves-Navigator-Smart\\*.*"')
+
+
+def test_core_install_replaces_old_minimap_tile_cache_before_copying_files():
+    text = installer_text()
+    core_section = text.split('Section "核心程序文件" SEC01', 1)[1].split("SectionEnd", 1)[0]
+
+    assert 'RMDir /r "$INSTDIR\\cache\\minimap_tiles"' in core_section
+    assert core_section.index('RMDir /r "$INSTDIR\\cache\\minimap_tiles"') < core_section.index('File /r "..\\dist\\WutheringWaves-Navigator-Smart\\*.*"')
+
+
 def test_uninstall_has_keep_user_data_checkbox():
     text = installer_text()
 

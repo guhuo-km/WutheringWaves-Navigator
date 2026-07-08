@@ -15,7 +15,8 @@ def test_source_mode_roots_are_stable(monkeypatch):
     assert Path(paths.config_file("app_settings.json")) == (
         project / ".runtime" / "config" / "app_settings.json"
     )
-    assert Path(paths.model_file("coord_ocr.pt")) == project / "models" / "coord_ocr.pt"
+    assert Path(paths.minimap_tile_cache_dir()) == project / ".runtime" / "cache" / "minimap_tiles"
+    assert Path(paths.model_file("coord_ocr.onnx")) == project / "models" / "coord_ocr.onnx"
 
 
 def test_frozen_mode_uses_executable_parent_for_runtime(monkeypatch, tmp_path):

@@ -27,15 +27,8 @@ from core.calibration import CalibrationPoint, CalibrationSystem
 
 def get_map_urls(current_language="zh_CN"):
     """根据当前语言返回地图URL映射"""
-    # 中文使用旧域名，其他语言使用新域名
-    if current_language == "zh_CN":
-        aura_url = "https://static-web.ghzs.com/cspage_pro/mingchao-map.html#/?map=default"
-    else:
-        aura_url = "https://www.ghzs666.com/wutheringwaves-map#/?map=default"
-
     return {
         "official_map": "https://www.kurobbs.com/mc/map",
-        "aura_helper": aura_url
     }
 
 class CalibrationWindow(QDialog):
@@ -331,7 +324,7 @@ class CalibrationWindow(QDialog):
             self.log(f"Calibration window loading current URL: {map_url}")
         else:
             if self.current_map_provider == tr('local_map', '本地地图'):
-                map_url = "http://localhost:8000/index.html"
+                map_url = "http://localhost:58427/index.html"
                 self.log(f"Calibration window loading local map: {map_url}")
             elif self.current_map_provider in get_map_urls(self.language_manager.get_current_language() if hasattr(self, 'language_manager') else "zh_CN"):
                 map_urls = get_map_urls(self.language_manager.get_current_language() if hasattr(self, 'language_manager') else "zh_CN")

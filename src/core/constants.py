@@ -22,7 +22,6 @@ DEFAULT_HOTKEYS: Dict[str, str] = {
 # Button to URL key mapping
 BUTTON_TO_URL_KEY: Dict[str, str] = {
     "radio_online_official": "official_map",
-    "radio_online_aura": "aura_helper"
 }
 
 
@@ -36,13 +35,6 @@ def get_map_urls(current_language: str = "zh_CN") -> Dict[str, str]:
     Returns:
         Dict mapping provider keys to URLs
     """
-    # Chinese uses old domain, other languages use new domain
-    if current_language == "zh_CN":
-        aura_url = "https://static-web.ghzs.com/cspage_pro/mingchao-map.html#/?map=default"
-    else:
-        aura_url = "https://www.ghzs666.com/wutheringwaves-map#/?map=default"
-
     return {
         "official_map": "https://www.kurobbs.com/mc/map",
-        "aura_helper": aura_url
     }

@@ -12,8 +12,7 @@ Pillow>=10.0.0
 numpy>=1.24.0
 
 # OCR和机器学习
-torch>=2.0.0
-ultralytics>=8.0.0
+onnxruntime>=1.23.0
 
 # 快捷键支持
 keyboard>=0.13.5

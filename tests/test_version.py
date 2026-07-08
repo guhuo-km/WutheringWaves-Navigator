@@ -67,17 +67,23 @@ def test_load_version_info_reads_internal_version_from_explicit_app_root(tmp_pat
     assert info.update_base_url == "https://updates.example.com/latest.json"
 
 
-def test_find_version_file_prefers_explicit_app_root(tmp_path):
+def test_find_version_file_prefers_internal_version_for_packaged_app_root(tmp_path):
     (tmp_path / "version.json").write_text(
         json.dumps({"version": "3.4.5"}),
         encoding="utf-8",
     )
+    internal = tmp_path / "_internal"
+    internal.mkdir()
+    (internal / "version.json").write_text(
+        json.dumps({"version": "4.5.6"}),
+        encoding="utf-8",
+    )
 
-    assert find_version_file(tmp_path) == tmp_path / "version.json"
+    assert find_version_file(tmp_path) == internal / "version.json"
 
 
 def test_repository_version_defaults_are_pre_1_0_and_do_not_embed_update_url():
     info = load_version_info(Path(__file__).resolve().parents[1])
 
-    assert info.version == "0.1.6.17"
+    assert info.version == "0.1.6.21"
     assert info.update_base_url == ""

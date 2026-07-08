@@ -53,6 +53,10 @@ def cache_dir(*parts: str) -> Path:
     return runtime_dir("cache", *parts)
 
 
+def minimap_tile_cache_dir() -> Path:
+    return cache_dir("minimap_tiles")
+
+
 def routes_dir() -> Path:
     return runtime_dir("recorded_routes")
 

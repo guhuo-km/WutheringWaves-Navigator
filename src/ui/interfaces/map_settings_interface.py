@@ -4,13 +4,13 @@
 """
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
+    QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QFileDialog, QProgressBar, QMessageBox
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Signal
 from qfluentwidgets import (
     BodyLabel, SubtitleLabel, PushButton, PrimaryPushButton,
-    RadioButton, CardWidget, InfoBar, InfoBarPosition
+    RadioButton, CardWidget, InfoBar, InfoBarPosition,
 )
 
 try:
@@ -27,7 +27,7 @@ from core.calibration import CalibrationDataManager
 class MapSettingsInterface(QWidget):
     """地图设置页面"""
     
-    map_source_changed = Signal(str)  # 'official', 'aura', 'local'
+    map_source_changed = Signal(str)  # 'official', 'local'
     calibration_requested = Signal()
     auto_calibration_toggled = Signal(bool)
     
@@ -58,10 +58,6 @@ class MapSettingsInterface(QWidget):
         self.radio_official.setChecked(True)
         self.radio_official.toggled.connect(lambda c: c and self.on_source_changed('official'))
         source_layout.addWidget(self.radio_official)
-        
-        self.radio_aura = RadioButton()
-        self.radio_aura.toggled.connect(lambda c: c and self.on_source_changed('aura'))
-        source_layout.addWidget(self.radio_aura)
         
         self.radio_local = RadioButton()
         self.radio_local.toggled.connect(lambda c: c and self.on_source_changed('local'))
@@ -137,6 +133,7 @@ class MapSettingsInterface(QWidget):
         calib_layout.addWidget(self.calibration_status_label)
         
         layout.addWidget(calib_card)
+
         layout.addStretch()
         self.retranslate_ui()
     
@@ -260,10 +257,11 @@ class MapSettingsInterface(QWidget):
 
     def load_settings(self):
         source = self.settings.get("map.source", "official")
+        if source not in {"official", "local"}:
+            source = "official"
+            self.settings.set("map.source", source)
         if source == "official":
             self.radio_official.setChecked(True)
-        elif source == "aura":
-            self.radio_aura.setChecked(True)
         elif source == "local":
             self.radio_local.setChecked(True)
 
@@ -317,7 +315,6 @@ class MapSettingsInterface(QWidget):
     def retranslate_ui(self):
         self.source_title_label.setText(tr("map_source_title", "地图源"))
         self.radio_official.setText(tr("map_source_official_full", "库街区官方地图"))
-        self.radio_aura.setText(tr("map_source_aura_full", "光环助手地图"))
         self.radio_local.setText(tr("map_source_local", "本地地图"))
         self.local_title_label.setText(tr("map_local_management", "本地地图管理"))
         self.add_map_btn.setText(tr("map_add", "添加地图"))
