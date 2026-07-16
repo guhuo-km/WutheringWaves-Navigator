@@ -39,6 +39,7 @@ def run_graph_data_harness(script_path: Path) -> dict:
     ]
     functions = [
         "normalizeRouteCoordinate",
+        "reserveRouteCoordinate",
         "normalizeHexColor",
         "hexToRgb",
         "rgbToHex",
@@ -324,6 +325,132 @@ process.stdout.write(JSON.stringify({{
         ["node", "-"],
         input=harness,
         text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def run_route_merge_harness(script_path: Path) -> dict:
+    text = script_path.read_text(encoding="utf-8")
+    required_signatures = (
+        "function reserveRouteCoordinate(x, y, usedCoordinates)",
+        "function collectSelectedJsonRoutes(routeManager)",
+        "function mergeRouteGraphs(routes, routeName)",
+    )
+    for signature in required_signatures:
+        assert signature in text
+
+    declarations = [
+        extract_js_declaration(text, "const ROUTE_GRAPH_SCHEMA ="),
+        extract_js_declaration(text, "const ROUTE_GRAPH_VERSION ="),
+        extract_js_declaration(text, "const SPECIAL_MARKER_SHAPES ="),
+        extract_js_declaration(text, "const DEFAULT_SPECIAL_MARKER_STYLE ="),
+    ]
+    functions = [
+        "normalizeRouteCoordinate",
+        "normalizeHexColor",
+        "clampNumber",
+        "normalizeSpecialMarkerStyle",
+        "normalizeSpecialMarkerGroups",
+        "makeGraphNodeId",
+        "makeGraphEdgeId",
+        "normalizeRouteAssociatedMarkers",
+        "isRouteGraphV2",
+        "getLegacyRouteSegments",
+        "reserveRouteCoordinate",
+        "normalizeLegacyRouteGraph",
+        "normalizeRouteGraph",
+        "createEmptyRouteGraph",
+        "createSpecialMarkerGroupId",
+        "collectSelectedJsonRoutes",
+        "mergeRouteGraphs",
+    ]
+    source = "\n".join(
+        [*declarations, *(extract_js_function(text, name) for name in functions)]
+    )
+    harness = f"""
+{source}
+const routeA = {{
+    id: 'route-a',
+    name: '路线 A',
+    type: 'json',
+    rawData: {{
+        schema: ROUTE_GRAPH_SCHEMA,
+        version: ROUTE_GRAPH_VERSION,
+        route_info: {{ name: '路线 A' }},
+        associated_markers: [
+            {{ id: 'shared', type: 'CS_01', name: '共享标记' }},
+            {{ id: 'a-only', type: 'CS_02', name: 'A 标记' }}
+        ],
+        nodes: [
+            {{ id: 'n1', x: 10, y: 20, z: 1 }},
+            {{ id: 'n2', x: 20, y: 20, z: 2 }}
+        ],
+        edges: [{{ id: 'e1', from: 'n1', to: 'n2' }}],
+        special_marker_groups: [{{
+            id: 'g1',
+            style: {{ shape: 'star', fill_color: '#123456' }},
+            node_ids: ['n2', 'n1']
+        }}]
+    }},
+    isEditing: false
+}};
+const routeB = {{
+    id: 'route-b',
+    name: '路线 B',
+    type: 'json',
+    rawData: {{
+        schema: ROUTE_GRAPH_SCHEMA,
+        version: ROUTE_GRAPH_VERSION,
+        route_info: {{ name: '路线 B' }},
+        associated_markers: [
+            {{ id: 'shared', type: 'CS_01', name: '共享标记' }},
+            {{ id: 'b-only', type: 'CS_03', name: 'B 标记' }}
+        ],
+        nodes: [
+            {{ id: 'n1', x: 10, y: 20, z: 3 }},
+            {{ id: 'n2', x: 30, y: 20, z: 4 }}
+        ],
+        edges: [{{ id: 'e1', from: 'n1', to: 'n2' }}],
+        special_marker_groups: [{{
+            id: 'g1',
+            style: {{ shape: 'diamond', fill_color: '#654321' }},
+            node_ids: ['n1', 'n2']
+        }}]
+    }},
+    isEditing: false
+}};
+const routeSvg = {{ id: 'route-svg', name: '路线 SVG', type: 'svg', rawText: '<svg />', isEditing: false }};
+const routesBeforeMerge = JSON.stringify([routeA.rawData, routeB.rawData]);
+const merged = mergeRouteGraphs([routeA, routeB], '合并路线');
+const routesAfterMerge = JSON.stringify([routeA.rawData, routeB.rawData]);
+const selectedManager = {{
+    routes: [routeA, routeB],
+    selectedIds: new Set(['route-a', 'route-b']),
+    singleVisibleMode: false
+}};
+const oneSelectedManager = {{ ...selectedManager, selectedIds: new Set(['route-a']) }};
+const mixedSelectedManager = {{ ...selectedManager, routes: [routeA, routeSvg], selectedIds: new Set(['route-a', 'route-svg']) }};
+const editingManager = {{ ...selectedManager, routes: [routeA, {{ ...routeB, isEditing: true }}] }};
+const singleVisibleManager = {{ ...selectedManager, singleVisibleMode: true }};
+process.stdout.write(JSON.stringify({{
+    merged,
+    sourcesUnchanged: routesBeforeMerge === routesAfterMerge,
+    selected: collectSelectedJsonRoutes(selectedManager).map(route => route.id),
+    oneSelected: collectSelectedJsonRoutes(oneSelectedManager).map(route => route.id),
+    mixedSelected: collectSelectedJsonRoutes(mixedSelectedManager).map(route => route.id),
+    editing: collectSelectedJsonRoutes(editingManager).map(route => route.id),
+    singleVisible: collectSelectedJsonRoutes(singleVisibleManager).map(route => route.id)
+}}));
+"""
+    result = subprocess.run(
+        ["node", "-"],
+        input=harness,
+        text=True,
+        encoding="utf-8",
         capture_output=True,
         check=False,
     )
@@ -340,6 +467,81 @@ def test_graph_constants_and_helpers_exist_in_both_scripts():
         assert "function normalizeRouteGraph(rawData, routeName = 'route')" in text
         assert "function normalizeLegacyRouteGraph(rawData, routeName)" in text
         assert "function serializeRouteGraph(route)" in text
+
+
+def test_selected_json_routes_merge_into_a_new_graph_in_both_scripts():
+    for script_path in (FULL_SCRIPT, LITE_SCRIPT):
+        result = run_route_merge_harness(script_path)
+        merged = result["merged"]
+
+        assert merged["schema"] == "wuwa-route-graph"
+        assert merged["version"] == 2
+        assert merged["route_info"]["name"] == "合并路线"
+        assert merged["nodes"] == [
+            {"id": "n1", "x": 10, "y": 20, "z": 1},
+            {"id": "n2", "x": 20, "y": 20, "z": 2},
+            {"id": "n3", "x": 11, "y": 20, "z": 3},
+            {"id": "n4", "x": 30, "y": 20, "z": 4},
+        ]
+        assert merged["edges"] == [
+            {"id": "e1", "from": "n1", "to": "n2"},
+            {"id": "e2", "from": "n3", "to": "n4"},
+        ]
+        assert [group["id"] for group in merged["special_marker_groups"]] == [
+            "smg1",
+            "smg2",
+        ]
+        assert [group["node_ids"] for group in merged["special_marker_groups"]] == [
+            ["n2", "n1"],
+            ["n3", "n4"],
+        ]
+        assert [marker["id"] for marker in merged["associated_markers"]] == [
+            "shared",
+            "a-only",
+            "b-only",
+        ]
+        assert result["sourcesUnchanged"] is True
+
+
+def test_selected_json_route_merge_requires_an_unambiguous_selection_in_both_scripts():
+    for script_path in (FULL_SCRIPT, LITE_SCRIPT):
+        result = run_route_merge_harness(script_path)
+
+        assert result["selected"] == ["route-a", "route-b"]
+        assert result["oneSelected"] == []
+        assert result["mixedSelected"] == []
+        assert result["editing"] == []
+        assert result["singleVisible"] == []
+
+
+def test_route_merge_control_is_symmetric_and_preserves_original_routes():
+    for text in scripts():
+        assert "const ROUTE_LIST_TEXT = {" in text
+        assert "mergeSelected: '合并选中'" in text
+        assert "mergedRoutePrefix: '合并路线'" in text
+        assert "selectionTitle: '勾选用于批量操作'" in text
+        assert "function collectSelectedJsonRoutes(routeManager)" in text
+        assert "function mergeRouteGraphs(routes, routeName)" in text
+        assert "STATE.routeManager.mergeSelected = function()" in text
+        assert 'id="sm-merge-selected"' in text
+        assert (
+            '<div class="sm-section-title" style="margin-top:10px"><span>已导入列表</span><button '
+            'class="sm-btn" id="sm-merge-selected" style="margin-left:auto;flex:0 0 auto">'
+            "${ROUTE_LIST_TEXT.mergeSelected}</button></div>"
+        ) in text
+        assert "const mergeBtn = document.getElementById('sm-merge-selected');" in text
+        assert "const mergeCandidates = collectSelectedJsonRoutes(STATE.routeManager);" in text
+        assert "mergeBtn.disabled = mergeCandidates.length < 2;" in text
+        assert "$('#sm-merge-selected').onclick = () => {" in text
+        assert "STATE.routeManager.mergeSelected();" in text
+
+        merge_start = text.index("    STATE.routeManager.mergeSelected = function() {")
+        merge_end = text.index("    STATE.routeManager.redraw = function() {", merge_start)
+        merge_block = text[merge_start:merge_end]
+        assert "this.add(mergedRoute);" in merge_block
+        assert "this.remove(" not in merge_block
+        assert "selectedIds.clear" not in merge_block
+        assert "selectedIds.add" not in merge_block
 
 
 def test_associated_official_markers_are_preserved_by_both_route_serializers():
@@ -755,6 +957,13 @@ def test_route_list_removes_legacy_box_delete_but_keeps_save_and_cancel():
         assert '<button class="cancel"' in text
 
 
+def test_imported_route_delete_action_uses_red_style_in_both_scripts():
+    for text in scripts():
+        assert '<button class="del">删除</button>' in text
+        assert ".sm-route-acts button.del { color: #ff6b6b; border-color: #722; }" in text
+        assert ".sm-route-acts button.del:hover { background: #311; color: #ff6b6b; border-color: #f44336; }" in text
+
+
 def test_graph_edit_toolbar_has_separate_save_cancel_action_group_in_both_scripts():
     for text in scripts():
         assert 'class="kmp-toolbar-commit-group"' in text
@@ -1027,9 +1236,10 @@ def test_legacy_nonconsecutive_duplicate_moves_one_unit_and_preserves_connection
 
 def test_legacy_duplicate_relocation_is_bounded_to_one_unit_neighbors():
     for text in scripts():
+        assert "function reserveRouteCoordinate(x, y, usedCoordinates)" in text
         assert "const neighborOffsets = [" in text
         assert "const availableOffset = neighborOffsets.find" in text
-        assert "if (!availableOffset) return;" in text
+        assert "if (!availableOffset) return null;" in text
         assert "for (let distance = 1" not in text
 
 

@@ -156,6 +156,11 @@
             octagon: '八边形', star: '五角星', ellipse: '椭圆', capsule: '胶囊形'
         }
     };
+    const ROUTE_LIST_TEXT = {
+        mergeSelected: '合并选中',
+        mergedRoutePrefix: '合并路线',
+        selectionTitle: '勾选用于批量操作'
+    };
 
     const JSZIP_CDN = 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
     const JSZIP_LOCAL_URLS = [
@@ -749,6 +754,8 @@
         .sm-route-acts { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; }
         .sm-route-acts button { background: #333; border: 1px solid #555; color: #ccc; cursor: pointer; opacity: 0.7; padding: 2px 6px; border-radius: 4px; font-size: 10px; }
         .sm-route-acts button:hover { opacity: 1; transform: scale(1.05); background: #444; color: #fff; border-color: #666; }
+        .sm-route-acts button.del { color: #ff6b6b; border-color: #722; }
+        .sm-route-acts button.del:hover { background: #311; color: #ff6b6b; border-color: #f44336; }
         .sm-input { width: 100%; padding: 8px; background: #111; border: 1px solid #444; color: white; border-radius: 4px; margin-bottom: 8px; box-sizing: border-box; }
         .sm-search-results { max-height: 200px; overflow-y: scroll; scrollbar-gutter: stable; background: #181818; border: 1px solid #333; border-radius: 4px; margin-top: 5px; display: none; }
         .sm-result-item { padding: 6px 10px; border-bottom: 1px solid #333; cursor: pointer; }
@@ -1598,6 +1605,30 @@
         return Number.isFinite(number) ? Math.round(number) : 0;
     }
 
+    function reserveRouteCoordinate(x, y, usedCoordinates) {
+        const normalizedX = normalizeRouteCoordinate(x);
+        const normalizedY = normalizeRouteCoordinate(y);
+        const coordinateKey = `${normalizedX},${normalizedY}`;
+        if (!usedCoordinates.has(coordinateKey)) {
+            usedCoordinates.add(coordinateKey);
+            return { x: normalizedX, y: normalizedY };
+        }
+
+        const neighborOffsets = [
+            [1, 0], [-1, 0], [0, 1], [0, -1],
+            [1, 1], [1, -1], [-1, 1], [-1, -1]
+        ];
+        const availableOffset = neighborOffsets.find(([dx, dy]) => !usedCoordinates.has(`${normalizedX + dx},${normalizedY + dy}`));
+        if (!availableOffset) return null;
+
+        const resolved = {
+            x: normalizedX + availableOffset[0],
+            y: normalizedY + availableOffset[1]
+        };
+        usedCoordinates.add(`${resolved.x},${resolved.y}`);
+        return resolved;
+    }
+
     function normalizeHexColor(value, fallback) {
         return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value)
             ? value.toUpperCase()
@@ -1817,10 +1848,6 @@
         const nodes = [];
         const edges = [];
         const usedCoordinates = new Set();
-        const neighborOffsets = [
-            [1, 0], [-1, 0], [0, 1], [0, -1],
-            [1, 1], [1, -1], [-1, 1], [-1, -1]
-        ];
         let nodeIndex = 1;
         let edgeIndex = 1;
         getLegacyRouteSegments(rawData).forEach(segment => {
@@ -1828,17 +1855,12 @@
             segment.forEach(point => {
                 const node = pointToGraphNode(point, makeGraphNodeId(nodeIndex));
                 if (prevNode && node.x === prevNode.x && node.y === prevNode.y) return;
-                let coordinateKey = `${node.x},${node.y}`;
-                if (usedCoordinates.has(coordinateKey)) {
-                    const availableOffset = neighborOffsets.find(([dx, dy]) => !usedCoordinates.has(`${node.x + dx},${node.y + dy}`));
-                    if (!availableOffset) return;
-                    node.x += availableOffset[0];
-                    node.y += availableOffset[1];
-                    coordinateKey = `${node.x},${node.y}`;
-                }
+                const coordinate = reserveRouteCoordinate(node.x, node.y, usedCoordinates);
+                if (!coordinate) return;
+                node.x = coordinate.x;
+                node.y = coordinate.y;
                 nodeIndex++;
                 nodes.push(node);
-                usedCoordinates.add(coordinateKey);
                 if (prevNode) {
                     edges.push({ id: makeGraphEdgeId(edgeIndex++), from: prevNode.id, to: node.id });
                 }
@@ -1906,6 +1928,64 @@
             edges: [],
             special_marker_groups: []
         };
+    }
+
+    function collectSelectedJsonRoutes(routeManager) {
+        if (!routeManager || routeManager.singleVisibleMode) return [];
+        const routes = Array.isArray(routeManager.routes) ? routeManager.routes : [];
+        if (routes.some(route => route && route.isEditing)) return [];
+        const selectedIds = routeManager.selectedIds;
+        if (!(selectedIds instanceof Set)) return [];
+        const selectedRoutes = routes.filter(route => route && selectedIds.has(route.id));
+        if (selectedRoutes.length < 2 || selectedRoutes.some(route => route.type !== 'json')) return [];
+        return selectedRoutes;
+    }
+
+    function mergeRouteGraphs(routes, routeName) {
+        const merged = createEmptyRouteGraph(routeName);
+        const usedCoordinates = new Set();
+        const associatedMarkers = [];
+
+        (routes || []).forEach(route => {
+            const graph = normalizeRouteGraph(route.rawData, route.name);
+            const nodeIdMap = new Map();
+            graph.nodes.forEach(node => {
+                const coordinate = reserveRouteCoordinate(node.x, node.y, usedCoordinates);
+                if (!coordinate) return;
+                const nodeId = makeGraphNodeId(merged.nodes.length + 1);
+                nodeIdMap.set(node.id, nodeId);
+                merged.nodes.push({
+                    id: nodeId,
+                    x: coordinate.x,
+                    y: coordinate.y,
+                    z: normalizeRouteCoordinate(node.z)
+                });
+            });
+
+            graph.edges.forEach(edge => {
+                const from = nodeIdMap.get(edge.from);
+                const to = nodeIdMap.get(edge.to);
+                if (!from || !to) return;
+                merged.edges.push({
+                    id: makeGraphEdgeId(merged.edges.length + 1),
+                    from,
+                    to
+                });
+            });
+
+            graph.special_marker_groups.forEach(group => {
+                const nodeIds = group.node_ids.map(nodeId => nodeIdMap.get(nodeId)).filter(Boolean);
+                merged.special_marker_groups.push({
+                    id: createSpecialMarkerGroupId(merged),
+                    style: normalizeSpecialMarkerStyle(group.style),
+                    node_ids: nodeIds
+                });
+            });
+            associatedMarkers.push(...graph.associated_markers);
+        });
+
+        merged.associated_markers = normalizeRouteAssociatedMarkers({ associated_markers: associatedMarkers });
+        return merged;
     }
 
     function buildDirectedGraphChains(graph) {
@@ -2272,6 +2352,28 @@
         const pad = (n) => String(n).padStart(2, '0');
         const zipName = `routes_${stamp.getFullYear()}${pad(stamp.getMonth()+1)}${pad(stamp.getDate())}_${pad(stamp.getHours())}${pad(stamp.getMinutes())}${pad(stamp.getSeconds())}.zip`;
         await exportRoutesAsZip(routes, zipName);
+    };
+
+    STATE.routeManager.mergeSelected = function() {
+        const routes = collectSelectedJsonRoutes(this);
+        if (routes.length < 2 || !STATE.mainLayerGroup) return null;
+
+        const name = `${ROUTE_LIST_TEXT.mergedRoutePrefix}_${Date.now()}`;
+        const rawData = mergeRouteGraphs(routes, name);
+        const layer = L.layerGroup();
+        drawJsonOnLayer(layer, rawData);
+        STATE.mainLayerGroup.addLayer(layer);
+
+        const mergedRoute = {
+            id: `route-${Date.now()}-${Math.random()}`,
+            name,
+            type: 'json',
+            layer,
+            rawData,
+            visible: true
+        };
+        this.add(mergedRoute);
+        return mergedRoute;
     };
 
     STATE.routeManager.redraw = function() {
@@ -4046,11 +4148,12 @@
             const exportBtn = document.getElementById('sm-export-selected');
             const toggleBtn = document.getElementById('sm-toggle-visible');
             const clearBtn = document.getElementById('sm-clear-route');
+            const mergeBtn = document.getElementById('sm-merge-selected');
             const singleToggle = document.getElementById('sm-single-route-toggle');
             const prevBtn = document.getElementById('sm-prev-route');
             const nextBtn = document.getElementById('sm-next-route');
             const createBtn = document.getElementById('sm-create-route-btn');
-            if (!exportBtn && !toggleBtn && !clearBtn && !singleToggle && !prevBtn && !nextBtn && !createBtn) return;
+            if (!exportBtn && !toggleBtn && !clearBtn && !mergeBtn && !singleToggle && !prevBtn && !nextBtn && !createBtn) return;
 
             const total = STATE.routeManager.routes.length;
             const selected = STATE.routeManager.selectedIds || new Set();
@@ -4064,6 +4167,7 @@
             const n = selected.size;
             const targets = n ? STATE.routeManager.routes.filter(r => selected.has(r.id)) : STATE.routeManager.routes.slice();
             const targetCount = targets.length;
+            const mergeCandidates = collectSelectedJsonRoutes(STATE.routeManager);
 
             if (exportBtn) {
                 exportBtn.disabled = total === 0;
@@ -4084,6 +4188,14 @@
                 clearBtn.disabled = total === 0 || targetCount === 0;
                 clearBtn.style.opacity = (total === 0 || targetCount === 0) ? 0.5 : 1;
                 clearBtn.innerText = n ? `清空路线(${targetCount})` : `清空路线`;
+            }
+
+            if (mergeBtn) {
+                mergeBtn.disabled = mergeCandidates.length < 2;
+                mergeBtn.style.opacity = mergeCandidates.length < 2 ? 0.5 : 1;
+                mergeBtn.innerText = mergeCandidates.length
+                    ? `${ROUTE_LIST_TEXT.mergeSelected}(${mergeCandidates.length})`
+                    : ROUTE_LIST_TEXT.mergeSelected;
             }
 
             if (singleToggle) {
@@ -4137,7 +4249,7 @@
             const singleMode = !!STATE.routeManager.singleVisibleMode;
             const isSelected = STATE.routeManager.selectedIds && STATE.routeManager.selectedIds.has(r.id);
             const selChecked = singleMode ? !!r.visible : !!isSelected;
-            const selTitle = singleMode ? '仅显示单条路线模式下切换当前显示路线' : '勾选用于批量导出';
+            const selTitle = singleMode ? '仅显示单条路线模式下切换当前显示路线' : ROUTE_LIST_TEXT.selectionTitle;
             const selHtml = `<label class="sm-route-sel" title="${selTitle}"><input class="sel" type="checkbox" ${selChecked ? 'checked' : ''} ${r.isEditing ? 'disabled' : ''}></label>`;
 
             div.innerHTML = `
@@ -4792,7 +4904,7 @@
                         <button class="sm-btn" id="sm-prev-route" disabled>上一条路线</button>
                         <button class="sm-btn" id="sm-next-route" disabled>下一条路线</button>
                     </div>
-                    <div class="sm-section-title" style="margin-top:10px">已导入列表</div>
+                    <div class="sm-section-title" style="margin-top:10px"><span>已导入列表</span><button class="sm-btn" id="sm-merge-selected" style="margin-left:auto;flex:0 0 auto">${ROUTE_LIST_TEXT.mergeSelected}</button></div>
                     <div id="sm-route-list"></div>
                 </div>
                 <div class="sm-section">
@@ -5295,6 +5407,9 @@
         };
         $('#sm-export-selected').onclick = () => {
             STATE.routeManager.exportSelected().catch(err => alert(`批量导出失败：${toReason(err)}`));
+        };
+        $('#sm-merge-selected').onclick = () => {
+            STATE.routeManager.mergeSelected();
         };
 
         $('#sm-toggle-visible').onclick = () => {
