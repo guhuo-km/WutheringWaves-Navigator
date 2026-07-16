@@ -1,55 +1,60 @@
+import hashlib
 import json
+import subprocess
+import sys
 from pathlib import Path
-from zipfile import ZipFile
 
 import pytest
 
 from scripts.make_release import (
-    build_latest_metadata,
-    build_delete_entries,
     build_manifest,
     copy_changed_files,
-    create_portable_zip,
     main,
+    publish_updater_artifact,
     should_protect_path,
     write_dist_version_file,
 )
 
 
+def test_make_release_cli_entrypoint_starts_without_import_error():
+    script = Path(__file__).resolve().parents[1] / "scripts" / "make_release.py"
+
+    result = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Create WutheringWaves Navigator release artifacts" in result.stdout
+
+
 def test_should_protect_user_data_paths():
     assert should_protect_path("logs/app.log") is True
     assert should_protect_path(".update/staging/file.tmp") is True
-    assert should_protect_path("app_settings.json") is True
-    assert should_protect_path("ocr_config.json") is True
-    assert should_protect_path("language_config.json") is True
-    assert should_protect_path("calibration_data.json") is True
-    assert should_protect_path("maps.json") is True
+    assert should_protect_path("config/app_settings.json") is True
+    assert should_protect_path("config/ocr_config.json") is True
+    assert should_protect_path("config/language_config.json") is True
+    assert should_protect_path("config/calibration_data.json") is True
+    assert should_protect_path("config/maps.json") is True
     assert should_protect_path("recorded_routes/route.json") is True
     assert should_protect_path("tiles/a.tile") is True
     assert should_protect_path("images/map.png") is True
-    assert should_protect_path("src/app_settings.json") is True
-    assert should_protect_path("src/ocr_config.json") is True
-    assert should_protect_path("src/calibration_data.json") is True
-    assert should_protect_path("src/recorded_routes/route.json") is True
-    assert should_protect_path("src/tiles/a.tile") is True
-    assert should_protect_path("_internal/app_settings.json") is True
-    assert should_protect_path("_internal/ocr_config.json") is True
-    assert should_protect_path("_internal/calibration_data.json") is True
-    assert should_protect_path("_internal/recorded_routes/route.json") is True
-    assert should_protect_path("_internal/tiles/a.tile") is True
+    assert should_protect_path("downloads/route.json") is True
+    assert should_protect_path("debug/minimap/frame.png") is True
+    assert should_protect_path("cache/web_profile/Cookies") is True
 
 
-def test_should_manage_packaged_paths():
+def test_should_classify_packaged_paths():
     assert should_protect_path("WutheringWaves-Navigator-Smart.exe") is False
     assert should_protect_path("_internal/js/wuwa_map_optimizer.js") is False
+    assert should_protect_path("cache/minimap_tiles/906/tile.png") is True
+    assert should_protect_path("README.txt") is False
 
 
 def test_should_protect_running_updater_binary():
     assert should_protect_path("WutheringWaves-Updater.exe") is True
-
-
-def test_should_ignore_generated_readme():
-    assert should_protect_path("README.txt") is True
 
 
 def test_build_manifest_hashes_files(tmp_path):
@@ -73,6 +78,7 @@ def test_build_manifest_hashes_files(tmp_path):
     assert entries["WutheringWaves-Navigator-Smart.exe"]["managed"] is True
     assert entries["_internal/js/wuwa_map_optimizer.js"]["managed"] is True
     assert entries["logs/app.log"]["protected"] is True
+    assert entries["logs/app.log"]["url"] == ""
     assert len(entries["WutheringWaves-Navigator-Smart.exe"]["sha256"]) == 64
 
 
@@ -96,54 +102,13 @@ def test_build_manifest_uses_absolute_hash_pool_urls_for_managed_files(tmp_path)
     assert app_entry["url"] == (
         f"https://updates.example.com/wuwa-navigator/stable/files/{app_entry['sha256']}"
     )
-    assert readme_entry["managed"] is False
-    assert readme_entry["url"] == "https://updates.example.com/wuwa-navigator/stable/files/README.txt"
-
-
-def test_build_delete_entries_lists_removed_managed_files(tmp_path):
-    dist_root = tmp_path / "dist"
-    dist_root.mkdir()
-    (dist_root / "current.txt").write_text("new", encoding="utf-8")
-    manifest = build_manifest(
-        dist_root=dist_root,
-        app_id="wutheringwaves-navigator",
-        version="0.1.0",
-        channel="stable",
-        file_url_prefix="portable/files",
+    assert readme_entry["managed"] is True
+    assert readme_entry["url"] == (
+        f"https://updates.example.com/wuwa-navigator/stable/files/{readme_entry['sha256']}"
     )
-    previous_entries = {
-        "current.txt": {"path": "current.txt", "managed": True, "protected": False},
-        "_internal/PySide6/resources/qtwebengine_devtools_resources.debug.pak": {
-            "path": "_internal/PySide6/resources/qtwebengine_devtools_resources.debug.pak",
-            "managed": True,
-            "protected": False,
-        },
-    }
-
-    assert build_delete_entries(manifest, previous_entries) == [
-        "_internal/PySide6/resources/qtwebengine_devtools_resources.debug.pak"
-    ]
 
 
-def test_build_delete_entries_skips_removed_protected_files(tmp_path):
-    dist_root = tmp_path / "dist"
-    dist_root.mkdir()
-    manifest = build_manifest(
-        dist_root=dist_root,
-        app_id="wutheringwaves-navigator",
-        version="0.1.0",
-        channel="stable",
-        file_url_prefix="portable/files",
-    )
-    previous_entries = {
-        "ocr_config.json": {"path": "ocr_config.json", "managed": False, "protected": True},
-        "logs/app.log": {"path": "logs/app.log", "managed": False, "protected": True},
-    }
-
-    assert build_delete_entries(manifest, previous_entries) == []
-
-
-def test_copy_changed_files_populates_missing_hashes_even_when_previous_manifest_matches(tmp_path):
+def test_copy_changed_files_populates_hashes_without_previous_manifest(tmp_path):
     dist_root = tmp_path / "dist"
     files_root = tmp_path / "files"
     dist_root.mkdir()
@@ -157,14 +122,9 @@ def test_copy_changed_files_populates_missing_hashes_even_when_previous_manifest
         channel="stable",
         file_url_prefix="portable/files",
     )
-    previous_entries = {
-        "same.txt": {"sha256": next(e["sha256"] for e in manifest["files"] if e["path"] == "same.txt")},
-        "changed.txt": {"sha256": "0" * 64},
-    }
-
     same_digest = next(e["sha256"] for e in manifest["files"] if e["path"] == "same.txt")
     changed_digest = next(e["sha256"] for e in manifest["files"] if e["path"] == "changed.txt")
-    copied = copy_changed_files(dist_root, files_root, manifest, previous_entries)
+    copied = copy_changed_files(dist_root, files_root, manifest)
 
     assert copied == [changed_digest, same_digest]
     assert (files_root / same_digest).read_bytes() == b"same"
@@ -193,76 +153,46 @@ def test_copy_changed_files_populates_hash_pool_once(tmp_path):
     assert (files_root / digest).read_text(encoding="utf-8") == "same"
 
 
-def test_build_latest_metadata_uses_unified_windows_artifact():
-    latest = build_latest_metadata(
+def test_copy_changed_files_repairs_corrupt_existing_hash_object(tmp_path):
+    dist_root = tmp_path / "dist"
+    files_root = tmp_path / "files"
+    dist_root.mkdir()
+    (dist_root / "app.exe").write_bytes(b"correct")
+    manifest = build_manifest(
+        dist_root=dist_root,
         app_id="wutheringwaves-navigator",
+        version="1.2.3",
         channel="stable",
-        version="0.2.0",
-        update_base_url="https://updates.example.com/wuwa/stable/",
-        artifact_size=42,
-        installer_info=None,
+        file_url_prefix="https://updates.example.com/files",
+    )
+    digest = manifest["files"][0]["sha256"]
+    files_root.mkdir()
+    (files_root / digest).write_bytes(b"corrupt")
+
+    copied = copy_changed_files(dist_root, files_root, manifest)
+
+    assert copied == [digest]
+    assert (files_root / digest).read_bytes() == b"correct"
+
+
+def test_publish_updater_artifact_repairs_corrupt_existing_hash_object(tmp_path):
+    dist_root = tmp_path / "dist"
+    files_root = tmp_path / "files"
+    dist_root.mkdir()
+    updater = dist_root / "WutheringWaves-Updater.exe"
+    updater.write_bytes(b"correct-updater")
+    digest = hashlib.sha256(b"correct-updater").hexdigest()
+    files_root.mkdir()
+    (files_root / digest).write_bytes(b"corrupt")
+
+    info = publish_updater_artifact(
+        dist_root,
+        files_root,
+        "https://updates.example.com/files",
     )
 
-    assert "windows-x64" in latest["artifacts"]
-    assert "windows-x64-portable" not in latest["artifacts"]
-    assert latest["release_url"] == "https://updates.example.com/wuwa/stable/releases/0.2.0/release.json"
-    artifact = latest["artifacts"]["windows-x64"]
-    assert artifact["update_mode"] == "file"
-    assert artifact["manifest_url"] == "https://updates.example.com/wuwa/stable/releases/0.2.0/manifest.json"
-    assert artifact["size"] == 42
-    assert "full_zip_url" not in artifact
-    assert "full_zip_sha256" not in artifact
-
-
-def test_build_latest_metadata_preserves_installer_artifact():
-    installer_info = {
-        "version": "0.2.0",
-        "update_mode": "installer",
-        "installer_url": "https://updates.example.com/wuwa/stable/releases/0.2.0/installer/setup.exe",
-        "installer_sha256": "c" * 64,
-        "size": 123,
-    }
-
-    latest = build_latest_metadata(
-        app_id="wutheringwaves-navigator",
-        channel="stable",
-        version="0.2.0",
-        update_base_url="https://updates.example.com/wuwa/stable",
-        artifact_size=42,
-        installer_info=installer_info,
-    )
-
-    assert latest["artifacts"]["windows-x64-installer"] == installer_info
-
-
-def test_create_portable_zip_matches_manifest_relative_paths(tmp_path):
-    dist_root = tmp_path / "WutheringWaves-Navigator-Smart"
-    internal = dist_root / "_internal" / "js"
-    internal.mkdir(parents=True)
-    (dist_root / "WutheringWaves-Navigator-Smart.exe").write_bytes(b"exe")
-    (internal / "wuwa_map_optimizer.js").write_text("console.log('ok')", encoding="utf-8")
-
-    zip_path = tmp_path / "release" / "portable.zip"
-    create_portable_zip(dist_root, zip_path)
-
-    with ZipFile(zip_path) as archive:
-        names = set(archive.namelist())
-
-    assert "WutheringWaves-Navigator-Smart.exe" in names
-    assert "_internal/js/wuwa_map_optimizer.js" in names
-    assert "WutheringWaves-Navigator-Smart/WutheringWaves-Navigator-Smart.exe" not in names
-
-
-def test_build_latest_metadata_requires_update_base_url():
-    with pytest.raises(ValueError, match="update_base_url"):
-        build_latest_metadata(
-            app_id="wutheringwaves-navigator",
-            channel="stable",
-            version="0.2.0",
-            update_base_url="",
-            artifact_size=42,
-            installer_info=None,
-        )
+    assert info["sha256"] == digest
+    assert (files_root / digest).read_bytes() == b"correct-updater"
 
 
 def test_write_dist_version_file_injects_client_latest_url(tmp_path):
@@ -280,6 +210,7 @@ def test_write_dist_version_file_injects_client_latest_url(tmp_path):
         "https://updates.example.com/wuwa/stable/",
     )
 
+    assert version_path == dist_root / "_internal" / "version.json"
     packaged = json.loads(version_path.read_text(encoding="utf-8"))
     assert packaged["update_base_url"] == "https://updates.example.com/wuwa/stable/latest.json"
 
@@ -289,6 +220,7 @@ def test_make_release_uses_cli_update_base_url(tmp_path, monkeypatch):
     dist_root = project_root / "dist" / "WutheringWaves-Navigator-Smart"
     dist_root.mkdir(parents=True)
     (dist_root / "WutheringWaves-Navigator-Smart.exe").write_bytes(b"exe")
+    (dist_root / "WutheringWaves-Updater.exe").write_bytes(b"updater")
     (project_root / "version.json").write_text(
         json.dumps(
             {
@@ -320,10 +252,90 @@ def test_make_release_uses_cli_update_base_url(tmp_path, monkeypatch):
     assert main() == 0
 
     latest = json.loads((output_root / "stable" / "latest.json").read_text(encoding="utf-8"))
-    artifact = latest["artifacts"]["windows-x64"]
+    manifest = json.loads(
+        (output_root / "stable" / "releases" / "0.2.0" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["delete"] == []
+    artifact = latest["artifacts"]["windows-x64-v2"]
     assert artifact["manifest_url"] == "https://updates.example.com/wuwa/stable/releases/0.2.0/manifest.json"
-    packaged_version = json.loads((dist_root / "version.json").read_text(encoding="utf-8"))
+    assert artifact["updater_sha256"]
+    assert artifact["download_url"] == "https://www.wuwuddt.com/download"
+    assert "full_zip_url" not in artifact
+    assert "full_zip_sha256" not in artifact
+    first_artifact_size = artifact["size"]
+    assert first_artifact_size > 0
+    assert (output_root / "stable" / "files" / artifact["updater_sha256"]).read_bytes() == b"updater"
+    legacy_expected = {
+        "version": "0.2.0",
+        "update_mode": "full",
+        "download_url": "https://www.wuwuddt.com/download",
+        "installer_url": "https://www.wuwuddt.com/download",
+    }
+    for artifact_key in ("windows-x64", "windows-x64-portable", "windows-x64-installer"):
+        assert latest["artifacts"][artifact_key] == legacy_expected
+    assert not (output_root / "stable" / "releases" / "0.2.0" / "portable").exists()
+    packaged_version = json.loads((dist_root / "_internal" / "version.json").read_text(encoding="utf-8"))
     assert packaged_version["update_base_url"] == "https://updates.example.com/wuwa/stable/latest.json"
+
+    assert main() == 0
+    repeated_latest = json.loads(
+        (output_root / "stable" / "latest.json").read_text(encoding="utf-8")
+    )
+    assert repeated_latest["artifacts"]["windows-x64-v2"]["size"] == first_artifact_size
+
+
+def test_make_release_keeps_explicit_installer_file_but_legacy_keys_still_open_download_page(
+    tmp_path, monkeypatch
+):
+    project_root = tmp_path / "project"
+    dist_root = project_root / "dist" / "WutheringWaves-Navigator-Smart"
+    dist_root.mkdir(parents=True)
+    (dist_root / "WutheringWaves-Navigator-Smart.exe").write_bytes(b"exe")
+    (dist_root / "WutheringWaves-Updater.exe").write_bytes(b"updater")
+    installer_source = project_root / "setup.exe"
+    installer_source.write_bytes(b"installer")
+    (project_root / "version.json").write_text(
+        json.dumps(
+            {
+                "app_id": "wutheringwaves-navigator",
+                "version": "0.2.2",
+                "channel": "stable",
+                "update_base_url": "https://updates.example.com/wuwa/stable/latest.json",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output_root = tmp_path / "release"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "make_release.py",
+            "--project-root",
+            str(project_root),
+            "--dist-root",
+            str(dist_root),
+            "--output-root",
+            str(output_root),
+            "--installer",
+            str(installer_source),
+        ],
+    )
+
+    assert main() == 0
+
+    latest = json.loads((output_root / "stable" / "latest.json").read_text(encoding="utf-8"))
+    assert latest["artifacts"]["windows-x64-installer"] == {
+        "version": "0.2.2",
+        "update_mode": "full",
+        "download_url": "https://www.wuwuddt.com/download",
+        "installer_url": "https://www.wuwuddt.com/download",
+    }
+    assert (
+        output_root / "stable" / "releases" / "0.2.2" / "installer" / installer_source.name
+    ).read_bytes() == b"installer"
 
 
 def test_make_release_writes_release_notes_to_latest_and_release(tmp_path, monkeypatch):
@@ -331,6 +343,7 @@ def test_make_release_writes_release_notes_to_latest_and_release(tmp_path, monke
     dist_root = project_root / "dist" / "WutheringWaves-Navigator-Smart"
     dist_root.mkdir(parents=True)
     (dist_root / "WutheringWaves-Navigator-Smart.exe").write_bytes(b"exe")
+    (dist_root / "WutheringWaves-Updater.exe").write_bytes(b"updater")
     (project_root / "version.json").write_text(
         json.dumps(
             {

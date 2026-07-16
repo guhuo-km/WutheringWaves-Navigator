@@ -26,9 +26,10 @@ def test_smart_builder_injects_dist_update_url_without_changing_source(tmp_path)
 
     assert builder.inject_dist_version_info() is True
 
-    dist_version = json.loads((dist_root / "version.json").read_text(encoding="utf-8"))
+    dist_version = json.loads((dist_root / "_internal" / "version.json").read_text(encoding="utf-8"))
     source_after = json.loads(source_version.read_text(encoding="utf-8"))
     assert dist_version["update_base_url"] == "https://updates.example.com/wuwa/stable/latest.json"
+    assert not (dist_root / "version.json").exists()
     assert source_after["update_base_url"] == ""
 
 
@@ -42,12 +43,26 @@ def test_smart_builder_leaves_dist_version_when_update_url_unconfigured(tmp_path
 
 def test_smart_builder_prunes_known_large_unused_artifacts(tmp_path):
     dist_root = tmp_path / "dist" / "WutheringWaves-Navigator-Smart"
-    debug_pak = dist_root / "_internal" / "PySide6" / "resources" / "qtwebengine_devtools_resources.debug.pak"
+    resources = dist_root / "_internal" / "PySide6" / "resources"
+    debug_pak = resources / "qtwebengine_devtools_resources.debug.pak"
+    devtools_pak = resources / "qtwebengine_devtools_resources.pak"
+    debug_resources_pak = resources / "qtwebengine_resources.debug.pak"
+    debug_snapshot = resources / "v8_context_snapshot.debug.bin"
+    debug_100p = resources / "qtwebengine_resources_100p.debug.pak"
+    debug_200p = resources / "qtwebengine_resources_200p.debug.pak"
     ffmpeg_dll = dist_root / "_internal" / "cv2" / "opencv_videoio_ffmpeg4130_64.dll"
-    kept_pak = dist_root / "_internal" / "PySide6" / "resources" / "qtwebengine_resources.pak"
+    kept_pak = resources / "qtwebengine_resources.pak"
     debug_pak.parent.mkdir(parents=True)
     ffmpeg_dll.parent.mkdir(parents=True)
-    debug_pak.write_bytes(b"debug")
+    for path in (
+        debug_pak,
+        devtools_pak,
+        debug_resources_pak,
+        debug_snapshot,
+        debug_100p,
+        debug_200p,
+    ):
+        path.write_bytes(b"unused")
     ffmpeg_dll.write_bytes(b"ffmpeg")
     kept_pak.write_bytes(b"keep")
 
@@ -57,6 +72,11 @@ def test_smart_builder_prunes_known_large_unused_artifacts(tmp_path):
     assert builder.prune_packaged_artifacts() is True
 
     assert not debug_pak.exists()
+    assert not devtools_pak.exists()
+    assert not debug_resources_pak.exists()
+    assert not debug_snapshot.exists()
+    assert not debug_100p.exists()
+    assert not debug_200p.exists()
     assert not ffmpeg_dll.exists()
     assert kept_pak.exists()
 
@@ -89,6 +109,36 @@ def test_smart_builder_exports_clean_prebuilt_minimap_cache(tmp_path):
     assert not (target / "906" / "indexes" / "tile_index_state.json.tmp").exists()
     assert not (target / "906" / "indexes" / "minimap_index.sqlite3-wal").exists()
     assert not (target / "906" / "indexes" / "minimap_index.sqlite3-shm").exists()
+
+
+def test_smart_builder_uses_runtime_minimap_cache_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv("WUWA_PREBUILT_MINIMAP_CACHE", raising=False)
+    monkeypatch.setattr(SmartBuilder, "find_project_root", lambda self, project_path=None: tmp_path)
+
+    builder = SmartBuilder()
+
+    assert builder.prebuilt_minimap_cache == tmp_path / ".runtime" / "cache" / "minimap_tiles"
+
+
+def test_smart_builder_rejects_missing_default_minimap_cache(tmp_path):
+    builder = SmartBuilder.__new__(SmartBuilder)
+    builder.project_root = tmp_path
+    builder.prebuilt_minimap_cache = tmp_path / ".runtime" / "cache" / "minimap_tiles"
+
+    assert builder.export_prebuilt_minimap_cache() is False
+
+
+def test_smart_builder_rejects_cache_without_complete_indexes(tmp_path):
+    source = tmp_path / ".runtime" / "cache" / "minimap_tiles"
+    tile = source / "8" / "standard" / "default" / "base" / "1_2.png"
+    tile.parent.mkdir(parents=True)
+    tile.write_bytes(b"tile")
+
+    builder = SmartBuilder.__new__(SmartBuilder)
+    builder.project_root = tmp_path
+    builder.prebuilt_minimap_cache = source
+
+    assert builder.export_prebuilt_minimap_cache() is False
 
 
 def test_parse_build_args_fast_expands_development_shortcuts():
@@ -137,6 +187,37 @@ def test_no_clean_omits_pyinstaller_clean_flag(tmp_path):
 
     assert "--clean" not in args
     assert "--noconfirm" in args
+
+
+def test_main_build_avoids_collecting_unused_runtime_packages(tmp_path):
+    builder = SmartBuilder.__new__(SmartBuilder)
+    builder.project_root = tmp_path
+    builder.project_config = {
+        "name": "WutheringWaves-Navigator",
+        "main_script": "src/main_app.py",
+        "icon": "assets/ico.ico",
+        "data_dirs": [],
+        "data_files": [],
+    }
+    builder.include_local_maps = False
+    builder.include_images = False
+    builder.include_runtime_configs = False
+    builder.no_clean = True
+    builder.python_version = "312"
+    builder.should_include_group = lambda group: True
+    builder.resolve_data_dir = lambda candidates: None
+    builder.get_python_dll_path = lambda: None
+    builder.check_package_installed = lambda package: True
+
+    args = builder.build_pyinstaller_args()
+
+    assert not any(arg.startswith("--collect-all=") for arg in args)
+    assert "--exclude-module=torch" in args
+    assert "--exclude-module=torchvision" in args
+    assert "--exclude-module=qfluentwidgets.multimedia" in args
+    assert "--exclude-module=PySide6.QtMultimedia" in args
+    assert "--exclude-module=PySide6.QtMultimediaWidgets" in args
+    assert "--exclude-module=cv2.data" in args
 
 
 def test_runtime_language_config_is_not_packaged_as_default_user_setting(tmp_path):
@@ -213,3 +294,110 @@ def test_default_build_uses_canonical_static_resource_locations():
         "tiles": [".runtime/tiles"],
         "images": [".runtime/images"],
     }
+
+
+def test_clean_updater_build_declares_psutil_dependency():
+    builder = SmartBuilder(skip_deps=True, skip_updater=True)
+
+    assert any(
+        package.lower().startswith("psutil")
+        for package in builder.required_packages
+    )
+    for requirements_file in builder.project_config["requirements_files"]:
+        lines = (builder.project_root / requirements_file).read_text(
+            encoding="utf-8"
+        ).splitlines()
+        assert any(line.strip().lower().startswith("psutil") for line in lines), (
+            requirements_file
+        )
+
+
+def test_build_uses_single_pinned_directml_distribution_with_onnxruntime_import():
+    builder = SmartBuilder(skip_deps=True, skip_updater=True)
+
+    assert "onnxruntime-directml==1.24.4" in builder.required_packages
+    assert not any(package.startswith("onnxruntime>") for package in builder.required_packages)
+    assert builder.package_import_aliases["onnxruntime-directml"] == "onnxruntime"
+    for requirements_file in builder.project_config["requirements_files"]:
+        lines = (builder.project_root / requirements_file).read_text(encoding="utf-8").splitlines()
+        runtime_lines = [line.strip() for line in lines if line.strip().startswith("onnxruntime")]
+        assert runtime_lines == ["onnxruntime-directml==1.24.4"]
+
+
+def test_dependency_check_fails_when_directml_provider_is_unavailable(monkeypatch):
+    builder = SmartBuilder(skip_deps=True, skip_updater=True)
+    monkeypatch.setattr(
+        builder,
+        "_distribution_version",
+        lambda name: "1.24.4" if name == "onnxruntime-directml" else None,
+    )
+    fake_runtime = type(
+        "FakeRuntime",
+        (),
+        {"get_available_providers": staticmethod(lambda: ["CPUExecutionProvider"])},
+    )
+    monkeypatch.setattr(builder, "_import_onnxruntime", lambda: fake_runtime)
+
+    assert builder.verify_directml_runtime() is False
+
+
+def test_dependency_check_accepts_directml_provider(monkeypatch):
+    builder = SmartBuilder(skip_deps=True, skip_updater=True)
+    monkeypatch.setattr(
+        builder,
+        "_distribution_version",
+        lambda name: "1.24.4" if name == "onnxruntime-directml" else None,
+    )
+    fake_runtime = type(
+        "FakeRuntime",
+        (),
+        {"get_available_providers": staticmethod(lambda: ["DmlExecutionProvider"])},
+    )
+    monkeypatch.setattr(builder, "_import_onnxruntime", lambda: fake_runtime)
+
+    assert builder.verify_directml_runtime() is True
+
+
+def test_dependency_check_rejects_missing_directml_distribution(monkeypatch):
+    builder = SmartBuilder(skip_deps=True, skip_updater=True)
+    monkeypatch.setattr(builder, "_distribution_version", lambda _name: None)
+    monkeypatch.setattr(
+        builder,
+        "_import_onnxruntime",
+        lambda: (_ for _ in ()).throw(AssertionError("must fail before import")),
+    )
+
+    assert builder.verify_directml_runtime() is False
+
+
+def test_dependency_check_rejects_wrong_directml_distribution_version(monkeypatch):
+    builder = SmartBuilder(skip_deps=True, skip_updater=True)
+    monkeypatch.setattr(
+        builder,
+        "_distribution_version",
+        lambda name: "1.24.3" if name == "onnxruntime-directml" else None,
+    )
+
+    assert builder.verify_directml_runtime() is False
+
+
+def test_dependency_check_rejects_conflicting_plain_onnxruntime(monkeypatch):
+    builder = SmartBuilder(skip_deps=True, skip_updater=True)
+    versions = {
+        "onnxruntime-directml": "1.24.4",
+        "onnxruntime": "1.26.0",
+    }
+    monkeypatch.setattr(builder, "_distribution_version", versions.get)
+
+    assert builder.verify_directml_runtime() is False
+
+
+def test_directml_package_check_uses_distribution_not_shared_import(monkeypatch):
+    builder = SmartBuilder(skip_deps=True, skip_updater=True)
+    monkeypatch.setattr(builder, "_distribution_version", lambda _name: None)
+    monkeypatch.setattr(
+        "scripts.smart_build.importlib.util.find_spec",
+        lambda _name: object(),
+    )
+
+    assert builder.check_package_installed("onnxruntime-directml") is False

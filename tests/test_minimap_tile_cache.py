@@ -48,3 +48,28 @@ def test_tile_cache_records_downloaded_tile_size_by_key(tmp_path):
     assert cache.is_same_cached_tile(key, 4) is True
     path.write_bytes(b"abcde")
     assert cache.is_same_cached_tile(key, None) is False
+
+
+def test_tile_cache_reads_size_records_once_per_instance(monkeypatch, tmp_path):
+    cache = MinimapTileCache(tmp_path)
+    key = TileKey(area_id="906", layer_id="default", z_level=None, kind="standard", x=1, y=2)
+    path = cache.tile_path(key)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"abcd")
+    cache.size_record_path().write_text(
+        '{"906/standard/default/base/1_2.png": 4}',
+        encoding="utf-8",
+    )
+    original = cache._read_size_records
+    calls = 0
+
+    def counted_read():
+        nonlocal calls
+        calls += 1
+        return original()
+
+    monkeypatch.setattr(cache, "_read_size_records", counted_read)
+
+    assert cache.is_same_cached_tile(key, None) is True
+    assert cache.is_same_cached_tile(key, None) is True
+    assert calls == 1

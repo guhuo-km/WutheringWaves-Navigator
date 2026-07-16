@@ -85,5 +85,5 @@ def test_find_version_file_prefers_internal_version_for_packaged_app_root(tmp_pa
 def test_repository_version_defaults_are_pre_1_0_and_do_not_embed_update_url():
     info = load_version_info(Path(__file__).resolve().parents[1])
 
-    assert info.version == "0.1.6.21"
+    assert info.version == "0.1.6.23"
     assert info.update_base_url == ""

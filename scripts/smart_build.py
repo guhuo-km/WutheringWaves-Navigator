@@ -20,6 +20,8 @@ import platform
 import shutil
 import json
 import argparse
+import importlib
+import importlib.metadata
 import re
 from pathlib import Path
 import importlib.util
@@ -126,6 +128,7 @@ class SmartBuilder:
             'opencv-python': 'cv2',
             'Pillow': 'PIL',
             'pyinstaller': 'PyInstaller',
+            'onnxruntime-directml': 'onnxruntime',
             'PySide6-Fluent-Widgets': 'qfluentwidgets',
             'PySideSix-Frameless-Window': 'qframelesswindow'
         }
@@ -141,8 +144,9 @@ class SmartBuilder:
             'opencv-python>=4.8.0',
             'Pillow>=10.0.0',
             'numpy>=1.24.0',
-            'onnxruntime>=1.23.0',
-            'requests>=2.31.0'
+            'onnxruntime-directml==1.24.4',
+            'requests>=2.31.0',
+            'psutil>=5.9.0'
         ]
         
         # 查找项目根目录
@@ -150,6 +154,8 @@ class SmartBuilder:
         if not self.project_root:
             print("[ERROR] 无法找到项目根目录！")
             sys.exit(1)
+        if self.prebuilt_minimap_cache is None:
+            self.prebuilt_minimap_cache = self.project_root / ".runtime" / "cache" / "minimap_tiles"
 
     def find_project_root(self, specified_path=None):
         """智能查找项目根目录"""
@@ -345,9 +351,49 @@ class SmartBuilder:
     def check_package_installed(self, package_name):
         """检查包是否已安装"""
         clean_name = re.split(r'[<>=]', package_name, maxsplit=1)[0].strip()
+        if clean_name.lower() == 'onnxruntime-directml':
+            return self._distribution_version(clean_name) == '1.24.4'
         import_name = self.package_import_aliases.get(clean_name, clean_name.replace('-', '_'))
         spec = importlib.util.find_spec(import_name)
         return spec is not None
+
+    def _distribution_version(self, distribution_name):
+        try:
+            return importlib.metadata.version(distribution_name)
+        except importlib.metadata.PackageNotFoundError:
+            return None
+
+    def _import_onnxruntime(self):
+        return importlib.import_module('onnxruntime')
+
+    def verify_directml_runtime(self):
+        directml_version = self._distribution_version('onnxruntime-directml')
+        if directml_version != '1.24.4':
+            print(
+                "[ERROR] 需要onnxruntime-directml==1.24.4，"
+                f"当前版本: {directml_version or '未安装'}"
+            )
+            return False
+        plain_runtime_version = self._distribution_version('onnxruntime')
+        if plain_runtime_version is not None:
+            print(
+                "[ERROR] 检测到冲突的onnxruntime发行版: "
+                f"{plain_runtime_version}"
+            )
+            return False
+        try:
+            runtime = self._import_onnxruntime()
+            providers = list(runtime.get_available_providers())
+        except Exception as error:
+            print(f"[ERROR] 无法验证ONNX Runtime DirectML: {error}")
+            return False
+        if 'DmlExecutionProvider' not in providers:
+            print(
+                "[ERROR] ONNX Runtime未提供DmlExecutionProvider: "
+                f"{providers}"
+            )
+            return False
+        return True
 
     def select_requirements_file(self):
         """选择可用的requirements文件"""
@@ -416,8 +462,8 @@ class SmartBuilder:
                     return False
         else:
             print("[OK] 所有必需包已安装")
-        
-        return True
+
+        return self.verify_directml_runtime()
 
     def get_python_dll_path(self):
         """自动获取Python DLL路径"""
@@ -503,12 +549,6 @@ class SmartBuilder:
         if python_dll:
             args.append(f'--add-binary={python_dll}{os.pathsep}.')
         
-        # 收集依赖
-        collect_packages = ['onnxruntime', 'cv2', 'qfluentwidgets', 'qframelesswindow']
-        for package in collect_packages:
-            if self.check_package_installed(package):
-                args.append(f'--collect-all={package}')
-        
         # 隐式导入
         hidden_imports = [
             'PySide6.QtCore',
@@ -529,6 +569,12 @@ class SmartBuilder:
             'pandas',
             'scipy',
             'pytest',
+            'torch',
+            'torchvision',
+            'qfluentwidgets.multimedia',
+            'PySide6.QtMultimedia',
+            'PySide6.QtMultimediaWidgets',
+            'cv2.data',
         ]
         for module in excluded_modules:
             args.append(f'--exclude-module={module}')
@@ -568,7 +614,8 @@ class SmartBuilder:
             return True
 
         source_version = self.project_root / "version.json"
-        dist_version = self.project_root / "dist" / "WutheringWaves-Navigator-Smart" / "version.json"
+        dist_root = self.project_root / "dist" / "WutheringWaves-Navigator-Smart"
+        dist_version = dist_root / "_internal" / "version.json"
         if not source_version.exists():
             print("[ERROR] version.json 不存在，无法注入更新地址")
             return False
@@ -578,6 +625,7 @@ class SmartBuilder:
             version_info["update_base_url"] = f"{self.update_base_url}/latest.json"
             dist_version.parent.mkdir(parents=True, exist_ok=True)
             dist_version.write_text(json.dumps(version_info, ensure_ascii=False, indent=2), encoding="utf-8")
+            (dist_root / "version.json").unlink(missing_ok=True)
             print(f"[OK] 已注入更新地址到打包产物: {version_info['update_base_url']}")
             return True
         except Exception as e:
@@ -639,6 +687,11 @@ class SmartBuilder:
 
         prune_patterns = (
             "_internal/PySide6/resources/qtwebengine_devtools_resources.debug.pak",
+            "_internal/PySide6/resources/qtwebengine_devtools_resources.pak",
+            "_internal/PySide6/resources/qtwebengine_resources.debug.pak",
+            "_internal/PySide6/resources/v8_context_snapshot.debug.bin",
+            "_internal/PySide6/resources/qtwebengine_resources_100p.debug.pak",
+            "_internal/PySide6/resources/qtwebengine_resources_200p.debug.pak",
             "_internal/cv2/opencv_videoio_ffmpeg*_64.dll",
         )
         removed_count = 0
@@ -660,11 +713,35 @@ class SmartBuilder:
         """Copy a clean prebuilt minimap tile cache into the packaged app."""
         source_root = Path(self.prebuilt_minimap_cache) if self.prebuilt_minimap_cache else None
         if source_root is None:
-            print("[INFO] 未配置预置小地图瓦片缓存，跳过")
-            return True
+            print("[ERROR] 未配置预置小地图瓦片缓存")
+            return False
         if not source_root.exists() or not source_root.is_dir():
-            print(f"[WARN] 预置小地图瓦片缓存不存在，跳过: {source_root}")
-            return True
+            print(f"[ERROR] 预置小地图瓦片缓存不存在: {source_root}")
+            return False
+
+        tile_areas = {
+            path.relative_to(source_root).parts[0]
+            for path in source_root.rglob("*.png")
+            if path.relative_to(source_root).parts
+        }
+        if not tile_areas:
+            print(f"[ERROR] 预置小地图缓存中没有瓦片: {source_root}")
+            return False
+        for area_id in sorted(tile_areas):
+            index_root = source_root / area_id / "indexes"
+            required_files = (
+                index_root / "minimap_index.sqlite3",
+                index_root / "tile_index_state.json",
+            )
+            missing = [path for path in required_files if not path.is_file()]
+            if not any((index_root / "sift_tiles").glob("*.npz")):
+                missing.append(index_root / "sift_tiles" / "*.npz")
+            if missing:
+                print(
+                    f"[ERROR] 区域 {area_id} 的预置小地图索引不完整: "
+                    + ", ".join(str(path) for path in missing)
+                )
+                return False
 
         dist_root = self.project_root / "dist" / "WutheringWaves-Navigator-Smart"
         target_root = dist_root / "cache" / "minimap_tiles"

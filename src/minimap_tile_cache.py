@@ -10,6 +10,7 @@ from core.map_context import MapContext, TileKey
 class MinimapTileCache:
     def __init__(self, root: Path):
         self.root = Path(root)
+        self._size_records: dict[str, int] | None = None
 
     def tile_path(self, key: TileKey) -> Path:
         area, kind, layer, z_part, name = key.parts()
@@ -57,10 +58,15 @@ class MinimapTileCache:
         return records
 
     def get_recorded_tile_size(self, key: TileKey) -> int | None:
-        return self._read_size_records().get(self._tile_record_key(key))
+        return self._get_size_records().get(self._tile_record_key(key))
+
+    def _get_size_records(self) -> dict[str, int]:
+        if self._size_records is None:
+            self._size_records = self._read_size_records()
+        return self._size_records
 
     def record_tile_size(self, key: TileKey, size: int) -> None:
-        records = self._read_size_records()
+        records = self._get_size_records()
         records[self._tile_record_key(key)] = int(size)
         path = self.size_record_path()
         path.parent.mkdir(parents=True, exist_ok=True)

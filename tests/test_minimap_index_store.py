@@ -1,5 +1,6 @@
 from core.map_context import TileKey
 from minimap_index_store import MinimapIndexStore
+from minimap_tile_index_state import canonical_tile_key
 
 
 def _tile(x: int, y: int, *, area_id: str = "8", kind: str = "standard", layer_id: str = "default", z_level=None) -> TileKey:
@@ -63,3 +64,16 @@ def test_index_store_missing_status_is_empty(tmp_path):
     assert status.tile_present is False
     assert status.rough_ready is False
     assert status.sift_ready is False
+
+
+def test_index_store_reads_multiple_tile_statuses_in_one_batch(tmp_path):
+    ready = _tile(1, 1)
+    missing = _tile(2, 1)
+    store = MinimapIndexStore(tmp_path, "8")
+    store.record_tile_available(ready, png_path="ready.png", mtime_ns=1, size=2)
+
+    statuses = store.get_tile_statuses([ready, missing])
+
+    assert set(statuses) == {canonical_tile_key(ready), canonical_tile_key(missing)}
+    assert statuses[canonical_tile_key(ready)].tile_present is True
+    assert statuses[canonical_tile_key(missing)].tile_present is False

@@ -4,7 +4,7 @@
 Unicode true
 
 !define APP_NAME "呜呜大地图"
-!define APP_VERSION "0.1.6.21"
+!define APP_VERSION "0.1.6.23"
 !define APP_EXE "WutheringWaves-Navigator-Smart.exe"
 !define APP_PUBLISHER "B站UP主 uid:1876277780"
 !define APP_URL "https://space.bilibili.com/1876277780"
@@ -20,6 +20,27 @@ Unicode true
 
 Var KeepUserDataCheckbox
 Var KeepUserDataState
+Var MigrationSource
+Var MigrationTarget
+Var MigrationConflictTarget
+Var MigrationCandidate
+Var MigrationIndex
+Var ReplaceCheckSource
+Var ReplaceCheckTarget
+
+!macro MigrateLegacyFile SOURCE TARGET CONFLICT
+  StrCpy $MigrationSource "${SOURCE}"
+  StrCpy $MigrationTarget "${TARGET}"
+  StrCpy $MigrationConflictTarget "${CONFLICT}"
+  Call MigrateLegacyFile
+!macroend
+
+!macro MigrateLegacyDirectory SOURCE TARGET CONFLICT
+  StrCpy $MigrationSource "${SOURCE}"
+  StrCpy $MigrationTarget "${TARGET}"
+  StrCpy $MigrationConflictTarget "${CONFLICT}"
+  Call MigrateLegacyDirectory
+!macroend
 
 ; 应用程序信息
 Name "${APP_NAME}"
@@ -58,7 +79,7 @@ UninstPage custom un.KeepUserDataPage un.KeepUserDataPageLeave
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
 ; 版本信息
-VIProductVersion "0.1.6.21"
+VIProductVersion "0.1.6.23"
 VIAddVersionKey "ProductName" "${APP_NAME}"
 VIAddVersionKey "CompanyName" "${APP_PUBLISHER}"
 VIAddVersionKey "LegalCopyright" "Copyright (C) 2024 ${APP_PUBLISHER}. 免费开源软件"
@@ -76,8 +97,49 @@ Section "核心程序文件" SEC01
   
   SetOutPath "$INSTDIR"
   SetOverwrite on
+  StrCpy $ReplaceCheckSource "$INSTDIR\${APP_EXE}"
+  StrCpy $ReplaceCheckTarget "$INSTDIR\${APP_EXE}.install-check"
+  Call CheckReplaceablePath
+  StrCpy $ReplaceCheckSource "$INSTDIR\WutheringWaves-Updater.exe"
+  StrCpy $ReplaceCheckTarget "$INSTDIR\WutheringWaves-Updater.exe.install-check"
+  Call CheckReplaceablePath
+  StrCpy $ReplaceCheckSource "$INSTDIR\Uninstall.exe"
+  StrCpy $ReplaceCheckTarget "$INSTDIR\Uninstall.exe.install-check"
+  Call CheckReplaceablePath
+  StrCpy $ReplaceCheckSource "$INSTDIR\version.json"
+  StrCpy $ReplaceCheckTarget "$INSTDIR\version.json.install-check"
+  Call CheckReplaceablePath
+  StrCpy $ReplaceCheckSource "$INSTDIR\README.txt"
+  StrCpy $ReplaceCheckTarget "$INSTDIR\README.txt.install-check"
+  Call CheckReplaceablePath
+  StrCpy $ReplaceCheckSource "$INSTDIR\_internal"
+  StrCpy $ReplaceCheckTarget "$INSTDIR\_internal.install-check"
+  Call CheckReplaceablePath
+  StrCpy $ReplaceCheckSource "$INSTDIR\src"
+  StrCpy $ReplaceCheckTarget "$INSTDIR\src.install-check"
+  Call CheckReplaceablePath
+  StrCpy $ReplaceCheckSource "$INSTDIR\languages"
+  StrCpy $ReplaceCheckTarget "$INSTDIR\languages.install-check"
+  Call CheckReplaceablePath
+  StrCpy $ReplaceCheckSource "$INSTDIR\cache\minimap_tiles"
+  StrCpy $ReplaceCheckTarget "$INSTDIR\cache\minimap_tiles.install-check"
+  Call CheckReplaceablePath
+  Call MigrateLegacyUserData
   Delete "$INSTDIR\version.json"
+  Delete "$INSTDIR\README.txt"
+  RMDir /r "$INSTDIR\_internal"
+  RMDir /r "$INSTDIR\src"
+  RMDir /r "$INSTDIR\languages"
   RMDir /r "$INSTDIR\cache\minimap_tiles"
+  IfFileExists "$INSTDIR\_internal\*.*" program_cleanup_failed
+  IfFileExists "$INSTDIR\src\*.*" program_cleanup_failed
+  IfFileExists "$INSTDIR\languages\*.*" program_cleanup_failed
+  IfFileExists "$INSTDIR\cache\minimap_tiles\*.*" program_cleanup_failed
+  Goto program_cleanup_done
+  program_cleanup_failed:
+    MessageBox MB_ICONSTOP|MB_OK "旧版程序文件仍被占用，安装已停止。请完全退出软件后重试。"
+    Abort
+  program_cleanup_done:
   
   ; 主程序文件
   File /r "..\dist\WutheringWaves-Navigator-Smart\*.*"
@@ -161,6 +223,123 @@ Function .onInit
   done:
 FunctionEnd
 
+Function CheckReplaceablePath
+  IfFileExists "$ReplaceCheckSource" replace_check_start
+  IfFileExists "$ReplaceCheckSource\*.*" replace_check_start replace_check_done
+  replace_check_start:
+    IfFileExists "$ReplaceCheckTarget" replace_check_temp_exists
+    IfFileExists "$ReplaceCheckTarget\*.*" replace_check_temp_exists
+    ClearErrors
+    Rename "$ReplaceCheckSource" "$ReplaceCheckTarget"
+    IfErrors replace_check_failed
+    ClearErrors
+    Rename "$ReplaceCheckTarget" "$ReplaceCheckSource"
+    IfErrors replace_check_restore_failed
+    Goto replace_check_done
+  replace_check_temp_exists:
+    MessageBox MB_ICONSTOP|MB_OK "发现上次安装检查残留，安装已停止: $ReplaceCheckTarget"
+    Abort
+  replace_check_failed:
+    MessageBox MB_ICONSTOP|MB_OK "程序文件正在使用，安装已停止。请完全退出软件后重试: $ReplaceCheckSource"
+    Abort
+  replace_check_restore_failed:
+    MessageBox MB_ICONSTOP|MB_OK "安装检查无法恢复原路径，安装已停止: $ReplaceCheckSource"
+    Abort
+  replace_check_done:
+FunctionEnd
+
+Function ResolveMigrationCandidate
+  StrCpy $MigrationCandidate "$MigrationConflictTarget"
+  StrCpy $MigrationIndex 1
+  migration_candidate_loop:
+    IfFileExists "$MigrationCandidate" migration_candidate_taken
+    IfFileExists "$MigrationCandidate\*.*" migration_candidate_taken migration_candidate_done
+  migration_candidate_taken:
+    IntOp $MigrationIndex $MigrationIndex + 1
+    StrCpy $MigrationCandidate "$MigrationConflictTarget.$MigrationIndex"
+    Goto migration_candidate_loop
+  migration_candidate_done:
+    RMDir "$MigrationCandidate"
+FunctionEnd
+
+Function MigrateLegacyFile
+  IfFileExists "$MigrationSource" 0 migration_file_done
+  IfFileExists "$MigrationTarget" migration_file_conflict
+  ClearErrors
+  Rename "$MigrationSource" "$MigrationTarget"
+  IfErrors migration_file_failed
+  Goto migration_file_done
+  migration_file_conflict:
+    Call ResolveMigrationCandidate
+    ClearErrors
+    Rename "$MigrationSource" "$MigrationCandidate"
+    IfErrors migration_file_failed
+    Goto migration_file_done
+  migration_file_failed:
+    MessageBox MB_ICONSTOP|MB_OK "旧版用户数据迁移失败，安装已停止: $MigrationSource"
+    Abort
+  migration_file_done:
+FunctionEnd
+
+Function MigrateLegacyDirectory
+  IfFileExists "$MigrationSource\*.*" 0 migration_directory_done
+  IfFileExists "$MigrationTarget\*.*" migration_directory_conflict
+  RMDir "$MigrationTarget"
+  ClearErrors
+  Rename "$MigrationSource" "$MigrationTarget"
+  IfErrors migration_directory_failed
+  Goto migration_directory_done
+  migration_directory_conflict:
+    Call ResolveMigrationCandidate
+    ClearErrors
+    Rename "$MigrationSource" "$MigrationCandidate"
+    IfErrors migration_directory_failed
+    Goto migration_directory_done
+  migration_directory_failed:
+    MessageBox MB_ICONSTOP|MB_OK "旧版用户数据目录迁移失败，安装已停止: $MigrationSource"
+    Abort
+  migration_directory_done:
+FunctionEnd
+
+Function MigrateLegacyUserData
+  CreateDirectory "$INSTDIR\config"
+  CreateDirectory "$INSTDIR\config\legacy\root"
+  CreateDirectory "$INSTDIR\config\legacy\src"
+  CreateDirectory "$INSTDIR\config\legacy\internal"
+  CreateDirectory "$INSTDIR\logs\legacy\root"
+  CreateDirectory "$INSTDIR\logs\legacy\src"
+  CreateDirectory "$INSTDIR\logs\legacy\internal"
+
+  !insertmacro MigrateLegacyFile "$INSTDIR\app_settings.json" "$INSTDIR\config\app_settings.json" "$INSTDIR\config\legacy\root\app_settings.json"
+  !insertmacro MigrateLegacyFile "$INSTDIR\ocr_config.json" "$INSTDIR\config\ocr_config.json" "$INSTDIR\config\legacy\root\ocr_config.json"
+  !insertmacro MigrateLegacyFile "$INSTDIR\language_config.json" "$INSTDIR\config\language_config.json" "$INSTDIR\config\legacy\root\language_config.json"
+  !insertmacro MigrateLegacyFile "$INSTDIR\calibration_data.json" "$INSTDIR\config\calibration_data.json" "$INSTDIR\config\legacy\root\calibration_data.json"
+  !insertmacro MigrateLegacyFile "$INSTDIR\maps.json" "$INSTDIR\config\maps.json" "$INSTDIR\config\legacy\root\maps.json"
+
+  !insertmacro MigrateLegacyFile "$INSTDIR\src\app_settings.json" "$INSTDIR\config\app_settings.json" "$INSTDIR\config\legacy\src\app_settings.json"
+  !insertmacro MigrateLegacyFile "$INSTDIR\src\ocr_config.json" "$INSTDIR\config\ocr_config.json" "$INSTDIR\config\legacy\src\ocr_config.json"
+  !insertmacro MigrateLegacyFile "$INSTDIR\src\language_config.json" "$INSTDIR\config\language_config.json" "$INSTDIR\config\legacy\src\language_config.json"
+  !insertmacro MigrateLegacyFile "$INSTDIR\src\calibration_data.json" "$INSTDIR\config\calibration_data.json" "$INSTDIR\config\legacy\src\calibration_data.json"
+  !insertmacro MigrateLegacyFile "$INSTDIR\src\maps.json" "$INSTDIR\config\maps.json" "$INSTDIR\config\legacy\src\maps.json"
+
+  !insertmacro MigrateLegacyFile "$INSTDIR\_internal\app_settings.json" "$INSTDIR\config\app_settings.json" "$INSTDIR\config\legacy\internal\app_settings.json"
+  !insertmacro MigrateLegacyFile "$INSTDIR\_internal\ocr_config.json" "$INSTDIR\config\ocr_config.json" "$INSTDIR\config\legacy\internal\ocr_config.json"
+  !insertmacro MigrateLegacyFile "$INSTDIR\_internal\language_config.json" "$INSTDIR\config\language_config.json" "$INSTDIR\config\legacy\internal\language_config.json"
+  !insertmacro MigrateLegacyFile "$INSTDIR\_internal\calibration_data.json" "$INSTDIR\config\calibration_data.json" "$INSTDIR\config\legacy\internal\calibration_data.json"
+  !insertmacro MigrateLegacyFile "$INSTDIR\_internal\maps.json" "$INSTDIR\config\maps.json" "$INSTDIR\config\legacy\internal\maps.json"
+
+  !insertmacro MigrateLegacyFile "$INSTDIR\ocr_logs.json" "$INSTDIR\logs\ocr_logs.json" "$INSTDIR\logs\legacy\root\ocr_logs.json"
+  !insertmacro MigrateLegacyFile "$INSTDIR\src\ocr_logs.json" "$INSTDIR\logs\ocr_logs.json" "$INSTDIR\logs\legacy\src\ocr_logs.json"
+  !insertmacro MigrateLegacyFile "$INSTDIR\_internal\ocr_logs.json" "$INSTDIR\logs\ocr_logs.json" "$INSTDIR\logs\legacy\internal\ocr_logs.json"
+
+  !insertmacro MigrateLegacyDirectory "$INSTDIR\src\recorded_routes" "$INSTDIR\recorded_routes" "$INSTDIR\recorded_routes\legacy-src"
+  !insertmacro MigrateLegacyDirectory "$INSTDIR\src\tiles" "$INSTDIR\tiles" "$INSTDIR\tiles\legacy-src"
+  !insertmacro MigrateLegacyDirectory "$INSTDIR\src\images" "$INSTDIR\images" "$INSTDIR\images\legacy-src"
+  !insertmacro MigrateLegacyDirectory "$INSTDIR\_internal\recorded_routes" "$INSTDIR\recorded_routes" "$INSTDIR\recorded_routes\legacy-internal"
+  !insertmacro MigrateLegacyDirectory "$INSTDIR\_internal\tiles" "$INSTDIR\tiles" "$INSTDIR\tiles\legacy-internal"
+  !insertmacro MigrateLegacyDirectory "$INSTDIR\_internal\images" "$INSTDIR\images" "$INSTDIR\images\legacy-internal"
+FunctionEnd
+
 Function un.onInit
   StrCpy $KeepUserDataState ${BST_CHECKED}
 FunctionEnd
@@ -205,56 +384,23 @@ Section "Uninstall"
   Delete "$INSTDIR\Uninstall.exe"
 
   RMDir /r "$INSTDIR\languages"
-  RMDir /r "$INSTDIR\_internal\_polars_runtime_32"
-  RMDir /r "$INSTDIR\_internal\_tcl_data"
-  RMDir /r "$INSTDIR\_internal\_tk_data"
-  RMDir /r "$INSTDIR\_internal\assets"
-  RMDir /r "$INSTDIR\_internal\certifi"
-  RMDir /r "$INSTDIR\_internal\charset_normalizer"
-  RMDir /r "$INSTDIR\_internal\contourpy"
-  RMDir /r "$INSTDIR\_internal\cv2"
-  RMDir /r "$INSTDIR\_internal\dateutil"
-  RMDir /r "$INSTDIR\_internal\js"
-  RMDir /r "$INSTDIR\_internal\kiwisolver"
-  RMDir /r "$INSTDIR\_internal\lap"
-  RMDir /r "$INSTDIR\_internal\markupsafe"
-  RMDir /r "$INSTDIR\_internal\matplotlib"
-  RMDir /r "$INSTDIR\_internal\models"
-  RMDir /r "$INSTDIR\_internal\numpy"
-  RMDir /r "$INSTDIR\_internal\numpy.libs"
-  RMDir /r "$INSTDIR\_internal\pandas"
-  RMDir /r "$INSTDIR\_internal\pandas.libs"
-  RMDir /r "$INSTDIR\_internal\PIL"
-  RMDir /r "$INSTDIR\_internal\psutil"
-  RMDir /r "$INSTDIR\_internal\PySide6"
-  RMDir /r "$INSTDIR\_internal\qfluentwidgets"
-  RMDir /r "$INSTDIR\_internal\qframelesswindow"
-  RMDir /r "$INSTDIR\_internal\scipy"
-  RMDir /r "$INSTDIR\_internal\scipy.libs"
-  RMDir /r "$INSTDIR\_internal\setuptools"
-  RMDir /r "$INSTDIR\_internal\shiboken6"
-  RMDir /r "$INSTDIR\_internal\tcl8"
-  RMDir /r "$INSTDIR\_internal\templates"
-  RMDir /r "$INSTDIR\_internal\torch"
-  RMDir /r "$INSTDIR\_internal\torchvision"
-  RMDir /r "$INSTDIR\_internal\tzdata"
-  RMDir /r "$INSTDIR\_internal\ui"
-  RMDir /r "$INSTDIR\_internal\ultralytics"
-  RMDir /r "$INSTDIR\_internal\win32"
-  RMDir /r "$INSTDIR\_internal\win32com"
-  RMDir /r "$INSTDIR\_internal\yaml"
+  RMDir /r "$INSTDIR\src"
+  RMDir /r "$INSTDIR\_internal"
 
-  Delete "$INSTDIR\_internal\*.pyd"
-  Delete "$INSTDIR\_internal\*.dll"
-  Delete "$INSTDIR\_internal\*.py"
+  ; 小地图瓦片和索引属于程序管理缓存，不作为用户数据保留。
+  RMDir /r "$INSTDIR\cache\minimap_tiles"
 
   StrCmp $KeepUserDataState ${BST_CHECKED} keep_userdata
     RMDir /r "$APPDATA\${APP_NAME}"
+    RMDir /r "$INSTDIR\config"
     RMDir /r "$INSTDIR\logs"
     RMDir /r "$INSTDIR\.update"
     RMDir /r "$INSTDIR\recorded_routes"
     RMDir /r "$INSTDIR\tiles"
     RMDir /r "$INSTDIR\images"
+    RMDir /r "$INSTDIR\downloads"
+    RMDir /r "$INSTDIR\debug"
+    RMDir /r "$INSTDIR\cache"
     Delete "$INSTDIR\app_settings.json"
     Delete "$INSTDIR\ocr_config.json"
     Delete "$INSTDIR\language_config.json"
@@ -270,6 +416,5 @@ Section "Uninstall"
     Delete "$INSTDIR\_internal\maps.json"
   keep_userdata:
 
-  RMDir "$INSTDIR\_internal"
   RMDir "$INSTDIR"
 SectionEnd

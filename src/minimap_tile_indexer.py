@@ -41,6 +41,7 @@ class TileIndexEnqueueResult:
     queued: tuple[TileIndexWork, ...]
     stale_tile_keys: tuple[str, ...]
     pending_count: int
+    incomplete_tiles: tuple[TileKey, ...] = ()
 
     @property
     def queued_count(self) -> int:
@@ -179,21 +180,29 @@ class TileIndexQueue:
 
     def enqueue_missing_indexes_for_tiles(self, keys) -> TileIndexEnqueueResult:
         queued: list[TileIndexWork] = []
+        incomplete: list[TileKey] = []
+        keys_by_area: dict[str, list[TileKey]] = {}
         for key in keys:
             if not isinstance(key, TileKey):
                 continue
             path = resolve_tile_image_path(self.tile_root, key)
             if not path.exists():
                 continue
-            status = MinimapIndexStore(self.tile_root, key.area_id).get_tile_status(key)
-            if status.tile_present and status.rough_ready and status.sift_ready and not status.stale_reason:
-                continue
-            result = self.enqueue_changed_tile(key)
-            queued.extend(result.queued)
+            keys_by_area.setdefault(str(key.area_id), []).append(key)
+        for area_id, area_keys in keys_by_area.items():
+            statuses = MinimapIndexStore(self.tile_root, area_id).get_tile_statuses(area_keys)
+            for key in area_keys:
+                status = statuses[canonical_tile_key(key)]
+                if status.tile_present and status.rough_ready and status.sift_ready and not status.stale_reason:
+                    continue
+                incomplete.append(key)
+                result = self.enqueue_changed_tile(key)
+                queued.extend(result.queued)
         return TileIndexEnqueueResult(
             queued=tuple(queued),
             stale_tile_keys=(),
             pending_count=self.pending_count,
+            incomplete_tiles=tuple(incomplete),
         )
 
     def health_summary(self, area_id: str) -> dict[str, int]:

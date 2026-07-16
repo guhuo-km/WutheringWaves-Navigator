@@ -19,8 +19,8 @@ class UpdateResult:
     update_mode: str = "download"
     manifest_url: str = ""
     installer_url: str = ""
-    full_zip_url: str = ""
-    full_zip_sha256: str = ""
+    updater_url: str = ""
+    updater_sha256: str = ""
     artifact_size: int = 0
     error_message: str = ""
 
@@ -133,9 +133,9 @@ class HttpUpdateProvider:
             update_mode = "download"
         installer_url = str(artifact.get("installer_url") or "")
         manifest_url = str(artifact.get("manifest_url") or "")
-        full_zip_url = str(artifact.get("full_zip_url") or "")
-        full_zip_sha256 = str(artifact.get("full_zip_sha256") or "")
-        download_url = str(artifact.get("download_url") or "") or installer_url or full_zip_url
+        updater_url = str(artifact.get("updater_url") or "")
+        updater_sha256 = str(artifact.get("updater_sha256") or "")
+        download_url = str(artifact.get("download_url") or "") or installer_url
         artifact_size = int(artifact.get("size") or 0)
         if has_update and update_mode == "file" and not manifest_url:
             return UpdateResult(
@@ -148,10 +148,26 @@ class HttpUpdateProvider:
                 update_mode=update_mode,
                 manifest_url=manifest_url,
                 installer_url=installer_url,
-                full_zip_url=full_zip_url,
-                full_zip_sha256=full_zip_sha256,
                 artifact_size=artifact_size,
                 error_message="缺少文件更新清单地址",
+            )
+        if has_update and update_mode == "file" and (
+            not updater_url or len(updater_sha256) != 64
+        ):
+            return UpdateResult(
+                has_update=False,
+                current_version=current_version,
+                latest_version=latest_version,
+                release_notes=str(data.get("release_notes") or ""),
+                download_url=download_url,
+                checked_at=checked_at,
+                update_mode=update_mode,
+                manifest_url=manifest_url,
+                installer_url=installer_url,
+                updater_url=updater_url,
+                updater_sha256=updater_sha256,
+                artifact_size=artifact_size,
+                error_message="缺少可验证的更新器信息",
             )
         if has_update and update_mode in {"full", "download"} and not download_url:
             return UpdateResult(
@@ -164,8 +180,6 @@ class HttpUpdateProvider:
                 update_mode=update_mode,
                 manifest_url=manifest_url,
                 installer_url=installer_url,
-                full_zip_url=full_zip_url,
-                full_zip_sha256=full_zip_sha256,
                 artifact_size=artifact_size,
                 error_message="更新产物缺少下载地址",
             )
@@ -180,7 +194,7 @@ class HttpUpdateProvider:
             update_mode=update_mode,
             manifest_url=manifest_url,
             installer_url=installer_url,
-            full_zip_url=full_zip_url,
-            full_zip_sha256=full_zip_sha256,
+            updater_url=updater_url,
+            updater_sha256=updater_sha256,
             artifact_size=artifact_size,
         )

@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 from core.map_context import TileKey
-from minimap_index_store import MinimapIndexStore
+from minimap_index_store import MinimapIndexStore, MinimapIndexTileStatus
 from minimap_tile_cache import MinimapTileCache
 from minimap_tile_index_state import TileIndexStateStore, TileIndexStatus, canonical_tile_key
 from minimap_tile_indexer import TileIndexQueue
@@ -180,11 +180,47 @@ def test_enqueue_missing_indexes_for_tiles_only_checks_given_keys(tmp_path):
     result = queue.enqueue_missing_indexes_for_tiles([current])
 
     assert result.queued_count >= 2
+    assert result.incomplete_tiles == (current,)
     queued_tile_keys = {work.tile_keys[0] for work in result.queued if work.tile_keys}
     assert current in queued_tile_keys
     assert historical not in queued_tile_keys
     assert MinimapIndexStore(tmp_path, "8").get_tile_status(current).tile_present is True
     assert MinimapIndexStore(tmp_path, "8").get_tile_status(historical).exists is False
+
+
+def test_enqueue_missing_indexes_batches_status_queries_per_area(monkeypatch, tmp_path):
+    area8 = _tile(16, -13)
+    area906 = TileKey(area_id="906", layer_id="default", z_level=None, kind="standard", x=2, y=3)
+    _write_tile(tmp_path, area8)
+    _write_tile(tmp_path, area906)
+    created = []
+    queried = []
+
+    class FakeStore:
+        def __init__(self, tile_root, area_id):
+            created.append(str(area_id))
+
+        def get_tile_statuses(self, keys):
+            keys = list(keys)
+            queried.append([canonical_tile_key(key) for key in keys])
+            return {
+                canonical_tile_key(key): MinimapIndexTileStatus(
+                    tile_key=canonical_tile_key(key),
+                    tile_present=True,
+                    rough_ready=True,
+                    sift_ready=True,
+                )
+                for key in keys
+            }
+
+    monkeypatch.setattr("minimap_tile_indexer.MinimapIndexStore", FakeStore)
+    queue = TileIndexQueue(tmp_path, tile_size=32, max_workers=1, auto_start=False)
+
+    result = queue.enqueue_missing_indexes_for_tiles([area8, area906])
+
+    assert result.queued_count == 0
+    assert created == ["8", "906"]
+    assert len(queried) == 2
 
 
 def test_process_one_work_passes_color_image_to_sift(monkeypatch, tmp_path):

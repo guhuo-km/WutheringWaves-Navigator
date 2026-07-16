@@ -24,3 +24,13 @@ def test_main_app_uses_path_authority_after_bootstrap():
     assert "from core import paths" in source
     assert "os.path.dirname(os.path.abspath(__file__))" not in source
     assert "else repo_root" not in source
+
+
+def test_main_app_recovers_interrupted_updates_before_startup_maintenance():
+    project_root = Path(__file__).resolve().parents[1]
+    source = (project_root / "src" / "main_app.py").read_text(encoding="utf-8")
+
+    assert "recover_interrupted_updates(app_root)" in source
+    assert source.index("recover_interrupted_updates(app_root)") < source.index(
+        "run_startup_maintenance(app_root)"
+    )

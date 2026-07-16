@@ -1,10 +1,14 @@
 import hashlib
-from io import BytesIO
-from zipfile import ZipFile
+import inspect
+from pathlib import Path
 
 import pytest
 
-from src.core.update_downloader import UpdateDownloadError, stage_file_update
+from src.core.update_downloader import (
+    UpdateDownloadError,
+    prepare_updater_binary,
+    stage_file_update,
+)
 
 
 class FakeResponse:
@@ -32,35 +36,144 @@ class FakeSession:
         return self.responses.pop(0)
 
 
-def make_zip(files: dict[str, bytes]) -> bytes:
-    buffer = BytesIO()
-    with ZipFile(buffer, "w") as archive:
-        for name, data in files.items():
-            archive.writestr(name, data)
-    return buffer.getvalue()
-
-
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def test_stage_file_update_downloads_verifies_and_extracts(tmp_path):
-    manifest = b'{"schema":1,"app_id":"wutheringwaves-navigator","version":"0.2.0","channel":"stable","files":[],"delete":[]}'
-    zip_data = make_zip({"WutheringWaves-Navigator-Smart.exe": b"new"})
-    session = FakeSession([FakeResponse(manifest), FakeResponse(zip_data)])
+def test_prepare_updater_binary_skips_download_when_hash_matches(tmp_path):
+    updater = tmp_path / "WutheringWaves-Updater.exe"
+    updater.write_bytes(b"current")
+    session = FakeSession([])
 
-    staged = stage_file_update(
-        version="0.2.0",
-        manifest_url="https://updates.example.com/manifest.json",
-        full_zip_url="https://updates.example.com/full.zip",
-        full_zip_sha256=sha256(zip_data),
-        staging_base=tmp_path,
+    replaced = prepare_updater_binary(
+        updater_path=updater,
+        updater_url="https://updates.example.com/files/updater",
+        updater_sha256=sha256(b"current"),
+        staging_dir=tmp_path / ".update",
         session=session,
     )
 
-    assert staged.version == "0.2.0"
-    assert staged.manifest_path.read_bytes() == manifest
-    assert (staged.staging_root / "WutheringWaves-Navigator-Smart.exe").read_bytes() == b"new"
+    assert replaced is False
+    assert updater.read_bytes() == b"current"
+    assert session.urls == []
+
+
+def test_prepare_updater_binary_replaces_mismatched_updater(tmp_path):
+    updater = tmp_path / "WutheringWaves-Updater.exe"
+    updater.write_bytes(b"old")
+    session = FakeSession([FakeResponse(b"new-updater")])
+
+    replaced = prepare_updater_binary(
+        updater_path=updater,
+        updater_url="https://updates.example.com/files/updater",
+        updater_sha256=sha256(b"new-updater"),
+        staging_dir=tmp_path / ".update",
+        session=session,
+    )
+
+    assert replaced is True
+    assert updater.read_bytes() == b"new-updater"
+    assert not (tmp_path / ".update" / "WutheringWaves-Updater.new.exe").exists()
+    assert not (tmp_path / ".update" / "WutheringWaves-Updater.backup.exe").exists()
+
+
+def test_prepare_updater_binary_keeps_root_target_across_interrupted_replace(
+    tmp_path,
+    monkeypatch,
+):
+    class SimulatedPowerLoss(BaseException):
+        pass
+
+    updater = tmp_path / "WutheringWaves-Updater.exe"
+    updater.write_bytes(b"old")
+    session = FakeSession([FakeResponse(b"new-updater")])
+    original_replace = Path.replace
+
+    def replace_then_interrupt(self, target):
+        result = original_replace(self, target)
+        raise SimulatedPowerLoss
+
+    monkeypatch.setattr(Path, "replace", replace_then_interrupt)
+
+    with pytest.raises(SimulatedPowerLoss):
+        prepare_updater_binary(
+            updater_path=updater,
+            updater_url="https://updates.example.com/files/updater",
+            updater_sha256=sha256(b"new-updater"),
+            staging_dir=tmp_path / ".update",
+            session=session,
+        )
+
+    assert updater.exists()
+    assert updater.read_bytes() in {b"old", b"new-updater"}
+
+
+def test_prepare_updater_binary_preserves_old_file_when_download_hash_is_wrong(tmp_path):
+    updater = tmp_path / "WutheringWaves-Updater.exe"
+    updater.write_bytes(b"old")
+    session = FakeSession([FakeResponse(b"corrupt")])
+
+    with pytest.raises(UpdateDownloadError, match="updater hash mismatch"):
+        prepare_updater_binary(
+            updater_path=updater,
+            updater_url="https://updates.example.com/files/updater",
+            updater_sha256=sha256(b"expected"),
+            staging_dir=tmp_path / ".update",
+            session=session,
+        )
+
+    assert updater.read_bytes() == b"old"
+
+
+def test_prepare_updater_binary_ignores_orphaned_previous_backup(tmp_path):
+    updater = tmp_path / "WutheringWaves-Updater.exe"
+    staging_dir = tmp_path / ".update"
+    backup = staging_dir / "WutheringWaves-Updater.backup.exe"
+    updater.write_bytes(b"broken-current")
+    backup.parent.mkdir(parents=True)
+    backup.write_bytes(b"last-known-good")
+    session = FakeSession([FakeResponse(b"expected")])
+
+    replaced = prepare_updater_binary(
+        updater_path=updater,
+        updater_url="https://updates.example.com/files/updater",
+        updater_sha256=sha256(b"expected"),
+        staging_dir=staging_dir,
+        session=session,
+    )
+
+    assert replaced is True
+    assert updater.read_bytes() == b"expected"
+    assert backup.read_bytes() == b"last-known-good"
+    assert session.urls == [("https://updates.example.com/files/updater", 30, True)]
+
+
+def test_stage_file_update_accepts_only_manifest_staging_inputs():
+    parameters = inspect.signature(stage_file_update).parameters
+
+    assert "full_zip_url" not in parameters
+    assert "full_zip_sha256" not in parameters
+    assert parameters["app_root"].default is inspect.Parameter.empty
+
+
+def test_stage_file_update_does_not_delete_previous_rollback_data(tmp_path):
+    version = "0.2.0"
+    rollback_file = tmp_path / version / ".rollback" / "replaced" / "app.dll"
+    rollback_file.parent.mkdir(parents=True)
+    rollback_file.write_bytes(b"backup")
+    session = FakeSession([])
+
+    with pytest.raises(UpdateDownloadError, match="previous rollback data exists"):
+        stage_file_update(
+            version=version,
+            manifest_url="https://updates.example.com/manifest.json",
+            staging_base=tmp_path,
+            app_root=tmp_path / "app",
+            session=session,
+        )
+
+    assert rollback_file.read_bytes() == b"backup"
+    assert session.urls == []
 
 
 def test_stage_file_update_downloads_only_changed_manifest_files(tmp_path):
@@ -88,8 +201,6 @@ def test_stage_file_update_downloads_only_changed_manifest_files(tmp_path):
     staged = stage_file_update(
         version="0.2.0",
         manifest_url="https://updates.example.com/releases/0.2.0/manifest.json",
-        full_zip_url="https://updates.example.com/releases/0.2.0/full.zip",
-        full_zip_sha256=sha256(b"not-used"),
         staging_base=staging_base,
         app_root=app_root,
         session=session,
@@ -104,13 +215,45 @@ def test_stage_file_update_downloads_only_changed_manifest_files(tmp_path):
     ]
 
 
+def test_stage_file_update_rejects_invalid_manifest_before_file_download(tmp_path):
+    app_root = tmp_path / "app"
+    staging_base = tmp_path / "staging"
+    user_config = app_root / "config" / "app_settings.json"
+    user_config.parent.mkdir(parents=True)
+    user_config.write_bytes(b"user")
+    digest = sha256(b"remote")
+    manifest = (
+        b'{"schema":1,"app_id":"wutheringwaves-navigator","version":"0.2.0",'
+        b'"channel":"stable","files":['
+        b'{"path":"config/app_settings.json","size":6,"sha256":"'
+        + digest.encode()
+        + b'","url":"https://updates.example.com/files/config","managed":true,"protected":false}'
+        b'],"delete":[]}'
+    )
+    session = FakeSession([FakeResponse(manifest), FakeResponse(b"remote")])
+
+    with pytest.raises(ValueError, match="path classification"):
+        stage_file_update(
+            version="0.2.0",
+            manifest_url="https://updates.example.com/releases/0.2.0/manifest.json",
+            staging_base=staging_base,
+            app_root=app_root,
+            session=session,
+        )
+
+    assert session.urls == [
+        ("https://updates.example.com/releases/0.2.0/manifest.json", 30, True)
+    ]
+    assert user_config.read_bytes() == b"user"
+
+
 def test_stage_file_update_downloads_hash_pool_url_entries(tmp_path):
     app_root = tmp_path / "app"
     staging_base = tmp_path / "staging"
     app_root.mkdir()
     (app_root / "changed.txt").write_bytes(b"old")
     digest = sha256(b"new")
-    file_url = f"https://updates.example.com/stable/files/{digest}"
+    file_url = f"HTTPS://updates.example.com/stable/files/{digest}"
 
     manifest = (
         b'{'
@@ -129,7 +272,6 @@ def test_stage_file_update_downloads_hash_pool_url_entries(tmp_path):
     stage_file_update(
         version="0.2.0",
         manifest_url="https://updates.example.com/stable/releases/0.2.0/manifest.json",
-        full_zip_url="",
         staging_base=staging_base,
         app_root=app_root,
         session=session,
@@ -142,93 +284,29 @@ def test_stage_file_update_downloads_hash_pool_url_entries(tmp_path):
     ]
 
 
-def test_stage_file_update_rejects_missing_zip_hash(tmp_path):
-    manifest = b'{"schema":1,"app_id":"wutheringwaves-navigator","version":"0.2.0","channel":"stable","files":[],"delete":[]}'
-    zip_data = make_zip({"a.txt": b"new"})
-    session = FakeSession([FakeResponse(manifest), FakeResponse(zip_data)])
-
-    with pytest.raises(UpdateDownloadError, match="missing package hash"):
-        stage_file_update(
-            version="0.2.0",
-            manifest_url="https://updates.example.com/manifest.json",
-            full_zip_url="https://updates.example.com/full.zip",
-            staging_base=tmp_path,
-            session=session,
-        )
-
-    assert session.urls == []
-
-
-def test_stage_file_update_rejects_bad_zip_hash(tmp_path):
-    manifest = b'{"schema":1,"app_id":"wutheringwaves-navigator","version":"0.2.0","channel":"stable","files":[],"delete":[]}'
-    zip_data = make_zip({"a.txt": b"new"})
-    session = FakeSession([FakeResponse(manifest), FakeResponse(zip_data)])
-
-    with pytest.raises(UpdateDownloadError, match="hash mismatch"):
-        stage_file_update(
-            version="0.2.0",
-            manifest_url="https://updates.example.com/manifest.json",
-            full_zip_url="https://updates.example.com/full.zip",
-            full_zip_sha256="0" * 64,
-            staging_base=tmp_path,
-            session=session,
-        )
-
-
-def test_stage_file_update_rejects_unsafe_version_path_without_touching_outside(tmp_path):
+def test_stage_file_update_handles_old_directory_replaced_by_file(tmp_path):
+    app_root = tmp_path / "app"
     staging_base = tmp_path / "staging"
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    sentinel = outside / "keep.txt"
-    sentinel.write_text("do not delete", encoding="utf-8")
+    old_directory = app_root / "_internal" / "package"
+    old_directory.mkdir(parents=True)
+    (old_directory / "old.py").write_bytes(b"old")
+    digest = sha256(b"new-file")
+    manifest = (
+        b'{"schema":1,"app_id":"wutheringwaves-navigator","version":"0.2.0","channel":"stable","files":['
+        b'{"path":"_internal/package","size":8,"sha256":"'
+        + digest.encode()
+        + b'","url":"https://updates.example.com/files/'
+        + digest.encode()
+        + b'","managed":true,"protected":false}],"delete":[]}'
+    )
+    session = FakeSession([FakeResponse(manifest), FakeResponse(b"new-file")])
 
-    session = FakeSession([])
+    staged = stage_file_update(
+        version="0.2.0",
+        manifest_url="https://updates.example.com/releases/0.2.0/manifest.json",
+        staging_base=staging_base,
+        app_root=app_root,
+        session=session,
+    )
 
-    with pytest.raises(UpdateDownloadError, match="unsafe version path"):
-        stage_file_update(
-            version="../outside",
-            manifest_url="https://updates.example.com/manifest.json",
-            full_zip_url="https://updates.example.com/full.zip",
-            full_zip_sha256="a" * 64,
-            staging_base=staging_base,
-            session=session,
-        )
-
-    assert sentinel.read_text(encoding="utf-8") == "do not delete"
-    assert not (outside / "manifest.json").exists()
-    assert session.urls == []
-
-
-def test_stage_file_update_rejects_zip_path_traversal(tmp_path):
-    manifest = b'{"schema":1,"app_id":"wutheringwaves-navigator","version":"0.2.0","channel":"stable","files":[],"delete":[]}'
-    zip_data = make_zip({"../escape.txt": b"bad"})
-    session = FakeSession([FakeResponse(manifest), FakeResponse(zip_data)])
-
-    with pytest.raises(UpdateDownloadError, match="unsafe zip path"):
-        stage_file_update(
-            version="0.2.0",
-            manifest_url="https://updates.example.com/manifest.json",
-            full_zip_url="https://updates.example.com/full.zip",
-            full_zip_sha256=sha256(zip_data),
-            staging_base=tmp_path,
-            session=session,
-        )
-
-
-def test_stage_file_update_cleans_partial_extract_after_late_zip_path_traversal(tmp_path):
-    manifest = b'{"schema":1,"app_id":"wutheringwaves-navigator","version":"0.2.0","channel":"stable","files":[],"delete":[]}'
-    zip_data = make_zip({"safe.txt": b"partial", "../escape.txt": b"bad"})
-    session = FakeSession([FakeResponse(manifest), FakeResponse(zip_data)])
-
-    with pytest.raises(UpdateDownloadError, match="unsafe zip path"):
-        stage_file_update(
-            version="0.2.0",
-            manifest_url="https://updates.example.com/manifest.json",
-            full_zip_url="https://updates.example.com/full.zip",
-            full_zip_sha256=sha256(zip_data),
-            staging_base=tmp_path,
-            session=session,
-        )
-
-    assert not (tmp_path / "0.2.0" / "safe.txt").exists()
-    assert not (tmp_path / "0.2.0").exists()
+    assert (staged.staging_root / "_internal" / "package").read_bytes() == b"new-file"

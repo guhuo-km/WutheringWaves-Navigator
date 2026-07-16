@@ -215,7 +215,12 @@ def test_main_window_listens_for_tile_metadata_update_notifications():
 def test_main_window_logs_tile_snapshot_and_download_diagnostics():
     text = (PROJECT_ROOT / "src" / "ui" / "main_window.py").read_text(encoding="utf-8")
 
-    assert "小地图瓦片变更通知" in text
+    start = text.index("    def _on_tile_metadata_changed(self, updated_at: str):")
+    end = text.index("    def _refresh_minimap_tile_cache_from_notification", start)
+    notification_handler = text[start:end]
+
+    assert "append_system_log" not in notification_handler
+    assert "小地图瓦片变更通知" not in notification_handler
     assert "小地图瓦片快照" in text
     assert "standardTiles" in text
     assert "小地图瓦片下载检查" in text
@@ -228,8 +233,9 @@ def test_main_window_requeues_stale_sift_indexes_from_tile_snapshot():
     text = (PROJECT_ROOT / "src" / "ui" / "main_window.py").read_text(encoding="utf-8")
     service_text = (PROJECT_ROOT / "src" / "minimap_tile_sync_service.py").read_text(encoding="utf-8")
 
-    assert "def _enqueue_stale_sift_indexes(self, snapshot" in service_text
+    assert "def _enqueue_stale_sift_indexes(self, area_ids" in service_text
     assert "enqueue_stale_sift_tiles" in service_text
+    assert "self._reconciled_area_ids" in service_text
     assert "小地图SIFT过期索引修复队列" in text
 
 
@@ -237,8 +243,9 @@ def test_main_window_reconciles_missing_minimap_indexes_from_snapshot():
     text = (PROJECT_ROOT / "src" / "ui" / "main_window.py").read_text(encoding="utf-8")
     service_text = (PROJECT_ROOT / "src" / "minimap_tile_sync_service.py").read_text(encoding="utf-8")
 
-    assert "def _enqueue_missing_indexes(self, snapshot" in service_text
-    assert "enqueue_missing_indexes_for_area" in service_text
+    assert "def _enqueue_missing_indexes(" in service_text
+    assert "excluded_keys=downloaded_keys" in service_text
+    assert "enqueue_missing_indexes_for_tiles" in service_text
     assert "小地图索引补偿队列" in text
     assert "小地图索引状态" in text
     assert "health_summary" in text

@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
-from typing import Optional, List
-from PySide6.QtCore import Qt, Signal
+from typing import Any, Dict, Optional, List
+from PySide6.QtCore import Qt, Signal, QThread, QSignalBlocker
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout
 
 from qfluentwidgets import (
     ScrollArea, CardWidget, PushButton,
     BodyLabel, StrongBodyLabel, ComboBox, CheckBox, Slider, SpinBox,
-    RadioButton, FluentIcon as FIF, Theme, setTheme, isDarkTheme
+    RadioButton, SwitchButton, FluentIcon as FIF, Theme, setTheme, isDarkTheme
+)
+
+from core.gpu_adapters import (
+    GpuAdapter,
+    adapter_to_selection,
+    enumerate_gpu_adapters,
+    resolve_saved_adapter,
 )
 
 try:
@@ -22,16 +29,38 @@ except ImportError:
         return {"zh_CN": "简体中文", "en_US": "English"}
 
 
+class GpuAdapterDiscoveryWorker(QThread):
+    """Enumerates display adapters away from the Qt UI thread."""
+
+    adapters_discovered = Signal(list)
+    discovery_failed = Signal()
+
+    def run(self):
+        try:
+            self.adapters_discovered.emit(enumerate_gpu_adapters())
+        except Exception:
+            self.discovery_failed.emit()
+
+
 class SettingsInterface(ScrollArea):
 
     language_changed = Signal(str)
     theme_changed = Signal(str)  # 新增主题变化信号
     log_settings_changed = Signal(int, int)
     window_settings_changed = Signal(bool)
+    gpu_acceleration_changed = Signal(bool)
+    gpu_adapter_changed = Signal(dict)
 
     def __init__(self, app_state, parent=None):
         super().__init__(parent)
         self.app_state = app_state
+        self._gpu_config: Dict[str, Any] = {}
+        self._gpu_adapters: List[GpuAdapter] = []
+        self._gpu_discovery_worker: Optional[GpuAdapterDiscoveryWorker] = None
+        self._gpu_status = "disabled"
+        self._ocr_running = False
+        self._pending_default_gpu_selection: Optional[Dict[str, object]] = None
+        self._default_selection_persisting = False
         self.setObjectName("settingsInterface")
 
         # Set transparent background for consistent appearance
@@ -47,6 +76,7 @@ class SettingsInterface(ScrollArea):
 
         self._init_theme_card()  # 新增主题设置卡片
         self._init_language_card()
+        self._init_gpu_acceleration_card()
         self._init_window_card()
         self._init_log_card()
         self.retranslate_ui()
@@ -184,6 +214,210 @@ class SettingsInterface(ScrollArea):
 
         self._layout.addWidget(self.log_card)
 
+    def _init_gpu_acceleration_card(self):
+        self.gpu_acceleration_card = CardWidget(self)
+        card_layout = QVBoxLayout(self.gpu_acceleration_card)
+
+        self.gpu_acceleration_title_label = StrongBodyLabel()
+        card_layout.addWidget(self.gpu_acceleration_title_label)
+
+        enabled_row = QHBoxLayout()
+        self.gpu_acceleration_enabled_label = BodyLabel()
+        enabled_row.addWidget(self.gpu_acceleration_enabled_label)
+        self.gpu_acceleration_switch = SwitchButton()
+        self.gpu_acceleration_switch.checkedChanged.connect(
+            self._on_gpu_acceleration_toggled
+        )
+        enabled_row.addWidget(self.gpu_acceleration_switch)
+        enabled_row.addStretch()
+        card_layout.addLayout(enabled_row)
+
+        adapter_row = QHBoxLayout()
+        self.gpu_adapter_label = BodyLabel()
+        adapter_row.addWidget(self.gpu_adapter_label)
+        self.gpu_adapter_combo = ComboBox()
+        self.gpu_adapter_combo.setMinimumWidth(240)
+        self.gpu_adapter_combo.currentIndexChanged.connect(
+            self._on_gpu_adapter_changed
+        )
+        adapter_row.addWidget(self.gpu_adapter_combo)
+        adapter_row.addStretch()
+        card_layout.addLayout(adapter_row)
+
+        self.gpu_status_label = BodyLabel()
+        card_layout.addWidget(self.gpu_status_label)
+        self._layout.addWidget(self.gpu_acceleration_card)
+        self._refresh_gpu_presentation()
+
+    def set_gpu_configuration(self, config):
+        """Show the OCR manager's authoritative persisted GPU configuration."""
+        self._gpu_config = dict(config or {})
+        enabled = bool(self._gpu_config.get("gpu_acceleration_enabled", False))
+        blocker = QSignalBlocker(self.gpu_acceleration_switch)
+        self.gpu_acceleration_switch.setChecked(enabled)
+        del blocker
+
+        if not enabled:
+            self._pending_default_gpu_selection = None
+            self._gpu_status = "disabled"
+            self._clear_gpu_adapters()
+        elif self._gpu_adapters:
+            self._apply_discovered_gpu_adapters(self._gpu_adapters)
+        else:
+            self._start_gpu_discovery()
+        self._refresh_gpu_presentation()
+
+    def set_ocr_running(self, running: bool):
+        was_running = self._ocr_running
+        self._ocr_running = bool(running)
+        self._refresh_gpu_presentation()
+        if was_running and not self._ocr_running:
+            self._persist_deferred_default_gpu_selection()
+
+    def mark_gpu_unavailable(self):
+        self._gpu_status = "unavailable"
+        self._refresh_gpu_presentation()
+
+    def _on_gpu_acceleration_toggled(self, enabled: bool):
+        if self._ocr_running:
+            self.set_gpu_configuration(self._gpu_config)
+            return
+        self.gpu_acceleration_changed.emit(bool(enabled))
+
+    def _on_gpu_adapter_changed(self, index: int):
+        if self._ocr_running or index < 0:
+            return
+        adapter = self.gpu_adapter_combo.itemData(index)
+        if isinstance(adapter, GpuAdapter):
+            self.gpu_adapter_changed.emit(adapter_to_selection(adapter))
+
+    def _start_gpu_discovery(self):
+        if self._ocr_running or self._gpu_discovery_worker is not None:
+            return
+        self._gpu_status = "detecting"
+        self._refresh_gpu_presentation()
+        self._gpu_discovery_worker = GpuAdapterDiscoveryWorker(self)
+        self._gpu_discovery_worker.adapters_discovered.connect(
+            self._on_gpu_adapters_discovered
+        )
+        self._gpu_discovery_worker.discovery_failed.connect(
+            self._on_gpu_discovery_failed
+        )
+        self._gpu_discovery_worker.finished.connect(self._on_gpu_discovery_finished)
+        self._gpu_discovery_worker.start()
+
+    def _on_gpu_discovery_finished(self):
+        worker = self._gpu_discovery_worker
+        self._gpu_discovery_worker = None
+        if worker is not None:
+            worker.deleteLater()
+
+    def _on_gpu_discovery_failed(self):
+        if not self._gpu_config.get("gpu_acceleration_enabled", False):
+            self._gpu_status = "disabled"
+            self._clear_gpu_adapters()
+            self._refresh_gpu_presentation()
+            return
+        self.mark_gpu_unavailable()
+
+    def shutdown_gpu_discovery(self, timeout_ms: int = 1000) -> bool:
+        """Wait for discovery to end before the owning UI can be destroyed."""
+        worker = self._gpu_discovery_worker
+        if worker is None:
+            return True
+        if worker.isRunning() and not worker.wait(max(0, int(timeout_ms))):
+            if worker.isRunning():
+                return False
+        if worker.isRunning():
+            return False
+        if self._gpu_discovery_worker is worker:
+            self._gpu_discovery_worker = None
+            worker.deleteLater()
+        return True
+
+    def _on_gpu_adapters_discovered(self, adapters):
+        if not self._gpu_config.get("gpu_acceleration_enabled", False):
+            self._gpu_adapters = []
+            self._gpu_status = "disabled"
+            self._refresh_gpu_presentation()
+            return
+        self._gpu_adapters = list(adapters or [])
+        if not self._gpu_adapters:
+            self.mark_gpu_unavailable()
+            return
+        self._apply_discovered_gpu_adapters(self._gpu_adapters)
+
+    def _apply_discovered_gpu_adapters(self, adapters: List[GpuAdapter]):
+        saved_selection = self._gpu_config.get("gpu_adapter")
+        selected_adapter = None
+        blocker = QSignalBlocker(self.gpu_adapter_combo)
+        self.gpu_adapter_combo.clear()
+        for adapter in adapters:
+            self.gpu_adapter_combo.addItem(adapter.name, userData=adapter)
+        del blocker
+        if saved_selection:
+            try:
+                selected_adapter = resolve_saved_adapter(saved_selection, adapters)
+            except ValueError:
+                blocker = QSignalBlocker(self.gpu_adapter_combo)
+                self.gpu_adapter_combo.setCurrentIndex(-1)
+                del blocker
+                self.mark_gpu_unavailable()
+                return
+        else:
+            selected_adapter = adapters[0]
+
+        blocker = QSignalBlocker(self.gpu_adapter_combo)
+        self.gpu_adapter_combo.setCurrentIndex(adapters.index(selected_adapter))
+        del blocker
+
+        self._gpu_status = "ready"
+        self._refresh_gpu_presentation()
+        if not saved_selection:
+            selection = adapter_to_selection(selected_adapter)
+            if self._ocr_running:
+                self._pending_default_gpu_selection = selection
+            elif not self._default_selection_persisting:
+                self.gpu_adapter_changed.emit(selection)
+
+    def _persist_deferred_default_gpu_selection(self):
+        selection = self._pending_default_gpu_selection
+        self._pending_default_gpu_selection = None
+        if (
+            selection is None
+            or not self._gpu_config.get("gpu_acceleration_enabled", False)
+            or self._gpu_config.get("gpu_adapter")
+        ):
+            return
+        self._default_selection_persisting = True
+        try:
+            self.gpu_adapter_changed.emit(selection)
+        finally:
+            self._default_selection_persisting = False
+
+    def _clear_gpu_adapters(self):
+        self._gpu_adapters = []
+        blocker = QSignalBlocker(self.gpu_adapter_combo)
+        self.gpu_adapter_combo.clear()
+        del blocker
+
+    def _refresh_gpu_presentation(self):
+        enabled = bool(self._gpu_config.get("gpu_acceleration_enabled", False))
+        self.gpu_acceleration_switch.setEnabled(not self._ocr_running)
+        self.gpu_adapter_combo.setEnabled(
+            not self._ocr_running
+            and enabled
+            and self._gpu_status in ("ready", "unavailable")
+            and bool(self._gpu_adapters)
+        )
+        status_keys = {
+            "disabled": "settings_gpu_status_disabled",
+            "detecting": "settings_gpu_status_detecting",
+            "ready": "settings_gpu_status_ready",
+            "unavailable": "settings_gpu_status_unavailable",
+        }
+        self.gpu_status_label.setText(tr(status_keys[self._gpu_status]))
+
     def _init_window_card(self):
         from core.settings_manager import SettingsManager
         settings = SettingsManager()
@@ -224,6 +458,15 @@ class SettingsInterface(ScrollArea):
             tr("settings_interface_language", "界面语言:")
         )
 
+        self.gpu_acceleration_title_label.setText(
+            tr("settings_gpu_acceleration")
+        )
+        self.gpu_acceleration_enabled_label.setText(
+            tr("settings_gpu_acceleration_enabled")
+        )
+        self.gpu_adapter_label.setText(tr("settings_gpu_adapter"))
+        self._refresh_gpu_presentation()
+
         self.window_title_label.setText(tr("settings_window", "窗口设置"))
         self.remember_map_window_geometry_check.setText(
             tr("settings_remember_map_window_geometry", "记住地图窗口位置和大小")
@@ -248,6 +491,7 @@ class SettingsInterface(ScrollArea):
         checkbox_style = ThemeManager.get_check_box_style()
         self.theme_card.setStyleSheet(card_style)
         self.language_card.setStyleSheet(card_style)
+        self.gpu_acceleration_card.setStyleSheet(card_style)
         self.window_card.setStyleSheet(card_style)
         self.log_card.setStyleSheet(card_style)
         self.remember_map_window_geometry_check.setStyleSheet(checkbox_style)

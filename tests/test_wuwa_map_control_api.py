@@ -68,6 +68,19 @@ def test_userscript_dispatches_tile_metadata_event_on_page_global_scope():
     assert "window.dispatchEvent(new CustomEvent('wuwaTileMetadataChanged'" not in text
 
 
+def test_userscript_deduplicates_and_debounces_tile_metadata_notifications():
+    text = read_script()
+
+    assert "notificationTimer: null" in text
+    assert "function sameTileMetadata(previous, current)" in text
+    assert "if (previous && sameTileMetadata(previous, tile)) return true;" in text
+    assert "function scheduleTileMetadataChanged(updatedAt)" in text
+    assert "clearTimeout(STATE.tileMetadata.notificationTimer)" in text
+    assert "STATE.tileMetadata.notificationTimer = setTimeout" in text
+    assert "scheduleTileMetadataChanged(updatedAt);" in text
+    assert "notifyTileMetadataChanged(updatedAt);" not in text[text.index("function observeTileMetadataUrl") : text.index("function getTileMetadataSnapshot")]
+
+
 def test_userscript_does_not_patch_leaflet_tile_loading_lifecycle():
     text = read_script()
 

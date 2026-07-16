@@ -4,13 +4,20 @@
 """
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView
+    QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, QHeaderView,
+    QFileDialog
 )
 from PySide6.QtCore import Qt, Signal
 from qfluentwidgets import (
     BodyLabel, SubtitleLabel, PushButton, PrimaryPushButton, CardWidget,
-    StrongBodyLabel
+    StrongBodyLabel, LineEdit
 )
+
+from core.route_export_paths import (
+    ROUTE_EXPORT_DIRECTORY_KEY,
+    resolve_route_export_directory,
+)
+from core.settings_manager import SettingsManager
 
 try:
     from language_manager import tr
@@ -32,6 +39,7 @@ class RouteSettingsInterface(QWidget):
         super().__init__(parent)
         self.setObjectName('routeSettingsInterface')
         self.route_recorder = None  # 将由 MainWindow 设置
+        self._settings = SettingsManager()
         self._status_key = "route_loading"
         self._status_kwargs = {}
         self.setup_ui()
@@ -56,6 +64,25 @@ class RouteSettingsInterface(QWidget):
         self.record_tip_label = BodyLabel()
         self.record_tip_label.setStyleSheet("color: gray;")
         record_layout.addWidget(self.record_tip_label)
+
+        self.export_directory_label = BodyLabel()
+        record_layout.addWidget(self.export_directory_label)
+
+        export_directory_layout = QHBoxLayout()
+        self.export_directory_edit = LineEdit()
+        self.export_directory_edit.setReadOnly(True)
+        export_directory_layout.addWidget(self.export_directory_edit, 1)
+
+        self.choose_export_directory_btn = PushButton()
+        self.choose_export_directory_btn.clicked.connect(self._choose_export_directory)
+        export_directory_layout.addWidget(self.choose_export_directory_btn)
+
+        self.reset_export_directory_btn = PushButton()
+        self.reset_export_directory_btn.clicked.connect(self._reset_export_directory)
+        export_directory_layout.addWidget(self.reset_export_directory_btn)
+
+        record_layout.addLayout(export_directory_layout)
+        self._refresh_export_directory()
 
         layout.addWidget(record_card)
 
@@ -234,6 +261,26 @@ class RouteSettingsInterface(QWidget):
         except Exception as e:
             print(f"打开文件夹失败: {e}")
 
+    def _choose_export_directory(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            tr("route_export_directory_dialog_title", "选择默认路线导出文件夹"),
+            str(resolve_route_export_directory(self._settings)),
+        )
+        if not folder:
+            return
+        self._settings.set(ROUTE_EXPORT_DIRECTORY_KEY, folder)
+        self._refresh_export_directory()
+
+    def _reset_export_directory(self):
+        self._settings.delete(ROUTE_EXPORT_DIRECTORY_KEY)
+        self._refresh_export_directory()
+
+    def _refresh_export_directory(self):
+        self.export_directory_edit.setText(
+            str(resolve_route_export_directory(self._settings))
+        )
+
     def update_theme(self):
         """更新主题样式"""
         from core.theme_manager import ThemeManager
@@ -257,6 +304,15 @@ class RouteSettingsInterface(QWidget):
         )
         self.record_tip_label.setText(
             tr("route_record_tip", "提示: 在导航页面点击\"开始录制\"按钮开始录制路线")
+        )
+        self.export_directory_label.setText(
+            tr("route_export_directory", "默认路线导出文件夹")
+        )
+        self.choose_export_directory_btn.setText(
+            tr("route_export_directory_choose", "选择文件夹")
+        )
+        self.reset_export_directory_btn.setText(
+            tr("route_export_directory_reset", "恢复默认")
         )
         self.list_title_label.setText(tr("route_list_title", "路线列表"))
         self.routes_table.setHorizontalHeaderLabels([

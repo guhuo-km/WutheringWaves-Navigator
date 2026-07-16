@@ -9,10 +9,10 @@ import threading
 import time
 from pathlib import Path
 
-from core.file_updater import apply_staged_update
+from core.file_updater import apply_staged_update, recover_interrupted_updates
 from core.update_downloader import stage_file_update
 from core.update_lock import update_lock
-from core.update_manifest import ReleaseManifest
+from core.update_manifest import ReleaseManifest, validate_release_manifest
 
 STAGE_LABELS = {
     "waiting": "正在准备更新...",
@@ -30,33 +30,33 @@ def updater_stage_label(stage: str) -> str:
 
 
 def parse_update_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="WutheringWaves Navigator updater")
+    parser = argparse.ArgumentParser(
+        description="WutheringWaves Navigator updater",
+        allow_abbrev=False,
+    )
     parser.add_argument("--app-root", required=True)
     parser.add_argument("--main-exe", required=True)
     parser.add_argument("--wait-pid", type=int, default=0)
     parser.add_argument("--version")
     parser.add_argument("--manifest-url")
-    parser.add_argument("--full-zip-url", default="")
-    parser.add_argument("--full-zip-sha256", default="")
-    parser.add_argument("--staging-root")
-    parser.add_argument("--manifest")
     parser.add_argument("--timeout", type=int, default=30)
-    parser.add_argument("--no-restart", action="store_true")
     return parser.parse_args(argv)
 
 
 def wait_for_process_exit(pid: int, timeout_seconds: int) -> bool:
     if pid <= 0:
         return True
+    try:
+        import psutil
+    except Exception:
+        return False
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         try:
-            import psutil
-
             if not psutil.pid_exists(pid):
                 return True
         except Exception:
-            return True
+            return False
         time.sleep(0.5)
     return False
 
@@ -67,9 +67,19 @@ def _progress_percent(downloaded: int, total: int) -> int:
     return max(0, min(69, int(downloaded * 70 / total)))
 
 
-def _load_manifest(path: str | Path) -> ReleaseManifest:
+def _load_manifest(
+    path: str | Path,
+    expected_version: str | None = None,
+    required_managed_paths: set[str] | None = None,
+) -> ReleaseManifest:
     manifest_data = json.loads(Path(path).read_text(encoding="utf-8"))
-    return ReleaseManifest.from_dict(manifest_data)
+    manifest = ReleaseManifest.from_dict(manifest_data)
+    validate_release_manifest(
+        manifest,
+        expected_version=expected_version,
+        required_managed_paths=required_managed_paths or set(),
+    )
+    return manifest
 
 
 def run_update_flow(
@@ -78,38 +88,38 @@ def run_update_flow(
     stage_update=stage_file_update,
     apply_update=apply_staged_update,
     wait_for_exit=wait_for_process_exit,
+    recover_updates=recover_interrupted_updates,
 ) -> Path:
     app_root = Path(args.app_root)
     with update_lock(app_root):
         if not wait_for_exit(args.wait_pid, 30):
             raise RuntimeError("主程序仍在运行，更新已取消。")
+        recover_updates(app_root)
 
         progress_callback("download", 0)
-        if args.manifest and args.staging_root:
-            staged_root = Path(args.staging_root)
-            manifest_path = Path(args.manifest)
-        else:
-            if not args.version or not args.manifest_url:
-                raise RuntimeError("更新参数不完整。")
+        if not args.version or not args.manifest_url:
+            raise RuntimeError("更新参数不完整。")
 
-            def on_download_progress(downloaded: int, total: int):
-                progress_callback("download", _progress_percent(downloaded, total))
+        def on_download_progress(downloaded: int, total: int):
+            progress_callback("download", _progress_percent(downloaded, total))
 
-            staged = stage_update(
-                version=args.version,
-                manifest_url=args.manifest_url,
-                full_zip_url=args.full_zip_url,
-                full_zip_sha256=args.full_zip_sha256 or None,
-                staging_base=app_root / ".update" / "staging",
-                app_root=app_root,
-                timeout=args.timeout,
-                progress_callback=on_download_progress,
-            )
-            staged_root = Path(staged.staging_root)
-            manifest_path = Path(staged.manifest_path)
+        staged = stage_update(
+            version=args.version,
+            manifest_url=args.manifest_url,
+            staging_base=app_root / ".update" / "staging",
+            app_root=app_root,
+            timeout=args.timeout,
+            progress_callback=on_download_progress,
+        )
+        staged_root = Path(staged.staging_root)
+        manifest_path = Path(staged.manifest_path)
 
         progress_callback("verify", 70)
-        manifest = _load_manifest(manifest_path)
+        manifest = _load_manifest(
+            manifest_path,
+            expected_version=args.version,
+            required_managed_paths={args.main_exe, "_internal/version.json"},
+        )
         progress_callback("apply", 75)
         apply_update(app_root, staged_root, manifest)
         progress_callback("complete", 100)
@@ -127,6 +137,7 @@ class UpdaterWindow:
         self.root.title("正在更新呜呜大地图")
         self.root.resizable(False, False)
         self.root.geometry("460x190")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_requested)
 
         self.title_var = tk.StringVar(value="正在更新呜呜大地图")
         self.stage_var = tk.StringVar(value=updater_stage_label("waiting"))
@@ -159,6 +170,13 @@ class UpdaterWindow:
 
         self.main_exe_path: Path | None = None
         self._closing_after_failure = False
+        self._update_running = True
+        self._result_code = 0
+
+    def _on_close_requested(self):
+        if self._update_running:
+            return
+        self.root.destroy()
 
     def _on_progress(self, stage: str, percent: int):
         self.stage_var.set(updater_stage_label(stage))
@@ -167,7 +185,9 @@ class UpdaterWindow:
             self.cancel_button.state(["disabled"])
 
     def _on_finished(self, ok: bool, message: str):
+        self._update_running = False
         if ok:
+            self._result_code = 0
             self.stage_var.set("更新完成")
             self.detail_var.set("新版本已应用完成。")
             self.progress_var.set(100)
@@ -175,6 +195,7 @@ class UpdaterWindow:
             self.later_button.pack(side="right")
             self.start_button.pack(side="right", padx=(0, 8))
             return
+        self._result_code = 1
         self.stage_var.set("更新失败")
         self.detail_var.set(message or "更新失败，请稍后重试。")
         self.cancel_button.configure(text="关闭")
@@ -196,9 +217,9 @@ class UpdaterWindow:
             except Exception as exc:
                 self.root.after(0, self._on_finished, False, str(exc))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=False).start()
         self.root.mainloop()
-        return 0
+        return self._result_code
 
 
 def main() -> int:

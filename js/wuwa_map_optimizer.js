@@ -51,21 +51,29 @@
         return val === null ? def : val === 'true';
     };
 
+    const getRouteMarkerDisplayMode = () => {
+        const value = localStorage.getItem('KMP_ROUTE_MARKER_DISPLAY_MODE');
+        return ['none', 'highlight', 'focus'].includes(value) ? value : 'highlight';
+    };
+
     const STATE = {
         mapInstance: null,
         mainLayerGroup: null,
         highlightLayer: null,
+        routeMarkerHighlightLayer: null,
         smartMarkHistory: [],
         routeManager: {
             routes: [],
             selectedIds: new Set(),
             singleVisibleMode: false,
             activeRouteIndex: -1,
+            markerDisplayMode: getRouteMarkerDisplayMode(),
             add: null,
             remove: null,
             toggleVisible: null,
             redraw: null,
             // 新增编辑相关方法
+            createNewRoute: null,
             startEdit: null,
             cancelEdit: null,
             saveEdit: null,
@@ -90,10 +98,12 @@
         fpIdIndex: new Map(),
         markerFocus: {
             active: false,
+            owner: null,
             keepKeys: new Set(), // `${typeId}::${id}`
             restoreOpacity: new Map(), // key -> opacity number (restore on exit)
             _applyTimer: null,
             _restoreTimer: null,
+            _pendingRestoreEntries: null,
             _mapStoreUnsub: null,
             _busy: false,
             _lastLog: ''
@@ -114,7 +124,8 @@
             currentAreaId: '',
             updatedAt: 0,
             changed: false,
-            resourceObserverInstalled: false
+            resourceObserverInstalled: false,
+            notificationTimer: null
         },
         currentDetail: null,
         pageState: new Map(),
@@ -163,7 +174,7 @@
             zMin: -100, zRange: 400,
             SCALE: 0.01204705882352941,
             OFFSET: 1024,
-            defaultWeight: 4, defaultSize: 1.2, defaultGap: 500
+            defaultWeight: 4, defaultSize: 1.2, defaultGap: 150
         },
         canvas: { offsetY: 25 },
         api: { base: 'https://api.wuwuddt.com' }
@@ -180,9 +191,58 @@
     const KMP_ARROW_PANE_Z_INDEX = 650;
     const KMP_EDIT_LINE_PANE_Z_INDEX = 660;
     const KMP_EDIT_MARKER_PANE_Z_INDEX = 670;
-    const NODE_LABEL_STYLE_OPTIONS = ['none', 'badge', 'dot', 'alpha'];
-    const NODE_MARKER_STYLE_OPTIONS = ['none', 'diamond', 'star', 'triangle'];
-    const NODE_COLOR_OPTIONS = ['#dcb268', '#f06292', '#64b5f6', '#81c784', '#ffb74d', '#ba68c8', '#4dd0e1', '#e57373'];
+    const KMP_EDIT_DECORATION_PANE_Z_INDEX = 680;
+    const SPECIAL_MARKER_SHAPES = [
+        'circle', 'square', 'rounded-square', 'diamond', 'triangle-up', 'triangle-down',
+        'pentagon', 'hexagon', 'octagon', 'star', 'ellipse', 'capsule'
+    ];
+    const DEFAULT_SPECIAL_MARKER_STYLE = {
+        shape: 'diamond',
+        fill_color: '#E06474',
+        number: {
+            font_size: 24,
+            color: '#FFFFFF',
+            outline: { enabled: true, width: 2, color: '#111111' }
+        }
+    };
+    const SPECIAL_MARKER_GROUP_TEXT = {
+        toolbar: '设置分组',
+        sidebarTitle: '特殊标记分组',
+        createGroup: '新建分组',
+        emptyGroups: '暂无分组',
+        groupLabel: '分组',
+        members: '成员',
+        emptyMembers: '暂无成员',
+        addNode: '添加节点',
+        stopAdding: '停止添加',
+        editStyle: '编辑样式',
+        deleteGroup: '删除组',
+        moveUp: '上移',
+        moveDown: '下移',
+        removeMember: '移除',
+        styleSummary: '当前组样式',
+        noSelection: '选择一个分组查看样式',
+        createTitle: '新建特殊标记分组',
+        editTitle: '编辑特殊标记样式',
+        shape: '形状',
+        fillColor: '填充颜色',
+        numberColor: '数字颜色',
+        numberSize: '数字字号',
+        outlineEnabled: '启用数字描边',
+        outlineWidth: '描边粗细',
+        outlineColor: '描边颜色',
+        preview: '预览',
+        hue: '色相',
+        hex: 'Hex',
+        cancel: '取消',
+        create: '创建',
+        done: '完成',
+        shapeLabels: {
+            circle: '圆形', square: '正方形', 'rounded-square': '圆角正方形', diamond: '菱形',
+            'triangle-up': '上三角', 'triangle-down': '下三角', pentagon: '五边形', hexagon: '六边形',
+            octagon: '八边形', star: '五角星', ellipse: '椭圆', capsule: '胶囊形'
+        }
+    };
 
     const JSZIP_CDN = 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
     const JSZIP_LOCAL_URLS = [
@@ -563,6 +623,25 @@
         } catch (e) {}
     }
 
+    function scheduleTileMetadataChanged(updatedAt) {
+        if (STATE.tileMetadata.notificationTimer) {
+            clearTimeout(STATE.tileMetadata.notificationTimer);
+        }
+        STATE.tileMetadata.notificationTimer = setTimeout(() => {
+            STATE.tileMetadata.notificationTimer = null;
+            notifyTileMetadataChanged(updatedAt);
+        }, 150);
+    }
+
+    function sameTileMetadata(previous, current) {
+        if (!previous || !current) return false;
+        return [
+            'type', 'regionId', 'layerId', 'zLevel', 'x', 'y', 'url',
+            'tileBaseUrl', 'ossParams', 'tileWidth',
+            'leafletTileX', 'leafletTileY', 'leafletTileZ'
+        ].every(field => previous[field] === current[field]);
+    }
+
     function attachLeafletTileCoords(tile, coords) {
         if (!coords || typeof coords !== 'object') return tile;
         const leafletTileX = Number(coords.x);
@@ -583,7 +662,10 @@
 
         const updatedAt = Date.now();
         const tile = attachLeafletTileCoords(Object.assign({}, parsed, { updatedAt }), coords);
-        store.set(tileMetadataKey(tile), tile);
+        const key = tileMetadataKey(tile);
+        const previous = store.get(key);
+        if (previous && sameTileMetadata(previous, tile)) return true;
+        store.set(key, tile);
 
         STATE.tileMetadata.currentAreaId = String(tile.regionId || STATE.tileMetadata.currentAreaId || '');
         STATE.tileMetadata.tileBaseUrl = tile.tileBaseUrl || STATE.tileMetadata.tileBaseUrl;
@@ -591,7 +673,7 @@
         STATE.tileMetadata.tileWidth = tile.tileWidth || 1024;
         STATE.tileMetadata.updatedAt = updatedAt;
         STATE.tileMetadata.changed = true;
-        notifyTileMetadataChanged(updatedAt);
+        scheduleTileMetadataChanged(updatedAt);
         return true;
     }
 
@@ -1129,6 +1211,9 @@
         .sm-route-mode-row .sm-switch.is-off .sm-slider:before { transform: translateX(0) !important; }
         .sm-route-mode-row .sm-switch.is-on .sm-slider { background-color: var(--sm-gold) !important; }
         .sm-route-mode-row .sm-switch.is-on .sm-slider:before { transform: translateX(16px) !important; }
+        .sm-route-marker-mode { margin-top: 8px; }
+        .sm-route-marker-mode .sm-seg { display: flex; width: 100%; margin-top: 5px; border-radius: 5px; }
+        .sm-route-marker-mode .sm-seg-btn { flex: 1; padding-left: 4px; padding-right: 4px; }
         .sm-route-nav { display: flex; gap: 5px; margin-top: 6px; }
         .sm-route-nav .sm-btn { flex: 1; }
         .sm-btn:disabled {
@@ -1361,6 +1446,18 @@
             box-shadow: 0 0 0 5px rgba(130,217,130,0.32), 0 0 16px rgba(130,217,130,0.9);
             transform: scale(1.45);
         }
+        .kmp-edit-node-coordinate {
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 50%;
+            transform: translateX(-50%);
+            color: #fff;
+            font-size: 11px;
+            line-height: 1;
+            white-space: nowrap;
+            text-shadow: 0 1px 3px #000;
+            pointer-events: none;
+        }
 
         path.kmp-selected-edge {
             stroke-opacity: 0.9 !important;
@@ -1447,6 +1544,18 @@
             color: #f7e5be;
             text-align: center;
         }
+        #kmp-graph-edit-toolbar .kmp-toolbar-commit-group {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            margin-left: 4px;
+            padding: 4px 5px 4px 12px;
+            border-left: 2px solid rgba(220,178,104,0.65);
+            border-radius: 0 6px 6px 0;
+            background: rgba(255,255,255,0.06);
+        }
+        #kmp-toolbar-save { border-color: #4caf50 !important; color: #8ee694 !important; }
+        #kmp-toolbar-cancel { border-color: #ff9800 !important; color: #ffc166 !important; }
         #kmp-graph-edit-toolbar input { margin: 0; }
         #kmp-graph-edit-help {
             position: fixed;
@@ -1469,14 +1578,8 @@
         }
 
         .kmp-edit-popup { font-size: 12px; color: #ccc; min-width: 140px; }
-        .kmp-node-edit-popup {
-            display: flex;
-            align-items: flex-start;
-            gap: 12px;
-        }
         .kmp-node-edit-actions {
             width: 88px;
-            flex: 0 0 88px;
         }
         .kmp-node-edit-actions .kmp-edit-input {
             width: 62px;
@@ -1486,35 +1589,84 @@
             padding-left: 0;
             padding-right: 0;
         }
-        .kmp-node-style-grid {
-            display: grid;
-            grid-template-columns: repeat(4, 38px);
-            grid-auto-rows: 32px;
-            gap: 5px;
-        }
-        .kmp-node-style-option {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            border: 1px solid #555;
-            border-radius: 6px;
-            background: #242424;
+        #kmp-special-marker-sidebar {
+            position: fixed;
+            top: 76px;
+            right: 18px;
+            bottom: 78px;
+            z-index: 100003;
+            display: none;
+            width: 340px;
+            overflow: hidden;
+            border: 1px solid rgba(220,178,104,0.55);
+            border-radius: 12px;
+            background: rgba(18,18,18,0.94);
             color: #eee;
-            font-weight: 700;
-            cursor: pointer;
-            user-select: none;
+            box-shadow: 0 18px 45px rgba(0,0,0,0.48);
+            backdrop-filter: blur(10px);
         }
-        .kmp-node-style-option.active {
-            border-color: #dcb268;
-            box-shadow: 0 0 0 2px rgba(220,178,104,0.28);
+        .kmp-special-sidebar-layout { display:grid; grid-template-rows:auto minmax(0,1fr) auto; height:100%; }
+        .kmp-special-sidebar-header,
+        .kmp-special-summary-header { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+        .kmp-special-sidebar-header { padding:12px; border-bottom:1px solid rgba(255,255,255,0.1); font-weight:800; }
+        .kmp-special-sidebar-tree { overflow:auto; padding:8px; }
+        .kmp-special-group { margin-bottom:8px; border:1px solid rgba(255,255,255,0.12); border-radius:8px; background:rgba(255,255,255,0.035); }
+        .kmp-special-group.selected { border-color:#dcb268; }
+        .kmp-special-group summary { padding:9px 10px; cursor:pointer; user-select:none; font-weight:700; }
+        .kmp-special-group-actions { display:flex; gap:5px; flex-wrap:wrap; padding:0 9px 9px; }
+        .kmp-special-sidebar-btn,
+        .kmp-special-member-btn,
+        .kmp-special-modal-btn { border:1px solid #666; border-radius:6px; background:#282828; color:#eee; padding:5px 8px; cursor:pointer; }
+        .kmp-special-sidebar-btn:hover,
+        .kmp-special-member-btn:hover,
+        .kmp-special-modal-btn:hover { border-color:#dcb268; }
+        .kmp-special-sidebar-btn.active { border-color:#4caf50; color:#9bea9f; background:rgba(76,175,80,0.16); }
+        .kmp-special-sidebar-btn.danger,
+        .kmp-special-member-btn.danger { border-color:rgba(211,47,47,0.7); color:#ffb8b8; }
+        .kmp-special-member-list { padding:0 9px 9px; }
+        .kmp-special-member-row { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:7px; padding:6px 0; border-top:1px solid rgba(255,255,255,0.08); }
+        .kmp-special-member-actions { display:flex; gap:4px; }
+        .kmp-special-member-btn { padding:3px 6px; font-size:11px; }
+        .kmp-special-empty { padding:16px 10px; color:#999; text-align:center; }
+        .kmp-special-sidebar-summary { padding:12px; border-top:1px solid rgba(255,255,255,0.12); background:rgba(0,0,0,0.18); }
+        .kmp-special-summary-body { display:flex; align-items:center; gap:14px; margin-top:10px; }
+        .kmp-special-summary-meta { min-width:0; color:#bbb; font-size:12px; line-height:1.6; }
+        #kmp-special-marker-style-modal {
+            position:fixed; inset:0; z-index:100020; display:flex; align-items:center; justify-content:center;
+            padding:28px; background:rgba(0,0,0,0.68); color:#eee;
         }
-        .kmp-node-style-color {
-            width: 18px;
-            height: 18px;
-            border-radius: 50%;
-            border: 1px solid rgba(255,255,255,0.65);
-            box-shadow: 0 1px 4px rgba(0,0,0,0.45);
+        .kmp-special-modal-panel { width:min(920px, calc(100vw - 56px)); max-height:calc(100vh - 56px); overflow:auto; border:1px solid rgba(220,178,104,0.65); border-radius:14px; background:#171717; box-shadow:0 28px 80px rgba(0,0,0,0.65); }
+        .kmp-special-modal-header { padding:16px 20px; border-bottom:1px solid rgba(255,255,255,0.12); font-size:18px; font-weight:800; }
+        .kmp-special-modal-body { display:grid; grid-template-columns:minmax(0,1.2fr) minmax(280px,0.8fr); gap:22px; padding:20px; }
+        .kmp-special-modal-section { margin-bottom:18px; }
+        .kmp-special-modal-label { display:block; margin-bottom:8px; color:#d9c08d; font-weight:700; }
+        .kmp-special-shape-grid { display:grid; grid-template-columns:repeat(4,minmax(86px,1fr)); gap:8px; }
+        .kmp-special-shape-option { display:flex; flex-direction:column; align-items:center; gap:7px; min-height:88px; padding:8px 5px; border:1px solid #555; border-radius:8px; background:#232323; color:#ddd; cursor:pointer; }
+        .kmp-special-shape-option.active { border-color:#dcb268; box-shadow:0 0 0 2px rgba(220,178,104,0.22); }
+        .kmp-special-number-row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+        .kmp-special-number-input { width:100%; box-sizing:border-box; border:1px solid #666; border-radius:6px; background:#252525; color:#fff; padding:7px 8px; }
+        .kmp-special-preview-stage { min-height:170px; display:flex; align-items:center; justify-content:center; border:1px solid rgba(255,255,255,0.12); border-radius:10px; background:radial-gradient(circle at center,#353535,#202020); }
+        .kmp-special-modal-actions { display:flex; justify-content:flex-end; gap:10px; padding:14px 20px 18px; border-top:1px solid rgba(255,255,255,0.12); }
+        .kmp-special-modal-btn.primary { border-color:#dcb268; background:#dcb268; color:#161616; font-weight:800; }
+        .kmp-special-color-picker { display:grid; gap:9px; }
+        .kmp-color-sv { position:relative; height:150px; border-radius:8px; overflow:hidden; cursor:crosshair; background-image:linear-gradient(to top,#000,transparent),linear-gradient(to right,#fff,transparent); touch-action:none; }
+        .kmp-color-sv-cursor { position:absolute; width:14px; height:14px; border:2px solid #fff; border-radius:50%; box-shadow:0 0 0 1px #000; transform:translate(-50%,-50%); pointer-events:none; }
+        .kmp-color-hue {
+            width:100%; height:16px; margin:0; cursor:pointer; background:transparent;
+            -webkit-appearance: none; appearance: none;
         }
+        .kmp-color-hue::-webkit-slider-runnable-track {
+            height:10px; border-radius:999px;
+            background: linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00);
+        }
+        .kmp-color-hue::-webkit-slider-thumb {
+            width:16px; height:16px; margin-top:-3px; border:2px solid #fff; border-radius:50%;
+            background:#222; box-shadow:0 1px 4px rgba(0,0,0,0.65);
+            -webkit-appearance: none; appearance: none;
+        }
+        .kmp-color-row { display:grid; grid-template-columns:34px minmax(0,1fr); align-items:center; gap:8px; }
+        .kmp-color-preview { width:32px; height:32px; border:1px solid rgba(255,255,255,0.65); border-radius:6px; }
+        .kmp-color-hex { width:100%; box-sizing:border-box; border:1px solid #666; border-radius:6px; background:#252525; color:#fff; padding:7px 8px; font-family:monospace; }
         .kmp-route-node-style {
             position: relative;
             width: 28px;
@@ -1530,16 +1682,51 @@
             border: 1.5px solid #fff;
             box-sizing: border-box;
         }
-        .kmp-route-node-core.diamond {
+        .kmp-special-marker-shape.circle {
+            border-radius: 50%;
+        }
+        .kmp-special-marker-shape.square {
+            border-radius: 0;
+        }
+        .kmp-special-marker-shape.rounded-square {
+            border-radius: 6px;
+        }
+        .kmp-special-marker-shape.diamond {
             inset: 4px;
             transform: rotate(45deg);
         }
-        .kmp-route-node-core.star {
-            clip-path: polygon(50% 0%, 61% 34%, 98% 34%, 68% 55%, 79% 90%, 50% 69%, 21% 90%, 32% 55%, 2% 34%, 39% 34%);
-        }
-        .kmp-route-node-core.triangle {
+        .kmp-special-marker-shape.triangle-up {
             clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
         }
+        .kmp-special-marker-shape.triangle-down {
+            clip-path: polygon(0% 0%, 100% 0%, 50% 100%);
+        }
+        .kmp-special-marker-shape.pentagon {
+            clip-path: polygon(50% 0%, 100% 38%, 82% 100%, 18% 100%, 0% 38%);
+        }
+        .kmp-special-marker-shape.hexagon {
+            clip-path: polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%);
+        }
+        .kmp-special-marker-shape.octagon {
+            clip-path: polygon(30% 0%, 70% 0%, 100% 30%, 100% 70%, 70% 100%, 30% 100%, 0% 70%, 0% 30%);
+        }
+        .kmp-special-marker-shape.star {
+            clip-path: polygon(50% 0%, 61% 34%, 98% 34%, 68% 55%, 79% 90%, 50% 69%, 21% 90%, 32% 55%, 2% 34%, 39% 34%);
+        }
+        .kmp-special-marker-shape.ellipse {
+            inset: 5px 1px;
+            border-radius: 50%;
+        }
+        .kmp-special-marker-shape.capsule {
+            inset: 6px 1px;
+            border-radius: 999px;
+        }
+        .kmp-special-marker-preview { width:64px; height:64px; flex:0 0 64px; }
+        .kmp-special-marker-preview .kmp-special-marker-shape.diamond { inset:10px; }
+        .kmp-special-marker-preview .kmp-special-marker-shape.ellipse { inset:12px 2px; }
+        .kmp-special-marker-preview .kmp-special-marker-shape.capsule { inset:15px 2px; }
+        .kmp-special-shape-option .kmp-special-marker-preview { width:40px; height:40px; flex-basis:40px; }
+        .kmp-special-shape-option .kmp-special-marker-shape.diamond { inset:7px; }
         .kmp-route-node-text {
             position: absolute;
             inset: 0;
@@ -1553,10 +1740,6 @@
             text-align: center;
             white-space: nowrap;
             text-shadow: 0 1px 0 rgba(255,255,255,0.55);
-        }
-        .kmp-route-node-text.dot,
-        .kmp-route-node-text.alpha {
-            font-size: 9px;
         }
         .kmp-edit-input {
             background: #222; border: 1px solid #dcb268; color: #fff;
@@ -1720,6 +1903,13 @@
             } catch (e) {}
             STATE.mainLayerGroup = null;
         }
+        if (STATE.routeMarkerHighlightLayer) {
+            try {
+                if (STATE.routeMarkerHighlightLayer._map) STATE.routeMarkerHighlightLayer._map.removeLayer(STATE.routeMarkerHighlightLayer);
+            } catch (e) {}
+            STATE.routeMarkerHighlightLayer = null;
+        }
+        uninstallRouteMarkerAssociationCapture();
 
         STATE.mainLayerGroup = L.layerGroup().addTo(map);
 
@@ -1742,6 +1932,7 @@
         setupDragAndDrop();
         setupPopupDomWatcher();
         scheduleAutoCalibrate('initMapLogic');
+        scheduleRouteMarkerDisplay('map-instance-change');
     }
 
     function isPointPopupOpenForControl() {
@@ -2183,63 +2374,154 @@
         return `<div class="kmp-route-arrow${extraClass}" style="width:${sizePx}px; height:${sizePx}px; transform: ${transform}; transform-origin: center; display:flex;"><svg viewBox="0 0 10 10"><path d="M 0 0 L 10 5 L 0 10 L 3 5 Z" fill="${fill}" stroke="${stroke}" stroke-width="${strokeWidth}" /></svg></div>`;
     }
 
-    function normalizeGraphNodeStyle(node) {
-        const labelStyle = NODE_LABEL_STYLE_OPTIONS.includes(node && node.labelStyle) ? node.labelStyle : 'none';
-        const markerStyle = NODE_MARKER_STYLE_OPTIONS.includes(node && node.markerStyle) ? node.markerStyle : 'none';
-        const color = NODE_COLOR_OPTIONS.includes(node && node.color) ? node.color : NODE_COLOR_OPTIONS[0];
-        return { labelStyle, markerStyle, color };
+    function normalizeRouteCoordinate(value) {
+        const number = Number(value);
+        return Number.isFinite(number) ? Math.round(number) : 0;
     }
 
-    function formatGraphNodeLabel(index, labelStyle) {
-        const n = index;
-        if (labelStyle === 'badge') return String(n);
-        if (labelStyle === 'dot') return `${n}.`;
-        if (labelStyle === 'alpha') return `A${n}`;
-        return '';
+    function normalizeHexColor(value, fallback) {
+        return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value)
+            ? value.toUpperCase()
+            : fallback;
     }
 
-    function getGraphNodeStyleGroupKey(style) {
-        return `${style.labelStyle}|${style.markerStyle}|${style.color}`;
+    function hexToRgb(value) {
+        if (typeof value !== 'string' || !/^#[0-9a-f]{6}$/i.test(value)) return null;
+        return {
+            r: parseInt(value.slice(1, 3), 16),
+            g: parseInt(value.slice(3, 5), 16),
+            b: parseInt(value.slice(5, 7), 16)
+        };
     }
 
-    function getGraphNodeStyleSequenceMap(graph) {
-        const counts = new Map();
-        const sequenceMap = new Map();
-        (graph.nodes || []).forEach(node => {
-            const style = normalizeGraphNodeStyle(node);
-            if (style.markerStyle === 'none' || style.labelStyle === 'none') return;
-            const key = getGraphNodeStyleGroupKey(style);
-            const sequence = (counts.get(key) || 0) + 1;
-            counts.set(key, sequence);
-            sequenceMap.set(node.id, sequence);
+    function rgbToHex(r, g, b) {
+        const channel = value => Math.round(Math.min(255, Math.max(0, Number(value) || 0)))
+            .toString(16).padStart(2, '0');
+        return `#${channel(r)}${channel(g)}${channel(b)}`.toUpperCase();
+    }
+
+    function rgbToHsv(r, g, b) {
+        const red = Math.min(255, Math.max(0, Number(r) || 0)) / 255;
+        const green = Math.min(255, Math.max(0, Number(g) || 0)) / 255;
+        const blue = Math.min(255, Math.max(0, Number(b) || 0)) / 255;
+        const max = Math.max(red, green, blue);
+        const min = Math.min(red, green, blue);
+        const delta = max - min;
+        let hue = 0;
+        if (delta) {
+            if (max === red) hue = 60 * (((green - blue) / delta) % 6);
+            else if (max === green) hue = 60 * (((blue - red) / delta) + 2);
+            else hue = 60 * (((red - green) / delta) + 4);
+        }
+        if (hue < 0) hue += 360;
+        return { h: hue, s: max ? (delta / max) * 100 : 0, v: max * 100 };
+    }
+
+    function hsvToRgb(h, s, v) {
+        const hue = ((Number(h) || 0) % 360 + 360) % 360;
+        const saturation = Math.min(100, Math.max(0, Number(s) || 0)) / 100;
+        const value = Math.min(100, Math.max(0, Number(v) || 0)) / 100;
+        const chroma = value * saturation;
+        const component = chroma * (1 - Math.abs((hue / 60) % 2 - 1));
+        const match = value - chroma;
+        let red = 0;
+        let green = 0;
+        let blue = 0;
+        if (hue < 60) [red, green, blue] = [chroma, component, 0];
+        else if (hue < 120) [red, green, blue] = [component, chroma, 0];
+        else if (hue < 180) [red, green, blue] = [0, chroma, component];
+        else if (hue < 240) [red, green, blue] = [0, component, chroma];
+        else if (hue < 300) [red, green, blue] = [component, 0, chroma];
+        else [red, green, blue] = [chroma, 0, component];
+        return {
+            r: Math.round((red + match) * 255),
+            g: Math.round((green + match) * 255),
+            b: Math.round((blue + match) * 255)
+        };
+    }
+
+    function clampNumber(value, min, max, fallback) {
+        const number = Number(value);
+        return Number.isFinite(number) ? Math.min(max, Math.max(min, number)) : fallback;
+    }
+
+    function normalizeSpecialMarkerStyle(style) {
+        const source = style && typeof style === 'object' ? style : {};
+        const number = source.number && typeof source.number === 'object' ? source.number : {};
+        const outline = number.outline && typeof number.outline === 'object' ? number.outline : {};
+        return {
+            shape: SPECIAL_MARKER_SHAPES.includes(source.shape) ? source.shape : DEFAULT_SPECIAL_MARKER_STYLE.shape,
+            fill_color: normalizeHexColor(source.fill_color, DEFAULT_SPECIAL_MARKER_STYLE.fill_color),
+            number: {
+                font_size: clampNumber(number.font_size, 8, 72, DEFAULT_SPECIAL_MARKER_STYLE.number.font_size),
+                color: normalizeHexColor(number.color, DEFAULT_SPECIAL_MARKER_STYLE.number.color),
+                outline: {
+                    enabled: typeof outline.enabled === 'boolean' ? outline.enabled : DEFAULT_SPECIAL_MARKER_STYLE.number.outline.enabled,
+                    width: clampNumber(outline.width, 0, 8, DEFAULT_SPECIAL_MARKER_STYLE.number.outline.width),
+                    color: normalizeHexColor(outline.color, DEFAULT_SPECIAL_MARKER_STYLE.number.outline.color)
+                }
+            }
+        };
+    }
+
+    function createSpecialMarkerStyleDraft(style) {
+        return normalizeSpecialMarkerStyle(style);
+    }
+
+    function restoreSpecialMarkerGroupStyle(route, groupId, snapshot) {
+        const groups = route && route.editingGraph && route.editingGraph.special_marker_groups;
+        const group = Array.isArray(groups) ? groups.find(item => item.id === groupId) : null;
+        if (!group) return false;
+        group.style = createSpecialMarkerStyleDraft(snapshot);
+        return true;
+    }
+
+    function normalizeSpecialMarkerGroups(rawData, nodeIds) {
+        const source = rawData && Array.isArray(rawData.special_marker_groups) ? rawData.special_marker_groups : [];
+        const validNodeIds = nodeIds instanceof Set ? nodeIds : new Set(nodeIds || []);
+        const claimedNodeIds = new Set();
+        return source.map((group, index) => {
+            const normalizedNodeIds = [];
+            const sourceNodeIds = group && Array.isArray(group.node_ids) ? group.node_ids : [];
+            sourceNodeIds.forEach(nodeId => {
+                const id = String(nodeId);
+                if (!validNodeIds.has(id) || claimedNodeIds.has(id)) return;
+                claimedNodeIds.add(id);
+                normalizedNodeIds.push(id);
+            });
+            return {
+                id: group && group.id ? String(group.id) : `smg${index + 1}`,
+                style: normalizeSpecialMarkerStyle(group && group.style),
+                node_ids: normalizedNodeIds
+            };
         });
-        return sequenceMap;
     }
 
-    function createGraphNodeStyleHtml(node, index) {
-        const style = normalizeGraphNodeStyle(node);
-        if (style.markerStyle === 'none') return '';
-        const label = formatGraphNodeLabel(index, style.labelStyle);
-        const labelHtml = label ? `<span class="kmp-route-node-text ${style.labelStyle}">${label}</span>` : '';
-        return `<div class="kmp-route-node-style" style="--node-color:${style.color}"><span class="kmp-route-node-core ${style.markerStyle}"></span>${labelHtml}</div>`;
-    }
-
-    function renderGraphNodeStyleMarkers(layerGroup, graph) {
-        const sequenceMap = getGraphNodeStyleSequenceMap(graph);
-        (graph.nodes || []).forEach(node => {
-            const html = createGraphNodeStyleHtml(node, sequenceMap.get(node.id));
-            if (!html) return;
-            const sizePx = 28;
-            L.marker(gameToLatLng(node.x, node.y), {
-                icon: L.divIcon({
-                    className: '',
-                    html,
-                    iconSize: [sizePx, sizePx],
-                    iconAnchor: [sizePx / 2, sizePx / 2]
-                }),
-                interactive: false,
-                pane: 'kmp-arrow-pane'
-            }).addTo(layerGroup);
+    function renderSpecialMarkerGroups(layerGroup, graph, options = {}) {
+        const nodeById = new Map((graph.nodes || []).map(node => [node.id, node]));
+        const pane = options.pane || 'kmp-arrow-pane';
+        normalizeSpecialMarkerGroups(graph, new Set(nodeById.keys())).forEach(group => {
+            group.node_ids.forEach((nodeId, index) => {
+                const node = nodeById.get(nodeId);
+                if (!node) return;
+                const style = group.style;
+                const outlineStyle = style.number.outline.enabled
+                    ? `-webkit-text-stroke:${style.number.outline.width}px ${style.number.outline.color};paint-order:stroke fill;`
+                    : '';
+                const numberStyle = `font-size:${style.number.font_size}px;color:${style.number.color};${outlineStyle}`;
+                const html = `<div class="kmp-route-node-style kmp-special-marker" data-special-marker-shape="${style.shape}" style="--node-color:${style.fill_color}"><span class="kmp-route-node-core kmp-special-marker-shape ${style.shape}"></span><span class="kmp-route-node-text" style="${numberStyle}">${index + 1}</span></div>`;
+                const sizePx = 28;
+                L.marker(gameToLatLng(node.x, node.y), {
+                    icon: L.divIcon({
+                        className: '',
+                        html,
+                        iconSize: [sizePx, sizePx],
+                        iconAnchor: [sizePx / 2, sizePx / 2]
+                    }),
+                    interactive: false,
+                    pane
+                }).addTo(layerGroup);
+            });
         });
     }
 
@@ -2254,10 +2536,41 @@
     function pointToGraphNode(point, id) {
         return {
             id,
-            x: Number(point && point.x) || 0,
-            y: Number(point && point.y) || 0,
-            z: Number(point && point.z) || 0
+            x: normalizeRouteCoordinate(point && point.x),
+            y: normalizeRouteCoordinate(point && point.y),
+            z: normalizeRouteCoordinate(point && point.z)
         };
+    }
+
+    function normalizeRouteAssociatedMarkers(rawData) {
+        const source = rawData && Array.isArray(rawData.associated_markers) ? rawData.associated_markers : [];
+        const seen = new Set();
+        const markers = [];
+        source.forEach(marker => {
+            if (!marker || marker.id === undefined || marker.id === null || marker.type === undefined || marker.type === null) return;
+            const id = String(marker.id);
+            const type = String(marker.type);
+            const key = `${type}::${id}`;
+            if (!id || !type || seen.has(key)) return;
+            seen.add(key);
+            const numberOrNull = value => {
+                if (value === undefined || value === null || value === '') return null;
+                const n = Number(value);
+                return Number.isFinite(n) ? n : null;
+            };
+            markers.push({
+                id,
+                type,
+                fp: marker.fp ? String(marker.fp) : '',
+                name: marker.name ? String(marker.name) : '',
+                x: numberOrNull(marker.x),
+                y: numberOrNull(marker.y),
+                level: marker.level === undefined || marker.level === null ? '0' : String(marker.level),
+                lat: numberOrNull(marker.lat),
+                lng: numberOrNull(marker.lng)
+            });
+        });
+        return markers;
     }
 
     function isRouteGraphV2(rawData) {
@@ -2284,25 +2597,43 @@
     function normalizeLegacyRouteGraph(rawData, routeName) {
         const nodes = [];
         const edges = [];
+        const usedCoordinates = new Set();
+        const neighborOffsets = [
+            [1, 0], [-1, 0], [0, 1], [0, -1],
+            [1, 1], [1, -1], [-1, 1], [-1, -1]
+        ];
         let nodeIndex = 1;
         let edgeIndex = 1;
         getLegacyRouteSegments(rawData).forEach(segment => {
-            let prevNodeId = null;
+            let prevNode = null;
             segment.forEach(point => {
-                const nodeId = makeGraphNodeId(nodeIndex++);
-                nodes.push(pointToGraphNode(point, nodeId));
-                if (prevNodeId) {
-                    edges.push({ id: makeGraphEdgeId(edgeIndex++), from: prevNodeId, to: nodeId });
+                const node = pointToGraphNode(point, makeGraphNodeId(nodeIndex));
+                if (prevNode && node.x === prevNode.x && node.y === prevNode.y) return;
+                let coordinateKey = `${node.x},${node.y}`;
+                if (usedCoordinates.has(coordinateKey)) {
+                    const availableOffset = neighborOffsets.find(([dx, dy]) => !usedCoordinates.has(`${node.x + dx},${node.y + dy}`));
+                    if (!availableOffset) return;
+                    node.x += availableOffset[0];
+                    node.y += availableOffset[1];
+                    coordinateKey = `${node.x},${node.y}`;
                 }
-                prevNodeId = nodeId;
+                nodeIndex++;
+                nodes.push(node);
+                usedCoordinates.add(coordinateKey);
+                if (prevNode) {
+                    edges.push({ id: makeGraphEdgeId(edgeIndex++), from: prevNode.id, to: node.id });
+                }
+                prevNode = node;
             });
         });
         return {
             schema: ROUTE_GRAPH_SCHEMA,
             version: ROUTE_GRAPH_VERSION,
             route_info: (rawData && rawData.route_info) || { name: routeName, created_time: new Date().toLocaleString() },
+            associated_markers: normalizeRouteAssociatedMarkers(rawData),
             nodes,
-            edges
+            edges,
+            special_marker_groups: []
         };
     }
 
@@ -2312,10 +2643,9 @@
                 .filter(node => node && typeof node.id === 'string')
                 .map(node => ({
                     id: node.id,
-                    x: Number(node.x) || 0,
-                    y: Number(node.y) || 0,
-                    z: Number(node.z) || 0,
-                    ...normalizeGraphNodeStyle(node)
+                    x: normalizeRouteCoordinate(node.x),
+                    y: normalizeRouteCoordinate(node.y),
+                    z: normalizeRouteCoordinate(node.z)
                 }));
             const nodeIds = new Set(nodes.map(node => node.id));
             const edges = rawData.edges
@@ -2325,8 +2655,10 @@
                 schema: ROUTE_GRAPH_SCHEMA,
                 version: ROUTE_GRAPH_VERSION,
                 route_info: rawData.route_info || { name: routeName, created_time: new Date().toLocaleString() },
+                associated_markers: normalizeRouteAssociatedMarkers(rawData),
                 nodes,
-                edges
+                edges,
+                special_marker_groups: normalizeSpecialMarkerGroups(rawData, nodeIds)
             };
         }
         return normalizeLegacyRouteGraph(rawData, routeName);
@@ -2338,14 +2670,129 @@
             schema: ROUTE_GRAPH_SCHEMA,
             version: ROUTE_GRAPH_VERSION,
             route_info: graph.route_info || { name: route.name, created_time: new Date().toLocaleString() },
+            associated_markers: normalizeRouteAssociatedMarkers(graph),
             nodes: graph.nodes,
-            edges: graph.edges
+            edges: graph.edges,
+            special_marker_groups: graph.special_marker_groups
         };
     }
 
-    function drawGraphOnLayer(layerGroup, graph) {
+    function createEmptyRouteGraph(routeName) {
+        return {
+            schema: ROUTE_GRAPH_SCHEMA,
+            version: ROUTE_GRAPH_VERSION,
+            route_info: { name: routeName, created_time: new Date().toLocaleString() },
+            associated_markers: [],
+            nodes: [],
+            edges: [],
+            special_marker_groups: []
+        };
+    }
+
+    function buildDirectedGraphChains(graph) {
+        const edges = Array.isArray(graph && graph.edges) ? graph.edges : [];
+        const inDegree = new Map();
+        const outDegree = new Map();
+        const outgoing = new Map();
+        (graph.nodes || []).forEach(node => {
+            inDegree.set(node.id, 0);
+            outDegree.set(node.id, 0);
+            outgoing.set(node.id, []);
+        });
+        edges.forEach(edge => {
+            inDegree.set(edge.to, (inDegree.get(edge.to) || 0) + 1);
+            outDegree.set(edge.from, (outDegree.get(edge.from) || 0) + 1);
+            if (!outgoing.has(edge.from)) outgoing.set(edge.from, []);
+            outgoing.get(edge.from).push(edge);
+        });
+
+        const visitedEdgeIds = new Set();
+        const chains = [];
+        const followChain = firstEdge => {
+            if (!firstEdge || visitedEdgeIds.has(firstEdge.id)) return;
+            const chain = [];
+            let edge = firstEdge;
+            while (edge && !visitedEdgeIds.has(edge.id)) {
+                visitedEdgeIds.add(edge.id);
+                chain.push(edge);
+                const currentNodeId = edge.to;
+                const continues = inDegree.get(currentNodeId) === 1 && outDegree.get(currentNodeId) === 1;
+                if (!continues) break;
+                edge = (outgoing.get(currentNodeId) || [])[0] || null;
+            }
+            if (chain.length) chains.push(chain);
+        };
+
+        edges.forEach(edge => {
+            if ((inDegree.get(edge.from) || 0) !== 1 || (outDegree.get(edge.from) || 0) !== 1) {
+                followChain(edge);
+            }
+        });
+        edges.slice().sort((a, b) => String(a.id).localeCompare(String(b.id))).forEach(followChain);
+        return chains;
+    }
+
+    function getGraphChainArrowPlacements(chain, nodeById, arrowGap) {
+        const segments = [];
+        let totalLength = 0;
+        (chain || []).forEach(edge => {
+            const fromNode = nodeById.get(edge.from);
+            const toNode = nodeById.get(edge.to);
+            if (!fromNode || !toNode) return;
+            const length = Math.hypot(toNode.x - fromNode.x, toNode.y - fromNode.y);
+            if (!(length > 0)) return;
+            segments.push({ edge, fromNode, toNode, length, start: totalLength });
+            totalLength += length;
+        });
+        if (!segments.length || !(totalLength > 0)) return [];
+
+        const gap = Math.max(1, Number(arrowGap) || CONFIG.route.defaultGap);
+        const arrowCount = Math.max(1, Math.floor(totalLength / gap));
+        const firstDistance = (totalLength - (arrowCount - 1) * gap) / 2;
+        const nodeDistances = [0, ...segments.slice(0, -1).map(segment => segment.start + segment.length), totalLength];
+        const nodeMargin = Math.min(20, Math.max(0.5, gap * 0.1), totalLength * 0.2);
+
+        const moveOffNode = distance => {
+            let nearest = nodeDistances[0];
+            let nearestDelta = Math.abs(distance - nearest);
+            nodeDistances.forEach(nodeDistance => {
+                const delta = Math.abs(distance - nodeDistance);
+                if (delta < nearestDelta) {
+                    nearest = nodeDistance;
+                    nearestDelta = delta;
+                }
+            });
+            if (nearestDelta >= nodeMargin) return distance;
+            const candidates = [nearest + nodeMargin, nearest - nodeMargin]
+                .filter(candidate => candidate > 0 && candidate < totalLength);
+            if (!candidates.length) return distance;
+            let best = candidates[0];
+            let bestClearance = Math.min(...nodeDistances.map(nodeDistance => Math.abs(best - nodeDistance)));
+            candidates.slice(1).forEach(candidate => {
+                const clearance = Math.min(...nodeDistances.map(nodeDistance => Math.abs(candidate - nodeDistance)));
+                if (clearance > bestClearance) {
+                    best = candidate;
+                    bestClearance = clearance;
+                }
+            });
+            return best;
+        };
+
+        const placements = [];
+        for (let index = 0; index < arrowCount; index++) {
+            const distance = moveOffNode(firstDistance + index * gap);
+            const segment = segments.find(item => distance < item.start + item.length) || segments[segments.length - 1];
+            const t = Math.max(0, Math.min(1, (distance - segment.start) / segment.length));
+            const x = segment.fromNode.x + (segment.toNode.x - segment.fromNode.x) * t;
+            const y = segment.fromNode.y + (segment.toNode.y - segment.fromNode.y) * t;
+            placements.push({ edge: segment.edge, fromNode: segment.fromNode, toNode: segment.toNode, x, y });
+        }
+        return placements;
+    }
+
+    function drawGraphOnLayer(layerGroup, graph, options = {}) {
         const nodeById = new Map(graph.nodes.map(node => [node.id, node]));
-        let cumulativeDist = 0;
+        const showDirectionArrows = options.showDirectionArrows !== false;
         graph.edges.forEach(edge => {
             const fromNode = nodeById.get(edge.from);
             const toNode = nodeById.get(edge.to);
@@ -2358,22 +2805,30 @@
                 opacity: 1,
                 interactive: false
             }).addTo(layerGroup);
-            const dist = Math.sqrt(Math.pow(toNode.x - fromNode.x, 2) + Math.pow(toNode.y - fromNode.y, 2));
-            cumulativeDist += dist;
-            if (cumulativeDist >= SETTINGS.arrowGap) {
-                cumulativeDist = 0;
-                const angle = getAngle(startLatLng, endLatLng);
-                const sizePx = 12 * SETTINGS.arrowSize;
-                const arrowIcon = L.divIcon({
-                    className: '',
-                    html: createRouteDirectionArrowHtml(angle, sizePx),
-                    iconSize: [sizePx, sizePx],
-                    iconAnchor: [sizePx / 2, sizePx / 2]
-                });
-                L.marker(endLatLng, { icon: arrowIcon, interactive: false, pane: 'kmp-arrow-pane' }).addTo(layerGroup);
-            }
         });
-        renderGraphNodeStyleMarkers(layerGroup, graph);
+
+        if (showDirectionArrows) {
+            const sizePx = 12 * SETTINGS.arrowSize;
+            const chains = buildDirectedGraphChains(graph);
+            chains.forEach(chain => {
+                getGraphChainArrowPlacements(chain, nodeById, SETTINGS.arrowGap).forEach(placement => {
+                    const startLatLng = gameToLatLng(placement.fromNode.x, placement.fromNode.y);
+                    const endLatLng = gameToLatLng(placement.toNode.x, placement.toNode.y);
+                    const arrowLatLng = gameToLatLng(placement.x, placement.y);
+                    const angle = getAngle(startLatLng, endLatLng);
+                    const arrowIcon = L.divIcon({
+                        className: '',
+                        html: createRouteDirectionArrowHtml(angle, sizePx),
+                        iconSize: [sizePx, sizePx],
+                        iconAnchor: [sizePx / 2, sizePx / 2]
+                    });
+                    L.marker(arrowLatLng, { icon: arrowIcon, interactive: false, pane: 'kmp-arrow-pane' }).addTo(layerGroup);
+                });
+            });
+        }
+        if (options.renderSpecialMarkers !== false) {
+            renderSpecialMarkerGroups(layerGroup, graph, { pane: options.specialMarkerPane || 'kmp-arrow-pane' });
+        }
     }
 
     function drawJsonOnLayer(layerGroup, data) {
@@ -2399,12 +2854,337 @@
         return minInfo.index;
     }
 
+    function routeAssociatedMarkerKey(marker) {
+        return marker ? `${String(marker.type)}::${String(marker.id)}` : '';
+    }
+
+    function getRouteGraphForMarkerDisplay(route) {
+        if (!route || route.type !== 'json') return null;
+        return route.editingGraph || route.rawData || null;
+    }
+
+    function getRouteAssociatedMarkers(route) {
+        return normalizeRouteAssociatedMarkers(getRouteGraphForMarkerDisplay(route));
+    }
+
+    function getControllerLeafletMarkers(controller) {
+        const markers = [];
+        if (!controller) return markers;
+        if (controller._icon || typeof controller.getElement === 'function') markers.push(controller);
+        if (Array.isArray(controller.markers)) {
+            controller.markers.forEach(marker => {
+                if (marker && !markers.includes(marker)) markers.push(marker);
+            });
+        }
+        return markers;
+    }
+
+    function getControllerLatLng(controller) {
+        const markers = getControllerLeafletMarkers(controller);
+        for (const marker of markers) {
+            try {
+                const latlng = typeof marker.getLatLng === 'function' ? marker.getLatLng() : marker._latlng;
+                if (latlng && Number.isFinite(Number(latlng.lat)) && Number.isFinite(Number(latlng.lng))) return latlng;
+            } catch (e) {}
+        }
+        try {
+            const latlng = typeof controller.getLatLng === 'function' ? controller.getLatLng() : controller._latlng;
+            if (latlng && Number.isFinite(Number(latlng.lat)) && Number.isFinite(Number(latlng.lng))) return latlng;
+        } catch (e) {}
+        return null;
+    }
+
+    function getLeafletMapContainer(map) {
+        if (!map) return null;
+        try {
+            if (map._container) return map._container;
+        } catch (e) {}
+        try {
+            if (typeof map.getContainer === 'function') return map.getContainer();
+        } catch (e) {}
+        return null;
+    }
+
+    function isSameLeafletMap(candidate, expected) {
+        if (!candidate || !expected) return false;
+        if (candidate === expected) return true;
+        const candidateContainer = getLeafletMapContainer(candidate);
+        const expectedContainer = getLeafletMapContainer(expected);
+        return !!candidateContainer && candidateContainer === expectedContainer;
+    }
+
+    function isControllerVisibleOnOfficialMap(controller) {
+        const capturedMap = STATE.mapInstance;
+        const storeMap = getMapStore()?.mapInstance || null;
+        return getControllerLeafletMarkers(controller).some(marker => {
+            try {
+                if (marker._map) {
+                    if (!capturedMap && !storeMap) return true;
+                    if (isSameLeafletMap(marker._map, storeMap)) return true;
+                    if (isSameLeafletMap(marker._map, capturedMap)) return true;
+                }
+                const icon = marker._icon || (typeof marker.getElement === 'function' ? marker.getElement() : null);
+                return !!(icon && icon.isConnected);
+            } catch (e) {
+                return false;
+            }
+        });
+    }
+
+    function getAssociatedMarkerController(marker) {
+        return marker ? getMarkerControllerById(marker.id, marker.type) : null;
+    }
+
+    function buildOfficialMarkerRecord(typeId, pointId, controller) {
+        const id = String(pointId);
+        const type = String(typeId);
+        const cached = STATE.pointIdCache.get(id) || null;
+        const latlng = getControllerLatLng(controller);
+        return {
+            id,
+            type,
+            fp: cached && cached.fp ? String(cached.fp) : '',
+            name: (cached && cached.name) || (controller.options && controller.options.name) || '',
+            x: cached && Number.isFinite(Number(cached.x)) ? Number(cached.x) : null,
+            y: cached && Number.isFinite(Number(cached.y)) ? Number(cached.y) : null,
+            level: cached && cached.level !== undefined ? String(cached.level) : '0',
+            lat: latlng ? Number(latlng.lat) : null,
+            lng: latlng ? Number(latlng.lng) : null
+        };
+    }
+
+    function findOfficialMarkerHitByCanvas(target) {
+        if (!target) return null;
+        const mapStore = getMapStore();
+        const cache = mapStore && mapStore.markersCache;
+        if (!(cache instanceof Map) || !mapStore.mapInstance || !mapStore.mapInstance._layers) return null;
+
+        const renderer = Object.values(mapStore.mapInstance._layers).find(
+            layer => layer && layer._container === target
+        );
+        const hoveredLayer = renderer && renderer._hoveredLayer;
+        if (!hoveredLayer) return null;
+
+        for (const [typeId, inner] of cache.entries()) {
+            if (!(inner instanceof Map)) continue;
+            for (const [pointId, controller] of inner.entries()) {
+                if (!controller || !Array.isArray(controller.markers)) continue;
+                if (!controller.markers.includes(hoveredLayer)) continue;
+                return buildOfficialMarkerRecord(typeId, pointId, controller);
+            }
+        }
+        return null;
+    }
+
+    function toggleRouteAssociatedMarker(route, markerRecord) {
+        if (!route || !route.editingGraph || !markerRecord) return false;
+        const markers = normalizeRouteAssociatedMarkers(route.editingGraph);
+        const key = routeAssociatedMarkerKey(markerRecord);
+        const index = markers.findIndex(marker => routeAssociatedMarkerKey(marker) === key);
+        if (index >= 0) markers.splice(index, 1);
+        else markers.push(markerRecord);
+        route.editingGraph.associated_markers = normalizeRouteAssociatedMarkers({ associated_markers: markers });
+        updateGraphEditToolbar(route);
+        updateGraphEditHelpPanel(route);
+        scheduleRouteMarkerDisplay('association-toggle');
+        return index < 0;
+    }
+
+    function uninstallRouteMarkerAssociationCapture() {
+        const container = STATE._routeMarkerCaptureContainer;
+        if (container && STATE._routeMarkerCaptureHandler) {
+            try { container.removeEventListener('click', STATE._routeMarkerCaptureHandler, true); } catch (e) {}
+        }
+        if (container && STATE._routeMarkerPointerMoveHandler) {
+            try { container.removeEventListener('pointermove', STATE._routeMarkerPointerMoveHandler, true); } catch (e) {}
+        }
+        if (container && STATE._routeMarkerPointerLeaveHandler) {
+            try { container.removeEventListener('pointerleave', STATE._routeMarkerPointerLeaveHandler, true); } catch (e) {}
+        }
+        if (STATE._routeMarkerHoverFrame) {
+            try { cancelAnimationFrame(STATE._routeMarkerHoverFrame); } catch (e) {}
+        }
+        STATE._routeMarkerCaptureContainer = null;
+        STATE._routeMarkerCaptureHandler = null;
+        STATE._routeMarkerPointerMoveHandler = null;
+        STATE._routeMarkerPointerLeaveHandler = null;
+        STATE._routeMarkerHoverFrame = null;
+        STATE._routeMarkerHoveredRecord = null;
+    }
+
+    function installRouteMarkerAssociationCapture() {
+        const map = STATE.mapInstance;
+        const container = map && typeof map.getContainer === 'function' ? map.getContainer() : null;
+        if (!container) return;
+        if (STATE._routeMarkerCaptureContainer === container && STATE._routeMarkerCaptureHandler) return;
+        uninstallRouteMarkerAssociationCapture();
+        STATE._routeMarkerPointerMoveHandler = event => {
+            if (STATE._routeMarkerHoverFrame) cancelAnimationFrame(STATE._routeMarkerHoverFrame);
+            STATE._routeMarkerHoverFrame = requestAnimationFrame(() => {
+                STATE._routeMarkerHoverFrame = null;
+                if (STATE._routeMarkerCaptureContainer !== container) return;
+                STATE._routeMarkerHoveredRecord = findOfficialMarkerHitByCanvas(event.target);
+            });
+        };
+        STATE._routeMarkerPointerLeaveHandler = () => {
+            STATE._routeMarkerHoveredRecord = null;
+        };
+        STATE._routeMarkerCaptureHandler = event => {
+            const route = getActiveEditingRoute();
+            if (!route || !route.markerAssociationMode) return;
+            const markerRecord = findOfficialMarkerHitByCanvas(event.target);
+            if (!markerRecord) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+            toggleRouteAssociatedMarker(route, markerRecord);
+        };
+        container.addEventListener('pointermove', STATE._routeMarkerPointerMoveHandler, true);
+        container.addEventListener('pointerleave', STATE._routeMarkerPointerLeaveHandler, true);
+        container.addEventListener('click', STATE._routeMarkerCaptureHandler, true);
+        STATE._routeMarkerCaptureContainer = container;
+    }
+
+    function setRouteMarkerAssociationMode(route, enabled) {
+        if (!route || !route.isEditing) return;
+        setExclusiveGraphEditMode(route, 'markers', enabled);
+    }
+
+    function getVisibleRouteAssociatedMarkers() {
+        const seen = new Set();
+        const markers = [];
+        (STATE.routeManager.routes || []).forEach(route => {
+            if (!route || route.type !== 'json' || !route.visible) return;
+            getRouteAssociatedMarkers(route).forEach(marker => {
+                const key = routeAssociatedMarkerKey(marker);
+                if (!key || seen.has(key)) return;
+                seen.add(key);
+                markers.push(marker);
+            });
+        });
+        return markers;
+    }
+
+    function hasVisibleJsonRoute() {
+        return (STATE.routeManager.routes || []).some(route => route && route.type === 'json' && route.visible);
+    }
+
+    function getEnabledAssociatedMarkers(markers) {
+        return (markers || []).filter(marker => {
+            const controller = getAssociatedMarkerController(marker);
+            return controller && isControllerVisibleOnOfficialMap(controller);
+        });
+    }
+
+    function clearRouteMarkerHighlights() {
+        if (STATE.routeMarkerHighlightLayer) STATE.routeMarkerHighlightLayer.clearLayers();
+    }
+
+    function highlightRouteAssociatedMarkers(markers) {
+        if (!STATE.mapInstance) return;
+        if (!STATE.routeMarkerHighlightLayer) STATE.routeMarkerHighlightLayer = L.layerGroup().addTo(STATE.mapInstance);
+        STATE.routeMarkerHighlightLayer.clearLayers();
+        getEnabledAssociatedMarkers(markers).forEach(marker => {
+            const latlng = getControllerLatLng(getAssociatedMarkerController(marker));
+            if (!latlng) return;
+            L.circleMarker(latlng, {
+                radius: 12,
+                color: '#00ff00',
+                weight: 3,
+                fill: false,
+                opacity: 0.9,
+                pane: 'kmp_highlight_pane'
+            }).addTo(STATE.routeMarkerHighlightLayer);
+        });
+    }
+
+    function applyRouteMarkerDisplay(reason) {
+        const editingRoute = getActiveEditingRoute();
+        const selectingMarkers = editingRoute && editingRoute.markerAssociationMode;
+        ensureMapStoreActionHook();
+
+        if (selectingMarkers) {
+            installRouteMarkerAssociationCapture();
+            clearMarkerFocus();
+            highlightRouteAssociatedMarkers(getRouteAssociatedMarkers(editingRoute));
+            return;
+        }
+
+        if (editingRoute && !editingRoute.graphPreviewMode) {
+            clearMarkerFocus('route');
+            highlightRouteAssociatedMarkers(getRouteAssociatedMarkers(editingRoute));
+            return;
+        }
+
+        const markers = getVisibleRouteAssociatedMarkers();
+        const mode = STATE.routeManager.markerDisplayMode;
+        if (mode === 'highlight') {
+            clearMarkerFocus('route');
+            highlightRouteAssociatedMarkers(markers);
+            return;
+        }
+
+        clearRouteMarkerHighlights();
+        if (mode === 'focus') {
+            if (!hasVisibleJsonRoute()) {
+                clearMarkerFocus('route');
+                return;
+            }
+            const keys = new Set(getEnabledAssociatedMarkers(markers).map(routeAssociatedMarkerKey).filter(Boolean));
+            applyMarkerFocusByKeys(keys, 'route', reason || 'route-marker-display');
+            return;
+        }
+        clearMarkerFocus('route');
+    }
+
+    function scheduleRouteMarkerDisplay(reason) {
+        if (STATE._routeMarkerDisplayTimer) clearTimeout(STATE._routeMarkerDisplayTimer);
+        STATE._routeMarkerDisplayTimer = setTimeout(() => {
+            STATE._routeMarkerDisplayTimer = null;
+            applyRouteMarkerDisplay(reason);
+        }, 0);
+    }
+
+    function syncRouteMarkerDisplayModeUI() {
+        const wrap = document.getElementById('sm-route-marker-display-mode');
+        if (!wrap) return;
+        wrap.querySelectorAll('[data-route-marker-mode]').forEach(button => {
+            button.classList.toggle('active', button.dataset.routeMarkerMode === STATE.routeManager.markerDisplayMode);
+        });
+    }
+
     STATE.routeManager.add = function(routeObj) {
         this.routes.push(routeObj);
         if (this.singleVisibleMode && routeObj && routeObj.visible) {
             this.setRouteVisible(routeObj, true, { exclusive: true });
         }
         renderRouteListUI();
+    };
+
+    STATE.routeManager.createNewRoute = function() {
+        if (getActiveEditingRoute()) {
+            alert('请先保存或取消当前路线编辑');
+            return null;
+        }
+        if (!STATE.mapInstance || !STATE.mainLayerGroup) {
+            alert('地图尚未初始化，暂时无法新建路线');
+            return null;
+        }
+
+        const name = `未命名路线_${Date.now()}`;
+        const route = {
+            id: `route-${Date.now()}-${Math.random()}`,
+            name,
+            type: 'json',
+            layer: L.layerGroup(),
+            rawData: createEmptyRouteGraph(name),
+            visible: true,
+            isNewRoute: true
+        };
+        STATE.mainLayerGroup.addLayer(route.layer);
+        this.add(route);
+        this.startEdit(route.id);
+        return route;
     };
 
     STATE.routeManager._setRouteLayerVisible = function(route, visible) {
@@ -2512,6 +3292,11 @@
             if (this.selectedIds) this.selectedIds.delete(id);
             // 清理编辑状态
             if (r.isEditing) {
+                closeSpecialMarkerStyleModal(r, false);
+                r.specialMarkerGroupMode = false;
+                r.specialMarkerAddingGroupId = null;
+                r.specialMarkerSelectedGroupId = null;
+                updateSpecialMarkerGroupSidebar(null);
                 this.disableBoxSelect(r); // 确保退出框选模式
                 if (r.editorGroup) STATE.mapInstance.removeLayer(r.editorGroup);
             }
@@ -2698,6 +3483,11 @@
         }
         map.getPane('kmp-edit-marker-pane').style.zIndex = KMP_EDIT_MARKER_PANE_Z_INDEX;
         map.getPane('kmp-edit-marker-pane').style.pointerEvents = 'none';
+        if (!map.getPane('kmp-edit-decoration-pane')) {
+            map.createPane('kmp-edit-decoration-pane');
+        }
+        map.getPane('kmp-edit-decoration-pane').style.zIndex = KMP_EDIT_DECORATION_PANE_Z_INDEX;
+        map.getPane('kmp-edit-decoration-pane').style.pointerEvents = 'none';
     }
 
     function deepCloneJson(value) {
@@ -2705,9 +3495,15 @@
     }
 
     function renderEditVisualLayer(route) {
-        const visualLayer = L.layerGroup();
-        drawGraphOnLayer(visualLayer, route.editingGraph || normalizeRouteGraph(route.rawData, route.name));
-        return visualLayer;
+        const layerGroup = L.layerGroup();
+        const graph = route.editingGraph || normalizeRouteGraph(route.rawData, route.name);
+        drawGraphOnLayer(
+            layerGroup,
+            graph,
+            { showDirectionArrows: !!route.graphPreviewMode, renderSpecialMarkers: false }
+        );
+        renderSpecialMarkerGroups(layerGroup, graph, { pane: 'kmp-edit-decoration-pane' });
+        return layerGroup;
     }
 
     function getActiveEditingRoute() {
@@ -2754,12 +3550,39 @@
         }
     }
 
+    function setExclusiveGraphEditMode(route, mode, enabled = true) {
+        if (!route) return;
+        const activeMode = enabled ? mode : null;
+        route.continuousDrawMode = activeMode === 'draw';
+        route.continuousDrawLastNodeId = null;
+        route.markerAssociationMode = activeMode === 'markers';
+        route.continuousSelectionMode = activeMode === 'selection';
+        route.graphBoxSelectMode = activeMode === 'box-node'
+            ? 'node'
+            : activeMode === 'box-edge' ? 'edge' : null;
+        route.graphPreviewMode = activeMode === 'preview';
+        route.specialMarkerGroupMode = activeMode === 'special-groups';
+        route.specialMarkerAddingGroupId = null;
+        if (!route.specialMarkerGroupMode) {
+            route.specialMarkerSelectedGroupId = null;
+            closeSpecialMarkerStyleModal(route, false);
+        }
+        if (route.specialMarkerGroupMode) {
+            route.graphSelectionType = null;
+            route.graphSelectedIds = new Set();
+            route.pendingConnectFromNodeId = null;
+            removeEditConnectionPreview(route);
+        }
+        if (route.markerAssociationMode) installRouteMarkerAssociationCapture();
+        syncGraphBoxSelectionMapDrag(route);
+        try { STATE.mapInstance.closePopup(); } catch (e) {}
+        refreshGraphEditRoute(route);
+        scheduleRouteMarkerDisplay(`edit-mode:${activeMode || 'none'}`);
+    }
+
     function setGraphBoxSelectMode(route, mode) {
         if (!route) return;
-        route.graphBoxSelectMode = route.graphBoxSelectMode === mode ? null : mode;
-        syncGraphBoxSelectionMapDrag(route);
-        updateGraphEditToolbar(route);
-        updateGraphEditHelpPanel(route);
+        setExclusiveGraphEditMode(route, `box-${mode}`, route.graphBoxSelectMode !== mode);
     }
 
     function selectSingleGraphElement(route, type, id) {
@@ -2782,6 +3605,7 @@
     function refreshGraphEditRoute(route) {
         updateGraphEditToolbar(route);
         updateGraphEditHelpPanel(route);
+        updateSpecialMarkerGroupSidebar(route);
         STATE.routeManager.updateEditLayer(route);
     }
 
@@ -2793,7 +3617,7 @@
             className: selected ? 'kmp-hit-line kmp-selected-edge' : 'kmp-hit-line',
             pane: 'kmp-edit-line-pane',
             renderer: svgRenderer,
-            interactive: !route.isBoxSelecting && !route.graphPreviewMode
+            interactive: !route.isBoxSelecting && !route.graphPreviewMode && !route.specialMarkerGroupMode
         }).addTo(group);
     }
 
@@ -2895,9 +3719,9 @@
         const gamePos = latLngToGame(latlng.lat, latlng.lng);
         const node = {
             id: nextGraphNodeId(graph),
-            x: gamePos.x,
-            y: gamePos.y,
-            z: Number(fromNode.z) || 0
+            x: normalizeRouteCoordinate(gamePos.x),
+            y: normalizeRouteCoordinate(gamePos.y),
+            z: normalizeRouteCoordinate(fromNode.z)
         };
         graph.nodes.push(node);
         deleteGraphEdge(route, edge.id);
@@ -2912,17 +3736,378 @@
         const gamePos = latLngToGame(latlng.lat, latlng.lng);
         const node = {
             id: nextGraphNodeId(graph),
-            x: gamePos.x,
-            y: gamePos.y,
+            x: normalizeRouteCoordinate(gamePos.x),
+            y: normalizeRouteCoordinate(gamePos.y),
             z: 0
         };
         graph.nodes.push(node);
+        const previousNode = route.continuousDrawMode && route.continuousDrawLastNodeId
+            ? getGraphNodeById(graph, route.continuousDrawLastNodeId)
+            : null;
+        if (previousNode) {
+            graph.edges.push({ id: nextGraphEdgeId(graph), from: previousNode.id, to: node.id });
+        }
+        if (route.continuousDrawMode) route.continuousDrawLastNodeId = node.id;
         selectSingleGraphElement(route, 'node', node.id);
         return node;
     }
 
+    function removeNodeFromSpecialMarkerGroups(graph, nodeId) {
+        (graph.special_marker_groups || []).forEach(group => {
+            group.node_ids = (group.node_ids || []).filter(id => id !== nodeId);
+        });
+    }
+
+    function createSpecialMarkerGroupId(graph) {
+        const usedIds = new Set((graph && graph.special_marker_groups || []).map(group => group.id));
+        let index = 1;
+        while (usedIds.has(`smg${index}`)) index++;
+        return `smg${index}`;
+    }
+
+    function addNodeToSpecialMarkerGroup(route, groupId, nodeId) {
+        const graph = route && route.editingGraph;
+        if (!graph || !(graph.nodes || []).some(node => node.id === nodeId)) return false;
+        const targetGroup = (graph.special_marker_groups || []).find(group => group.id === groupId);
+        if (!targetGroup) return false;
+        const targetNodeIds = targetGroup.node_ids || [];
+        if (targetNodeIds.includes(nodeId)) return false;
+        (graph.special_marker_groups || []).forEach(group => {
+            if (group !== targetGroup) group.node_ids = (group.node_ids || []).filter(id => id !== nodeId);
+        });
+        targetGroup.node_ids = targetNodeIds;
+        targetGroup.node_ids.push(nodeId);
+        return true;
+    }
+
+    function removeNodeFromSpecialMarkerGroup(route, groupId, nodeId) {
+        const graph = route && route.editingGraph;
+        const group = graph && (graph.special_marker_groups || []).find(item => item.id === groupId);
+        if (!group || !(group.node_ids || []).includes(nodeId)) return false;
+        group.node_ids = group.node_ids.filter(id => id !== nodeId);
+        return true;
+    }
+
+    function moveSpecialMarkerGroupMember(route, groupId, nodeId, direction) {
+        const graph = route && route.editingGraph;
+        const group = graph && (graph.special_marker_groups || []).find(item => item.id === groupId);
+        if (!group) return false;
+        const currentIndex = (group.node_ids || []).indexOf(nodeId);
+        const targetIndex = direction === 'up'
+            ? currentIndex - 1
+            : direction === 'down' ? currentIndex + 1 : currentIndex;
+        if (currentIndex < 0 || targetIndex < 0 || targetIndex >= group.node_ids.length || targetIndex === currentIndex) {
+            return false;
+        }
+        [group.node_ids[currentIndex], group.node_ids[targetIndex]] = [group.node_ids[targetIndex], group.node_ids[currentIndex]];
+        return true;
+    }
+
+    function deleteSpecialMarkerGroup(route, groupId) {
+        const graph = route && route.editingGraph;
+        if (!graph) return false;
+        const groupIndex = (graph.special_marker_groups || []).findIndex(group => group.id === groupId);
+        if (groupIndex < 0) return false;
+        graph.special_marker_groups.splice(groupIndex, 1);
+        return true;
+    }
+
+    function createSpecialMarkerPreviewHtml(style, numberValue = 1, extraClass = '') {
+        const normalized = normalizeSpecialMarkerStyle(style);
+        const outline = normalized.number.outline;
+        const outlineStyle = outline.enabled
+            ? `-webkit-text-stroke:${outline.width}px ${outline.color};paint-order:stroke fill;`
+            : '';
+        const numberStyle = `font-size:${normalized.number.font_size}px;color:${normalized.number.color};${outlineStyle}`;
+        return `<div class="kmp-route-node-style kmp-special-marker-preview ${extraClass}" style="--node-color:${normalized.fill_color}"><span class="kmp-route-node-core kmp-special-marker-shape ${normalized.shape}"></span><span class="kmp-route-node-text" style="${numberStyle}">${numberValue}</span></div>`;
+    }
+
+    function createSpecialMarkerColorPicker(container, initialColor, onChange) {
+        const initialRgb = hexToRgb(initialColor) || hexToRgb(DEFAULT_SPECIAL_MARKER_STYLE.fill_color);
+        const hsv = rgbToHsv(initialRgb.r, initialRgb.g, initialRgb.b);
+        const state = { h: hsv.h, s: hsv.s, v: hsv.v };
+        container.className = 'kmp-special-color-picker';
+        container.innerHTML = `
+            <div class="kmp-color-sv"><span class="kmp-color-sv-cursor"></span></div>
+            <input class="kmp-color-hue" type="range" min="0" max="360" step="1" aria-label="${SPECIAL_MARKER_GROUP_TEXT.hue}">
+            <div class="kmp-color-row">
+                <span class="kmp-color-preview"></span>
+                <input class="kmp-color-hex" type="text" maxlength="7" aria-label="${SPECIAL_MARKER_GROUP_TEXT.hex}">
+            </div>
+        `;
+        const svPanel = container.querySelector('.kmp-color-sv');
+        const svCursor = container.querySelector('.kmp-color-sv-cursor');
+        const hueInput = container.querySelector('.kmp-color-hue');
+        const preview = container.querySelector('.kmp-color-preview');
+        const hexInput = container.querySelector('.kmp-color-hex');
+
+        const currentHex = () => {
+            const rgb = hsvToRgb(state.h, state.s, state.v);
+            return rgbToHex(rgb.r, rgb.g, rgb.b);
+        };
+        const render = emit => {
+            const hex = currentHex();
+            svPanel.style.backgroundColor = `hsl(${state.h}, 100%, 50%)`;
+            svCursor.style.left = `${state.s}%`;
+            svCursor.style.top = `${100 - state.v}%`;
+            hueInput.value = String(Math.round(state.h));
+            preview.style.background = hex;
+            hexInput.value = hex;
+            if (emit && typeof onChange === 'function') onChange(hex);
+        };
+        const updateFromPointer = event => {
+            const rect = svPanel.getBoundingClientRect();
+            if (!rect.width || !rect.height) return;
+            state.s = Math.min(100, Math.max(0, ((event.clientX - rect.left) / rect.width) * 100));
+            state.v = 100 - Math.min(100, Math.max(0, ((event.clientY - rect.top) / rect.height) * 100));
+            render(true);
+        };
+        let dragging = false;
+        svPanel.addEventListener('pointerdown', event => {
+            dragging = true;
+            if (svPanel.setPointerCapture) svPanel.setPointerCapture(event.pointerId);
+            updateFromPointer(event);
+        });
+        svPanel.addEventListener('pointermove', event => {
+            if (dragging) updateFromPointer(event);
+        });
+        const stopDragging = () => { dragging = false; };
+        svPanel.addEventListener('pointerup', stopDragging);
+        svPanel.addEventListener('pointercancel', stopDragging);
+        hueInput.addEventListener('input', () => {
+            state.h = Number(hueInput.value);
+            render(true);
+        });
+        hexInput.addEventListener('change', () => {
+            const rgb = hexToRgb(hexInput.value);
+            if (!rgb) {
+                render(false);
+                return;
+            }
+            const next = rgbToHsv(rgb.r, rgb.g, rgb.b);
+            state.h = next.h;
+            state.s = next.s;
+            state.v = next.v;
+            render(true);
+        });
+        render(false);
+        return { getColor: currentHex };
+    }
+
+    function refreshSpecialMarkerGroupPreview(route) {
+        if (route && route.isEditing && route.editorGroup) STATE.routeManager.updateEditLayer(route);
+        updateSpecialMarkerGroupSidebar(route);
+    }
+
+    function closeSpecialMarkerStyleModal(route, keepChanges) {
+        const modal = document.getElementById('kmp-special-marker-style-modal');
+        if (!modal) return false;
+        const state = modal._specialMarkerState;
+        if (!keepChanges && state && !state.isNew) {
+            restoreSpecialMarkerGroupStyle(state.route, state.groupId, state.snapshot);
+        }
+        modal.remove();
+        refreshSpecialMarkerGroupPreview((state && state.route) || route);
+        return true;
+    }
+
+    function openSpecialMarkerStyleModal(route, groupId = null) {
+        if (!route || !route.editingGraph) return;
+        closeSpecialMarkerStyleModal(route, false);
+        const groups = route.editingGraph.special_marker_groups || [];
+        const group = groupId ? groups.find(item => item.id === groupId) : null;
+        if (groupId && !group) return;
+        const isNew = !group;
+        const draft = createSpecialMarkerStyleDraft(group ? group.style : DEFAULT_SPECIAL_MARKER_STYLE);
+        const snapshot = group ? createSpecialMarkerStyleDraft(group.style) : null;
+        const modal = document.createElement('div');
+        modal.id = 'kmp-special-marker-style-modal';
+        modal._specialMarkerState = { route, groupId, isNew, draft, snapshot };
+        modal.innerHTML = `
+            <div class="kmp-special-modal-panel" role="dialog" aria-modal="true">
+                <div class="kmp-special-modal-header">${isNew ? SPECIAL_MARKER_GROUP_TEXT.createTitle : SPECIAL_MARKER_GROUP_TEXT.editTitle}</div>
+                <div class="kmp-special-modal-body">
+                    <div>
+                        <section class="kmp-special-modal-section">
+                            <span class="kmp-special-modal-label">${SPECIAL_MARKER_GROUP_TEXT.shape}</span>
+                            <div class="kmp-special-shape-grid">
+                                ${SPECIAL_MARKER_SHAPES.map(shape => `<button type="button" class="kmp-special-shape-option${shape === draft.shape ? ' active' : ''}" data-shape="${shape}">${createSpecialMarkerPreviewHtml({ ...draft, shape }, 1)}<span>${SPECIAL_MARKER_GROUP_TEXT.shapeLabels[shape]}</span></button>`).join('')}
+                            </div>
+                        </section>
+                        <section class="kmp-special-modal-section">
+                            <span class="kmp-special-modal-label">${SPECIAL_MARKER_GROUP_TEXT.fillColor}</span>
+                            <div data-color-picker="fill"></div>
+                        </section>
+                    </div>
+                    <div>
+                        <section class="kmp-special-modal-section">
+                            <span class="kmp-special-modal-label">${SPECIAL_MARKER_GROUP_TEXT.preview}</span>
+                            <div class="kmp-special-preview-stage" data-style-preview></div>
+                        </section>
+                        <section class="kmp-special-modal-section">
+                            <span class="kmp-special-modal-label">${SPECIAL_MARKER_GROUP_TEXT.numberColor}</span>
+                            <div data-color-picker="number"></div>
+                        </section>
+                        <section class="kmp-special-modal-section kmp-special-number-row">
+                            <label><span class="kmp-special-modal-label">${SPECIAL_MARKER_GROUP_TEXT.numberSize}</span><input class="kmp-special-number-input" data-style-input="font-size" type="number" min="8" max="72" value="${draft.number.font_size}"></label>
+                            <label><span class="kmp-special-modal-label">${SPECIAL_MARKER_GROUP_TEXT.outlineWidth}</span><input class="kmp-special-number-input" data-style-input="outline-width" type="number" min="0" max="8" step="1" value="${draft.number.outline.width}"></label>
+                        </section>
+                        <section class="kmp-special-modal-section">
+                            <label><input data-style-input="outline-enabled" type="checkbox"${draft.number.outline.enabled ? ' checked' : ''}> ${SPECIAL_MARKER_GROUP_TEXT.outlineEnabled}</label>
+                        </section>
+                        <section class="kmp-special-modal-section">
+                            <span class="kmp-special-modal-label">${SPECIAL_MARKER_GROUP_TEXT.outlineColor}</span>
+                            <div data-color-picker="outline"></div>
+                        </section>
+                    </div>
+                </div>
+                <div class="kmp-special-modal-actions">
+                    <button type="button" class="kmp-special-modal-btn" data-modal-action="cancel">${SPECIAL_MARKER_GROUP_TEXT.cancel}</button>
+                    <button type="button" class="kmp-special-modal-btn primary" data-modal-action="confirm">${isNew ? SPECIAL_MARKER_GROUP_TEXT.create : SPECIAL_MARKER_GROUP_TEXT.done}</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        const state = modal._specialMarkerState;
+        const renderDraft = () => {
+            modal.querySelector('[data-style-preview]').innerHTML = createSpecialMarkerPreviewHtml(state.draft, 1);
+            modal.querySelectorAll('.kmp-special-shape-option').forEach(button => {
+                button.classList.toggle('active', button.dataset.shape === state.draft.shape);
+            });
+        };
+        const applyDraft = mutator => {
+            mutator(state.draft);
+            state.draft = createSpecialMarkerStyleDraft(state.draft);
+            if (!state.isNew) {
+                const target = route.editingGraph.special_marker_groups.find(item => item.id === state.groupId);
+                if (target) target.style = createSpecialMarkerStyleDraft(state.draft);
+            }
+            renderDraft();
+            if (!state.isNew) refreshSpecialMarkerGroupPreview(route);
+        };
+        modal.querySelectorAll('.kmp-special-shape-option').forEach(button => {
+            button.addEventListener('click', () => applyDraft(next => { next.shape = button.dataset.shape; }));
+        });
+        modal.querySelector('[data-style-input="font-size"]').addEventListener('input', event => {
+            applyDraft(next => { next.number.font_size = event.target.value; });
+        });
+        modal.querySelector('[data-style-input="outline-width"]').addEventListener('input', event => {
+            applyDraft(next => { next.number.outline.width = event.target.value; });
+        });
+        modal.querySelector('[data-style-input="outline-enabled"]').addEventListener('change', event => {
+            applyDraft(next => { next.number.outline.enabled = event.target.checked; });
+        });
+        createSpecialMarkerColorPicker(modal.querySelector('[data-color-picker="fill"]'), draft.fill_color, color => {
+            applyDraft(next => { next.fill_color = color; });
+        });
+        createSpecialMarkerColorPicker(modal.querySelector('[data-color-picker="number"]'), draft.number.color, color => {
+            applyDraft(next => { next.number.color = color; });
+        });
+        createSpecialMarkerColorPicker(modal.querySelector('[data-color-picker="outline"]'), draft.number.outline.color, color => {
+            applyDraft(next => { next.number.outline.color = color; });
+        });
+        modal.querySelector('[data-modal-action="cancel"]').addEventListener('click', () => closeSpecialMarkerStyleModal(route, false));
+        modal.querySelector('[data-modal-action="confirm"]').addEventListener('click', () => {
+            if (state.isNew) {
+                const id = createSpecialMarkerGroupId(route.editingGraph);
+                route.editingGraph.special_marker_groups.push({ id, style: createSpecialMarkerStyleDraft(state.draft), node_ids: [] });
+                route.specialMarkerSelectedGroupId = id;
+            }
+            closeSpecialMarkerStyleModal(route, true);
+        });
+        renderDraft();
+    }
+
+    function updateSpecialMarkerGroupSidebar(route) {
+        let sidebar = document.getElementById('kmp-special-marker-sidebar');
+        if (!sidebar) {
+            sidebar = document.createElement('aside');
+            sidebar.id = 'kmp-special-marker-sidebar';
+            document.body.appendChild(sidebar);
+        }
+        if (!sidebar.dataset.eventsBound) {
+            sidebar.addEventListener('click', event => {
+                const target = event.target.closest('[data-special-action]');
+                if (!target || !sidebar.contains(target)) return;
+                const activeRoute = getActiveEditingRoute();
+                if (!activeRoute || !activeRoute.specialMarkerGroupMode || !activeRoute.editingGraph) return;
+                const action = target.dataset.specialAction;
+                const groupId = target.dataset.groupId || null;
+                const nodeId = target.dataset.nodeId || null;
+                const groups = activeRoute.editingGraph.special_marker_groups || [];
+                if (action === 'create-group') {
+                    openSpecialMarkerStyleModal(activeRoute);
+                    return;
+                }
+                if (action === 'select-group') {
+                    activeRoute.specialMarkerSelectedGroupId = groupId;
+                    updateSpecialMarkerGroupSidebar(activeRoute);
+                    return;
+                }
+                if (action === 'toggle-add') {
+                    activeRoute.specialMarkerSelectedGroupId = groupId;
+                    activeRoute.specialMarkerAddingGroupId = activeRoute.specialMarkerAddingGroupId === groupId ? null : groupId;
+                    updateSpecialMarkerGroupSidebar(activeRoute);
+                    return;
+                }
+                if (action === 'edit-style') {
+                    activeRoute.specialMarkerSelectedGroupId = groupId;
+                    openSpecialMarkerStyleModal(activeRoute, groupId);
+                    updateSpecialMarkerGroupSidebar(activeRoute);
+                    return;
+                }
+                if (action === 'delete-group') {
+                    const index = groups.findIndex(group => group.id === groupId);
+                    if (index < 0 || !deleteSpecialMarkerGroup(activeRoute, groupId)) return;
+                    if (activeRoute.specialMarkerAddingGroupId === groupId) activeRoute.specialMarkerAddingGroupId = null;
+                    const remaining = activeRoute.editingGraph.special_marker_groups;
+                    activeRoute.specialMarkerSelectedGroupId = remaining.length ? remaining[Math.min(index, remaining.length - 1)].id : null;
+                    refreshGraphEditRoute(activeRoute);
+                    return;
+                }
+                if (action === 'move-up' || action === 'move-down') {
+                    if (moveSpecialMarkerGroupMember(activeRoute, groupId, nodeId, action === 'move-up' ? 'up' : 'down')) {
+                        refreshGraphEditRoute(activeRoute);
+                    }
+                    return;
+                }
+                if (action === 'remove-member' && removeNodeFromSpecialMarkerGroup(activeRoute, groupId, nodeId)) {
+                    refreshGraphEditRoute(activeRoute);
+                }
+            });
+            sidebar.dataset.eventsBound = 'true';
+        }
+        if (!route || !route.isEditing || !route.specialMarkerGroupMode || !route.editingGraph) {
+            sidebar.style.display = 'none';
+            return;
+        }
+        const groups = route.editingGraph.special_marker_groups || [];
+        const selected = groups.find(group => group.id === route.specialMarkerSelectedGroupId) || null;
+        const nodeById = new Map((route.editingGraph.nodes || []).map(node => [node.id, node]));
+        const treeHtml = groups.length ? groups.map((group, groupIndex) => {
+            const isSelected = selected && selected.id === group.id;
+            const isAdding = route.specialMarkerAddingGroupId === group.id;
+            const escapedGroupId = escapeHtml(String(group.id));
+            const members = group.node_ids.map((nodeId, memberIndex) => {
+                const node = nodeById.get(nodeId);
+                if (!node) return '';
+                const escapedNodeId = escapeHtml(String(nodeId));
+                return `<div class="kmp-special-member-row"><span>${memberIndex + 1}. ${normalizeRouteCoordinate(node.x)}, ${normalizeRouteCoordinate(node.y)}</span><span class="kmp-special-member-actions"><button type="button" class="kmp-special-member-btn" data-special-action="move-up" data-group-id="${escapedGroupId}" data-node-id="${escapedNodeId}"${memberIndex === 0 ? ' disabled' : ''}>${SPECIAL_MARKER_GROUP_TEXT.moveUp}</button><button type="button" class="kmp-special-member-btn" data-special-action="move-down" data-group-id="${escapedGroupId}" data-node-id="${escapedNodeId}"${memberIndex === group.node_ids.length - 1 ? ' disabled' : ''}>${SPECIAL_MARKER_GROUP_TEXT.moveDown}</button><button type="button" class="kmp-special-member-btn danger" data-special-action="remove-member" data-group-id="${escapedGroupId}" data-node-id="${escapedNodeId}">${SPECIAL_MARKER_GROUP_TEXT.removeMember}</button></span></div>`;
+            }).join('');
+            return `<details class="kmp-special-group${isSelected ? ' selected' : ''}" data-group-id="${escapedGroupId}"${isSelected ? ' open' : ''}><summary data-special-action="select-group" data-group-id="${escapedGroupId}">${SPECIAL_MARKER_GROUP_TEXT.groupLabel}${groupIndex + 1} (${group.node_ids.length})</summary><div class="kmp-special-group-actions"><button type="button" class="kmp-special-sidebar-btn${isAdding ? ' active' : ''}" data-special-action="toggle-add" data-group-id="${escapedGroupId}">${isAdding ? SPECIAL_MARKER_GROUP_TEXT.stopAdding : SPECIAL_MARKER_GROUP_TEXT.addNode}</button><button type="button" class="kmp-special-sidebar-btn" data-special-action="edit-style" data-group-id="${escapedGroupId}">${SPECIAL_MARKER_GROUP_TEXT.editStyle}</button><button type="button" class="kmp-special-sidebar-btn danger" data-special-action="delete-group" data-group-id="${escapedGroupId}">${SPECIAL_MARKER_GROUP_TEXT.deleteGroup}</button></div><div class="kmp-special-member-list">${members || `<div class="kmp-special-empty">${SPECIAL_MARKER_GROUP_TEXT.emptyMembers}</div>`}</div></details>`;
+        }).join('') : `<div class="kmp-special-empty">${SPECIAL_MARKER_GROUP_TEXT.emptyGroups}</div>`;
+        const selectedIndex = selected ? groups.indexOf(selected) : -1;
+        const escapedSelectedGroupId = selected ? escapeHtml(String(selected.id)) : '';
+        const summaryHtml = selected
+            ? `<div class="kmp-special-summary-header"><strong>${SPECIAL_MARKER_GROUP_TEXT.styleSummary}</strong><button type="button" class="kmp-special-sidebar-btn" data-special-action="edit-style" data-group-id="${escapedSelectedGroupId}">${SPECIAL_MARKER_GROUP_TEXT.editStyle}</button></div><div class="kmp-special-summary-body">${createSpecialMarkerPreviewHtml(selected.style, 1)}<div class="kmp-special-summary-meta">${SPECIAL_MARKER_GROUP_TEXT.groupLabel}${selectedIndex + 1}<br>${selected.node_ids.length} ${SPECIAL_MARKER_GROUP_TEXT.members}<br>${SPECIAL_MARKER_GROUP_TEXT.shapeLabels[normalizeSpecialMarkerStyle(selected.style).shape]}</div></div>`
+            : `<div class="kmp-special-empty">${SPECIAL_MARKER_GROUP_TEXT.noSelection}</div>`;
+        sidebar.innerHTML = `<div class="kmp-special-sidebar-layout"><div class="kmp-special-sidebar-header"><span>${SPECIAL_MARKER_GROUP_TEXT.sidebarTitle}</span><button type="button" class="kmp-special-sidebar-btn" data-special-action="create-group">${SPECIAL_MARKER_GROUP_TEXT.createGroup}</button></div><div class="kmp-special-sidebar-tree">${treeHtml}</div><div class="kmp-special-sidebar-summary">${summaryHtml}</div></div>`;
+        sidebar.style.display = 'block';
+    }
+
     function deleteGraphNode(route, nodeId) {
         const graph = route.editingGraph;
+        removeNodeFromSpecialMarkerGroups(graph, nodeId);
         graph.nodes = graph.nodes.filter(node => node.id !== nodeId);
         graph.edges = graph.edges.filter(edge => edge.from !== nodeId && edge.to !== nodeId);
         if (route.pendingConnectFromNodeId === nodeId) route.pendingConnectFromNodeId = null;
@@ -2941,6 +4126,7 @@
         if (incoming.length === 1 && outgoing.length === 1) {
             const fromNodeId = incoming[0].from;
             const toNodeId = outgoing[0].to;
+            removeNodeFromSpecialMarkerGroups(graph, nodeId);
             graph.nodes = graph.nodes.filter(node => node.id !== nodeId);
             graph.edges = graph.edges.filter(item => item.from !== nodeId && item.to !== nodeId);
             if (fromNodeId !== toNodeId && !graph.edges.some(item => item.from === fromNodeId && item.to === toNodeId)) {
@@ -2998,6 +4184,9 @@
             toolbar = document.createElement('div');
             toolbar.id = 'kmp-graph-edit-toolbar';
             toolbar.innerHTML = `
+                <button type="button" id="kmp-toolbar-draw-mode">连续绘制</button>
+                <button type="button" id="kmp-toolbar-route-markers">关联标记点</button>
+                <button type="button" id="kmp-toolbar-special-groups">${SPECIAL_MARKER_GROUP_TEXT.toolbar}</button>
                 <button type="button" id="kmp-toolbar-continuous">连续选择</button>
                 <button type="button" id="kmp-toolbar-box-node">框选节点</button>
                 <button type="button" id="kmp-toolbar-box-edge">框选路线</button>
@@ -3006,6 +4195,10 @@
                 <button type="button" id="kmp-toolbar-reverse">反转方向</button>
                 <button type="button" class="danger" id="kmp-toolbar-delete">删除</button>
                 <button type="button" id="kmp-toolbar-clear">取消选中</button>
+                <span class="kmp-toolbar-commit-group">
+                    <button type="button" id="kmp-toolbar-save">保存</button>
+                    <button type="button" id="kmp-toolbar-cancel">取消</button>
+                </span>
             `;
             document.body.appendChild(toolbar);
         }
@@ -3018,20 +4211,51 @@
         toolbar.style.display = 'flex';
         const count = activeRoute.graphSelectedIds.size;
         const typeLabel = activeRoute.graphSelectionType === 'node' ? '节点' : activeRoute.graphSelectionType === 'edge' ? '线段' : '';
+        const normalSelectionActionsEnabled = !activeRoute.specialMarkerGroupMode && count > 0;
         const status = document.getElementById('kmp-toolbar-status');
-        if (status) status.innerText = count ? `已选 ${count} ${typeLabel}` : '未选择';
+        if (status) {
+            status.style.display = activeRoute.specialMarkerGroupMode ? 'none' : '';
+            status.innerText = count ? `已选 ${count} ${typeLabel}` : '未选择';
+        }
 
+        const drawModeBtn = document.getElementById('kmp-toolbar-draw-mode');
+        const routeMarkersBtn = document.getElementById('kmp-toolbar-route-markers');
+        const specialGroupsBtn = document.getElementById('kmp-toolbar-special-groups');
         const continuousBtn = document.getElementById('kmp-toolbar-continuous');
         const previewInput = document.getElementById('kmp-toolbar-preview');
         const previewWrap = document.getElementById('kmp-toolbar-preview-wrap');
         const reverseBtn = document.getElementById('kmp-toolbar-reverse');
         const deleteBtn = document.getElementById('kmp-toolbar-delete');
+        const saveEditBtn = document.getElementById('kmp-toolbar-save');
+        const cancelEditBtn = document.getElementById('kmp-toolbar-cancel');
+        if (drawModeBtn) {
+            drawModeBtn.classList.toggle('active', !!activeRoute.continuousDrawMode);
+            drawModeBtn.title = activeRoute.continuousDrawMode
+                ? '右键立即添加节点，并与上一个连续绘制节点相连'
+                : '右键打开节点插入菜单';
+            drawModeBtn.onclick = () => {
+                setExclusiveGraphEditMode(activeRoute, 'draw', !activeRoute.continuousDrawMode);
+            };
+        }
+        if (routeMarkersBtn) {
+            const markerCount = getRouteAssociatedMarkers(activeRoute).length;
+            routeMarkersBtn.innerText = `关联标记点(${markerCount})`;
+            routeMarkersBtn.classList.toggle('active', !!activeRoute.markerAssociationMode);
+            routeMarkersBtn.title = activeRoute.markerAssociationMode
+                ? '点击官方地图标记点可添加或移除关联'
+                : '进入官方地图标记点关联模式';
+            routeMarkersBtn.onclick = () => setRouteMarkerAssociationMode(activeRoute, !activeRoute.markerAssociationMode);
+        }
+        if (specialGroupsBtn) {
+            specialGroupsBtn.classList.toggle('active', !!activeRoute.specialMarkerGroupMode);
+            specialGroupsBtn.onclick = () => {
+                setExclusiveGraphEditMode(activeRoute, 'special-groups', !activeRoute.specialMarkerGroupMode);
+            };
+        }
         if (continuousBtn) {
             continuousBtn.classList.toggle('active', !!activeRoute.continuousSelectionMode);
             continuousBtn.onclick = () => {
-                activeRoute.continuousSelectionMode = !activeRoute.continuousSelectionMode;
-                updateGraphEditToolbar(activeRoute);
-                updateGraphEditHelpPanel(activeRoute);
+                setExclusiveGraphEditMode(activeRoute, 'selection', !activeRoute.continuousSelectionMode);
             };
         }
         const boxNodeBtn = document.getElementById('kmp-toolbar-box-node');
@@ -3047,18 +4271,22 @@
         if (previewInput) {
             previewInput.checked = !!activeRoute.graphPreviewMode;
             previewInput.onchange = () => {
-                activeRoute.graphPreviewMode = !!previewInput.checked;
-                refreshGraphEditRoute(activeRoute);
+                setExclusiveGraphEditMode(activeRoute, 'preview', !!previewInput.checked);
             };
         }
         if (previewWrap) previewWrap.classList.toggle('active', !!activeRoute.graphPreviewMode);
         if (reverseBtn) {
-            reverseBtn.style.display = activeRoute.graphSelectionType === 'edge' && count ? 'inline-flex' : 'none';
-            reverseBtn.onclick = () => { reverseSelectedGraphEdges(activeRoute); refreshGraphEditRoute(activeRoute); };
+            reverseBtn.style.display = normalSelectionActionsEnabled && activeRoute.graphSelectionType === 'edge' ? 'inline-flex' : 'none';
+            reverseBtn.onclick = () => {
+                if (activeRoute.specialMarkerGroupMode) return;
+                reverseSelectedGraphEdges(activeRoute);
+                refreshGraphEditRoute(activeRoute);
+            };
         }
         if (deleteBtn) {
-            deleteBtn.style.display = count ? 'inline-flex' : 'none';
+            deleteBtn.style.display = normalSelectionActionsEnabled ? 'inline-flex' : 'none';
             deleteBtn.onclick = () => {
+                if (activeRoute.specialMarkerGroupMode) return;
                 if (activeRoute.graphSelectionType === 'edge') deleteSelectedGraphEdges(activeRoute);
                 else if (activeRoute.graphSelectionType === 'node') deleteSelectedGraphNodes(activeRoute);
                 refreshGraphEditRoute(activeRoute);
@@ -3066,9 +4294,15 @@
         }
         const clearBtn = document.getElementById('kmp-toolbar-clear');
         if (clearBtn) {
-            clearBtn.style.display = count ? 'inline-flex' : 'none';
-            clearBtn.onclick = () => { clearGraphSelection(activeRoute); refreshGraphEditRoute(activeRoute); };
+            clearBtn.style.display = normalSelectionActionsEnabled ? 'inline-flex' : 'none';
+            clearBtn.onclick = () => {
+                if (activeRoute.specialMarkerGroupMode) return;
+                clearGraphSelection(activeRoute);
+                refreshGraphEditRoute(activeRoute);
+            };
         }
+        if (saveEditBtn) saveEditBtn.onclick = () => STATE.routeManager.saveEdit(activeRoute.id);
+        if (cancelEditBtn) cancelEditBtn.onclick = () => STATE.routeManager.cancelEdit(activeRoute.id);
     }
 
     function updateGraphEditHelpPanel(route) {
@@ -3083,11 +4317,20 @@
             panel.style.display = 'none';
             return;
         }
+        if (activeRoute.specialMarkerGroupMode) {
+            panel.style.display = 'none';
+            return;
+        }
         panel.style.display = 'block';
-        if (activeRoute.graphPreviewMode) {
+        if (activeRoute.markerAssociationMode) {
+            const markerCount = getRouteAssociatedMarkers(activeRoute).length;
+            panel.innerText = `关联标记点模式\n点击官方地图标记点：添加或移除关联\n当前已关联 ${markerCount} 个标记点`;
+        } else if (activeRoute.graphPreviewMode) {
             panel.innerText = '预览模式\n编辑节点、选中状态和编辑交互已隐藏';
         } else if (activeRoute.pendingConnectFromNodeId) {
             panel.innerText = '连接模式\n左键点击目标节点：完成连接\nEsc / 点击空白处：取消连接';
+        } else if (activeRoute.continuousDrawMode) {
+            panel.innerText = '连续绘制模式\n右键地图：连续添加并连接路线点\n再次点击“连续绘制”可切回弹窗插入';
         } else {
             panel.innerText = '左键：选中节点/线段\nShift + 左键：追加或取消选择\n右键：打开上下文菜单\nEsc：取消选中';
         }
@@ -3363,18 +4606,26 @@
     }
 
     function openGraphBackgroundContextMenu(route, latlng) {
+        if (route.specialMarkerGroupMode) return;
         clearGraphEditSelection(route);
+        if (route.continuousDrawMode) {
+            addGraphNodeAtLatLng(route, latlng);
+            refreshGraphEditRoute(route);
+            return;
+        }
         openGraphBackgroundEditPopup(route, latlng);
     }
 
     function bindHitPolylineEvents(hitPolyline, route, edge) {
         hitPolyline.on('mousedown', (e) => {
+            if (route.specialMarkerGroupMode) return;
             if (!e.originalEvent || e.originalEvent.button !== 0 || !(e.originalEvent.shiftKey || route.continuousSelectionMode)) return;
             L.DomEvent.stopPropagation(e);
             startGraphBrushSelection(route, 'edge', edge.id);
         });
         hitPolyline.on('click', (e) => {
             L.DomEvent.stopPropagation(e);
+            if (route.specialMarkerGroupMode) return;
             if (route._graphSuppressSelectionClick) {
                 route._graphSuppressSelectionClick = false;
                 STATE.mapInstance.closePopup();
@@ -3391,61 +4642,24 @@
         });
         hitPolyline.on('contextmenu', (e) => {
             L.DomEvent.stopPropagation(e);
+            if (route.specialMarkerGroupMode) return;
             openGraphContextMenu(route, 'edge', edge.id, e.latlng);
         });
     }
 
-    function createEditNodeIcon(pIdx, nodeSize, state = {}) {
+    function createEditNodeIcon(pIdx, node, nodeSize, state = {}) {
         const classes = ['kmp-edit-handle-icon'];
         if (state.selected) classes.push('kmp-selected-node');
         if (state.connectSource) classes.push('kmp-connect-source');
         if (state.connectTarget) classes.push('kmp-connect-target');
+        const coordinateHtml = state.specialMarkerGroupMode
+            ? `<div class="kmp-edit-node-coordinate">${normalizeRouteCoordinate(node.x)}, ${normalizeRouteCoordinate(node.y)}</div>`
+            : '';
         return L.divIcon({
             className: classes.join(' '),
-            html: `<div class="kmp-edit-handle-visual" style="${pIdx === 0 ? 'background:#4caf50' : ''}"></div>`,
+            html: `<div class="kmp-edit-handle-visual" style="${pIdx === 0 ? 'background:#4caf50' : ''}"></div>${coordinateHtml}`,
             iconSize: [nodeSize, nodeSize],
             iconAnchor: [nodeSize / 2, nodeSize / 2]
-        });
-    }
-
-    function graphNodeStyleOptionHtml(field, value, content, active, extraClass = '') {
-        return `<button type="button" class="kmp-node-style-option ${extraClass}${active ? ' active' : ''}" data-node-style-field="${field}" data-node-style-value="${value}">${content}</button>`;
-    }
-
-    function createGraphNodeStyleGridHtml(node) {
-        const style = normalizeGraphNodeStyle(node);
-        const labels = [
-            graphNodeStyleOptionHtml('labelStyle', 'none', '无', style.labelStyle === 'none'),
-            graphNodeStyleOptionHtml('labelStyle', 'badge', '①', style.labelStyle === 'badge'),
-            graphNodeStyleOptionHtml('labelStyle', 'dot', '1.', style.labelStyle === 'dot'),
-            graphNodeStyleOptionHtml('labelStyle', 'alpha', 'A', style.labelStyle === 'alpha')
-        ];
-        const markers = [
-            graphNodeStyleOptionHtml('markerStyle', 'none', '无', style.markerStyle === 'none'),
-            graphNodeStyleOptionHtml('markerStyle', 'diamond', '◇', style.markerStyle === 'diamond'),
-            graphNodeStyleOptionHtml('markerStyle', 'star', '☆', style.markerStyle === 'star'),
-            graphNodeStyleOptionHtml('markerStyle', 'triangle', '△', style.markerStyle === 'triangle')
-        ];
-        const colors = NODE_COLOR_OPTIONS.map(color => graphNodeStyleOptionHtml('color', color, `<span class="kmp-node-style-color" style="background:${color}"></span>`, style.color === color));
-        const rows = [0, 1, 2, 3].map(index => [
-            labels[index],
-            markers[index],
-            colors[index],
-            colors[index + 4]
-        ].join('')).join('');
-        return `<div class="kmp-node-style-grid">${rows}</div>`;
-    }
-
-    function bindGraphNodeStyleOptions(route, node) {
-        document.querySelectorAll('.kmp-node-style-option[data-node-style-field]').forEach(btn => {
-            btn.onclick = () => {
-                const field = btn.getAttribute('data-node-style-field');
-                const value = btn.getAttribute('data-node-style-value');
-                if (!['labelStyle', 'markerStyle', 'color'].includes(field)) return;
-                node[field] = value;
-                document.querySelectorAll(`.kmp-node-style-option[data-node-style-field="${field}"]`).forEach(item => item.classList.toggle('active', item === btn));
-                refreshGraphEditRoute(route);
-            };
         });
     }
 
@@ -3460,7 +4674,6 @@
                         <button class="kmp-edit-popup-btn" id="btn-connect-node">开始连接</button>
                         <button class="kmp-edit-popup-btn danger" id="btn-del-node">删除点</button>
                     </div>
-                    ${createGraphNodeStyleGridHtml(node)}
                 </div>
             `)
             .openOn(STATE.mapInstance);
@@ -3470,11 +4683,9 @@
             const btnConnect = document.getElementById('btn-connect-node');
             const btnDel = document.getElementById('btn-del-node');
             const zInput = document.getElementById('node-z-input');
-            bindGraphNodeStyleOptions(route, node);
-
             if (btnSave && zInput) {
                 btnSave.onclick = () => {
-                    node.z = parseFloat(zInput.value) || 0;
+                    node.z = normalizeRouteCoordinate(zInput.value);
                     STATE.mapInstance.closePopup();
                     refreshGraphEditRoute(route);
                 };
@@ -3500,6 +4711,7 @@
 
     function bindEditMarkerEvents(marker, route, node, nodeSize) {
         marker.on('mousedown', (e) => {
+            if (route.specialMarkerGroupMode) return;
             if (!e.originalEvent || e.originalEvent.button !== 0 || !(e.originalEvent.shiftKey || route.continuousSelectionMode)) return;
             L.DomEvent.stopPropagation(e);
             startGraphBrushSelection(route, 'node', node.id);
@@ -3507,8 +4719,8 @@
         marker.on('drag', (e) => {
             const newPos = e.target.getLatLng();
             const newGamePos = latLngToGame(newPos.lat, newPos.lng);
-            node.x = newGamePos.x;
-            node.y = newGamePos.y;
+            node.x = normalizeRouteCoordinate(newGamePos.x);
+            node.y = normalizeRouteCoordinate(newGamePos.y);
         });
 
         marker.on('dragend', () => STATE.routeManager.updateEditLayer(route));
@@ -3516,6 +4728,13 @@
         marker.on('click', (e) => {
             L.DomEvent.stopPropagation(e);
             if (route.graphPreviewMode) return;
+            if (route.specialMarkerGroupMode) {
+                if (route.specialMarkerAddingGroupId) {
+                    addNodeToSpecialMarkerGroup(route, route.specialMarkerAddingGroupId, node.id);
+                    refreshGraphEditRoute(route);
+                }
+                return;
+            }
             if (route.pendingConnectFromNodeId) {
                 connectGraphNodes(route, route.pendingConnectFromNodeId, node.id);
                 route.pendingConnectFromNodeId = null;
@@ -3540,7 +4759,7 @@
         });
         marker.on('contextmenu', (e) => {
             L.DomEvent.stopPropagation(e);
-            if (route.graphPreviewMode) return;
+            if (route.graphPreviewMode || route.specialMarkerGroupMode) return;
             openGraphContextMenu(route, 'node', node.id, e.latlng);
         });
     }
@@ -3556,6 +4775,12 @@
         if (e.key === 'Escape') {
             e.preventDefault();
             e.stopPropagation();
+            if (closeSpecialMarkerStyleModal(route, false)) return;
+            if (route.specialMarkerAddingGroupId) {
+                route.specialMarkerAddingGroupId = null;
+                refreshGraphEditRoute(route);
+                return;
+            }
             clearGraphEditSelection(route);
         }
     }
@@ -3566,6 +4791,7 @@
         const mapEl = STATE.mapInstance && STATE.mapInstance.getContainer ? STATE.mapInstance.getContainer() : null;
         if (mapEl && mapEl.contains(e.target)) {
             e.preventDefault();
+            if (route.specialMarkerGroupMode) return;
             if (isGraphEditBackgroundEvent(e)) clearGraphEditSelection(route);
         }
     }
@@ -3610,6 +4836,7 @@
         if (!map || route._graphMapSelectionInstalled) return;
         route._graphOnMapClick = (e) => {
             if (!isGraphEditBackgroundEvent(e)) return;
+            if (route.specialMarkerGroupMode) return;
             if (route._graphIgnoreNextBlankClick) {
                 route._graphIgnoreNextBlankClick = false;
                 return;
@@ -3617,12 +4844,25 @@
             clearGraphEditSelection(route);
         };
         route._graphOnMapContextMenu = (e) => {
+            const ev = e.originalEvent || {};
+            if (route.specialMarkerGroupMode) {
+                L.DomEvent.preventDefault(e);
+                L.DomEvent.stopPropagation(e);
+                return;
+            }
+            if (route._graphSuppressNextContextMenu || ev.ctrlKey) {
+                route._graphSuppressNextContextMenu = false;
+                L.DomEvent.preventDefault(e);
+                L.DomEvent.stopPropagation(e);
+                return;
+            }
             if (!isGraphEditBackgroundEvent(e)) return;
             L.DomEvent.preventDefault(e);
             openGraphBackgroundContextMenu(route, e.latlng);
         };
         route._graphOnMapMouseDown = (e) => {
             if (!isGraphEditBackgroundEvent(e)) return;
+            if (route.specialMarkerGroupMode) return;
             if (route.pendingConnectFromNodeId) {
                 route.pendingConnectFromNodeId = null;
                 route.hoverConnectTargetNodeId = null;
@@ -3638,6 +4878,7 @@
             }
             if (!ev.ctrlKey) return;
             const type = ev.button === 2 ? 'edge' : 'node';
+            if (ev.button === 2) route._graphSuppressNextContextMenu = true;
             startGraphBoxSelection(route, type, e.latlng, !!ev.shiftKey);
             L.DomEvent.stopPropagation(e);
         };
@@ -3653,6 +4894,9 @@
         route._graphOnMapMouseUp = () => {
             finishGraphBrushSelection(route);
             if (route.graphBoxSelection) finishGraphBoxSelection(route);
+            if (route._graphSuppressNextContextMenu) {
+                setTimeout(() => { route._graphSuppressNextContextMenu = false; }, 250);
+            }
         };
         map.on('click', route._graphOnMapClick);
         map.on('contextmenu', route._graphOnMapContextMenu);
@@ -3675,12 +4919,18 @@
         route._graphOnMapMouseDown = null;
         route._graphOnMapMouseMove = null;
         route._graphOnMapMouseUp = null;
+        route._graphSuppressNextContextMenu = false;
         route._graphMapSelectionInstalled = false;
     }
 
     STATE.routeManager.startEdit = function(id) {
         const route = this.routes.find(r => r.id === id);
         if (!route || route.type !== 'json') return;
+        const editingRoute = getActiveEditingRoute();
+        if (editingRoute) {
+            if (editingRoute.id !== route.id) alert('请先保存或取消当前路线编辑');
+            return;
+        }
         ensureEditPanes();
 
         if (!route.visible) {
@@ -3697,11 +4947,18 @@
         route.connectionPreview = null;
         route.graphSelectionType = null;
         route.graphSelectedIds = new Set();
+        route.markerAssociationMode = false;
+        route.continuousDrawMode = !!route.isNewRoute;
+        route.continuousDrawLastNodeId = null;
         route.continuousSelectionMode = false;
         route.graphPreviewMode = false;
         route.graphBoxSelectMode = null;
+        route.specialMarkerGroupMode = false;
+        route.specialMarkerAddingGroupId = null;
+        route.specialMarkerSelectedGroupId = null;
         route._graphSuppressSelectionClick = false;
         route._graphIgnoreNextBlankClick = false;
+        route._graphSuppressNextContextMenu = false;
         route._graphBrushSelectionStarted = false;
         route._graphBrushSelectionMoved = false;
         route._editSnapshotStr = JSON.stringify(route.editingGraph);
@@ -3712,6 +4969,7 @@
         this.updateEditLayer(route);
         updateGraphEditToolbar(route);
         updateGraphEditHelpPanel(route);
+        updateSpecialMarkerGroupSidebar(route);
         renderRouteListUI();
     };
 
@@ -3747,19 +5005,20 @@
             const selected = isGraphElementSelected(route, 'edge', edge.id);
             drawEditDirectionArrow(group, latLngs[0], latLngs[1], { selected });
             const hitPolyline = createEditHitPolyline(group, latLngs, route, svgRenderer, selected);
-            if (!route.isBoxSelecting) bindHitPolylineEvents(hitPolyline, route, edge);
+            if (!route.isBoxSelecting && !route.specialMarkerGroupMode) bindHitPolylineEvents(hitPolyline, route, edge);
         });
 
         graph.nodes.forEach((node, nodeIndex) => {
             const ll = gameToLatLng(node.x, node.y);
-            const icon = createEditNodeIcon(nodeIndex, nodeSize, {
+            const icon = createEditNodeIcon(nodeIndex, node, nodeSize, {
                 selected: isGraphElementSelected(route, 'node', node.id),
                 connectSource: route.pendingConnectFromNodeId === node.id,
-                connectTarget: route.hoverConnectTargetNodeId === node.id
+                connectTarget: route.hoverConnectTargetNodeId === node.id,
+                specialMarkerGroupMode: route.specialMarkerGroupMode
             });
             const marker = L.marker(ll, {
                 icon: icon,
-                draggable: !route.isBoxSelecting,
+                draggable: !route.isBoxSelecting && !route.specialMarkerGroupMode,
                 pane: 'kmp-edit-marker-pane',
                 interactive: !route.isBoxSelecting
             }).addTo(group);
@@ -3784,7 +5043,9 @@
     STATE.routeManager.cancelEdit = function(id) {
         const route = this.routes.find(r => r.id === id);
         if (!route || !route.isEditing) return;
+        const discardNewRoute = !!route.isNewRoute;
 
+        closeSpecialMarkerStyleModal(route, false);
         this.disableBoxSelect(route);
         try { STATE.mapInstance.closePopup(); } catch (e) {}
         uninstallGraphEditMapSelectionEvents(route);
@@ -3804,9 +5065,21 @@
         route.pendingConnectFromNodeId = null;
         route.hoverConnectTargetNodeId = null;
         route.connectionPreview = null;
+        route.markerAssociationMode = false;
+        route.continuousDrawMode = false;
+        route.continuousDrawLastNodeId = null;
+        route.specialMarkerGroupMode = false;
+        route.specialMarkerAddingGroupId = null;
+        route.specialMarkerSelectedGroupId = null;
         route._editSnapshotStr = null;
         updateGraphEditToolbar(route);
         updateGraphEditHelpPanel(route);
+        updateSpecialMarkerGroupSidebar(route);
+
+        if (discardNewRoute) {
+            this.remove(route.id);
+            return;
+        }
 
         route.layer.clearLayers();
         drawJsonOnLayer(route.layer, route.rawData);
@@ -3817,6 +5090,7 @@
         const route = this.routes.find(r => r.id === id);
         if (!route) return;
 
+        closeSpecialMarkerStyleModal(route, false);
         // 确保先关闭框选模式
         this.disableBoxSelect(route);
         try { STATE.mapInstance.closePopup(); } catch (e) {}
@@ -3837,6 +5111,14 @@
             route.rawData = serializeRouteGraph(route);
         }
 
+        route.isNewRoute = false;
+        route.markerAssociationMode = false;
+        route.continuousDrawMode = false;
+        route.continuousDrawLastNodeId = null;
+        route.specialMarkerGroupMode = false;
+        route.specialMarkerAddingGroupId = null;
+        route.specialMarkerSelectedGroupId = null;
+
         route.isEditing = false;
         STATE.mapInstance.removeLayer(route.editorGroup);
         route.editorGroup = null;
@@ -3848,6 +5130,7 @@
         clearGraphSelection(route);
         updateGraphEditToolbar(route);
         updateGraphEditHelpPanel(route);
+        updateSpecialMarkerGroupSidebar(route);
 
         route.layer.clearLayers();
         drawJsonOnLayer(route.layer, route.rawData);
@@ -3866,7 +5149,8 @@
             const singleToggle = document.getElementById('sm-single-route-toggle');
             const prevBtn = document.getElementById('sm-prev-route');
             const nextBtn = document.getElementById('sm-next-route');
-            if (!exportBtn && !toggleBtn && !clearBtn && !singleToggle && !prevBtn && !nextBtn) return;
+            const createBtn = document.getElementById('sm-create-route-btn');
+            if (!exportBtn && !toggleBtn && !clearBtn && !singleToggle && !prevBtn && !nextBtn && !createBtn) return;
 
             const total = STATE.routeManager.routes.length;
             const selected = STATE.routeManager.selectedIds || new Set();
@@ -3913,11 +5197,17 @@
                 nextBtn.disabled = !singleMode || total === 0;
                 nextBtn.style.opacity = (!singleMode || total === 0) ? 0.5 : 1;
             }
+            if (createBtn) {
+                const editing = STATE.routeManager.routes.some(route => route && route.isEditing);
+                createBtn.disabled = editing;
+                createBtn.title = editing ? '请先保存或取消当前路线编辑' : '新建空白路线';
+            }
         };
 
         if (!STATE.routeManager.routes.length) {
             list.innerHTML = '<div style="text-align:center;color:#666;font-size:12px">暂无路径</div>';
             updateBulkButtons();
+            scheduleRouteMarkerDisplay('route-list-empty');
             return;
         }
 
@@ -3929,11 +5219,7 @@
 
             let btnGroupHtml = '';
             if (r.isEditing) {
-                const boxBtnStyle = r.isBoxSelecting
-                    ? 'border-color:#f44336;color:#f44336;background:rgba(244,67,54,0.1)'
-                    : 'color:#aaa;border-color:#666';
                 btnGroupHtml = `
-                    <button class="box-select" style="${boxBtnStyle}" title="画框批量删除节点">框删</button>
                     <button class="save" style="border-color:#4caf50;color:#4caf50">保存</button>
                     <button class="cancel" style="border-color:#ff9800;color:#ff9800">取消</button>
                 `;
@@ -3983,11 +5269,6 @@
             if (r.isEditing) {
                 div.querySelector('.save').onclick = () => STATE.routeManager.saveEdit(r.id);
                 div.querySelector('.cancel').onclick = () => STATE.routeManager.cancelEdit(r.id);
-                div.querySelector('.box-select').onclick = () => {
-                    STATE.routeManager.toggleBoxSelect(r.id);
-                    STATE.routeManager.updateEditLayer(r);
-                    renderRouteListUI();
-                };
             } else {
                 if (div.querySelector('.edit')) div.querySelector('.edit').onclick = () => STATE.routeManager.startEdit(r.id);
                 div.querySelector('.exp').onclick = () => STATE.routeManager.exportOne(r.id);
@@ -3999,6 +5280,7 @@
         });
 
         updateBulkButtons();
+        scheduleRouteMarkerDisplay('route-list-render');
     };
 
     function parseSvgMetadata(svgText) {
@@ -4713,7 +5995,8 @@
             const store = getMapStore();
             const cache = store && store.markersCache;
             if (!(cache instanceof Map)) return null;
-            const cacheMap = cache.get(targetType);
+            const typeStr = String(targetType).trim();
+            const cacheMap = cache.get(targetType) || cache.get(typeStr) || cache.get(Number(typeStr));
             if (!cacheMap) return null;
             const idStr = String(targetId).trim();
             return cacheMap.get(idStr) || cacheMap.get(Number(idStr)) || null;
@@ -5323,7 +6606,7 @@
                     </div>
                 </div>
                 <div class="sm-section">
-                    <div class="sm-section-title">路径绘制</div>
+                    <div class="sm-section-title">路径绘制 <button class="sm-btn" id="sm-create-route-btn" style="margin-left:auto;flex:0 0 auto">新建路线</button></div>
                     <div class="sm-btn-group">
                         <button class="sm-btn" id="sm-import-btn">导入</button>
                         <input type="file" id="sm-file-input" multiple hidden accept=".json,.svg,.zip,application/zip">
@@ -5338,7 +6621,7 @@
                         <div class="sm-ctrl-label">箭头大小: <b id="val-s">${SETTINGS.arrowSize}</b></div>
                         <input type="range" id="rng-s" min="0.5" max="3" step="0.1" value="${SETTINGS.arrowSize}">
                         <div class="sm-ctrl-label">箭头间距: <b id="val-g">${SETTINGS.arrowGap}</b></div>
-                        <input type="range" id="rng-g" min="100" max="2000" step="100" value="${SETTINGS.arrowGap}">
+                        <input type="range" id="rng-g" min="10" max="500" step="10" value="${SETTINGS.arrowGap}">
                     </div>
                     <div class="sm-route-mode-row">
                         <div class="sm-ctrl-label">仅显示单条路线</div>
@@ -5346,6 +6629,14 @@
                             <input type="checkbox" id="sm-single-route-toggle">
                             <span class="sm-slider"></span>
                         </label>
+                    </div>
+                    <div class="sm-route-marker-mode">
+                        <div class="sm-ctrl-label">路线关联标记点</div>
+                        <div class="sm-seg" id="sm-route-marker-display-mode">
+                            <button class="sm-seg-btn" type="button" data-route-marker-mode="none">不处理</button>
+                            <button class="sm-seg-btn" type="button" data-route-marker-mode="highlight">突出关联点</button>
+                            <button class="sm-seg-btn" type="button" data-route-marker-mode="focus">仅显示关联点</button>
+                        </div>
                     </div>
                     <div class="sm-route-nav">
                         <button class="sm-btn" id="sm-prev-route" disabled>上一条路线</button>
@@ -5961,6 +7252,7 @@
         }
 
         $('#sm-import-btn').onclick = () => $('#sm-file-input').click();
+        $('#sm-create-route-btn').onclick = () => STATE.routeManager.createNewRoute();
         const pageZipVersion = (globalScope && globalScope.JSZip && globalScope.JSZip.version) ? globalScope.JSZip.version : '';
         setImportStatus(pageZipVersion ? `ZIP支持：JSZip ${pageZipVersion}` : 'ZIP支持：未加载（导入ZIP时自动加载）');
 
@@ -6013,6 +7305,21 @@
             }
         };
 
+        const routeMarkerModeWrap = $('#sm-route-marker-display-mode');
+        if (routeMarkerModeWrap) {
+            routeMarkerModeWrap.querySelectorAll('[data-route-marker-mode]').forEach(button => {
+                button.onclick = () => {
+                    const mode = button.dataset.routeMarkerMode;
+                    if (!['none', 'highlight', 'focus'].includes(mode)) return;
+                    STATE.routeManager.markerDisplayMode = mode;
+                    try { localStorage.setItem('KMP_ROUTE_MARKER_DISPLAY_MODE', mode); } catch (e) {}
+                    syncRouteMarkerDisplayModeUI();
+                    scheduleRouteMarkerDisplay('display-mode-change');
+                };
+            });
+            syncRouteMarkerDisplayModeUI();
+        }
+
         $('#sm-prev-route').onclick = () => {
             if (!STATE.routeManager.singleVisibleMode) return;
             STATE.routeManager.shiftVisibleRoute(-1);
@@ -6040,8 +7347,14 @@
                 if (!idSet.has(r.id)) { keep.push(r); return; }
                 if (STATE.routeManager.selectedIds) STATE.routeManager.selectedIds.delete(r.id);
 
-                if (r.isEditing && typeof STATE.routeManager.disableBoxSelect === 'function') {
-                    try { STATE.routeManager.disableBoxSelect(r); } catch (e) {}
+                if (r.isEditing) {
+                    closeSpecialMarkerStyleModal(r, false);
+                    r.specialMarkerGroupMode = false;
+                    r.specialMarkerAddingGroupId = null;
+                    r.specialMarkerSelectedGroupId = null;
+                    if (typeof STATE.routeManager.disableBoxSelect === 'function') {
+                        try { STATE.routeManager.disableBoxSelect(r); } catch (e) {}
+                    }
                     try { STATE.mapInstance && r.editorGroup && STATE.mapInstance.removeLayer(r.editorGroup); } catch (e) {}
                 }
                 try { STATE.mainLayerGroup && r.layer && STATE.mainLayerGroup.removeLayer(r.layer); } catch (e) {}
@@ -6053,6 +7366,7 @@
                     if (!existing.has(id)) STATE.routeManager.selectedIds.delete(id);
                 }
             }
+            updateSpecialMarkerGroupSidebar(null);
             renderRouteListUI();
         };
 
@@ -6238,6 +7552,7 @@
                 // 避免在“路线”模式下遗留聚焦导致地图空白
                 try { clearMarkerFocus(); } catch (e) {}
                 try { clearHighlightPoints(); } catch (e) {}
+                scheduleRouteMarkerDisplay('search-mode-route');
             }
 
             if (modeWrap) {
@@ -6652,7 +7967,6 @@
         if (!store || typeof store.$onAction !== 'function') return;
         try {
             STATE.markerFocus._mapStoreUnsub = store.$onAction(({ name, after }) => {
-                if (!STATE.markerFocus.active) return;
                 const needsReapply =
                     name === 'smartResetPointOpacity' ||
                     name === 'initOpacityValue' ||
@@ -6662,8 +7976,8 @@
                     name === 'combinationSideMenuPointGroup';
                 if (!needsReapply) return;
                 after(() => {
-                    if (!STATE.markerFocus.active) return;
-                    scheduleApplyMarkerFocus('mapStoreAction:' + name);
+                    if (STATE.markerFocus.active) scheduleApplyMarkerFocus('mapStoreAction:' + name);
+                    scheduleRouteMarkerDisplay('mapStoreAction:' + name);
                 });
             });
         } catch (e) {}
@@ -6684,7 +7998,8 @@
         const store = getMapStore();
         const cache = store && store.markersCache;
         if (!(cache instanceof Map)) return;
-        if (!STATE.markerFocus.keepKeys || STATE.markerFocus.keepKeys.size === 0) return;
+        if (!STATE.markerFocus.keepKeys) return;
+        if (STATE.markerFocus.keepKeys.size === 0 && STATE.markerFocus.owner !== 'route') return;
 
         STATE.markerFocus._busy = true;
         try {
@@ -6720,6 +8035,29 @@
         }
     }
 
+    function applyMarkerFocusByKeys(keepKeys, owner = null, reason = 'applyMarkerFocusByKeys') {
+        const keys = keepKeys instanceof Set ? new Set(keepKeys) : new Set(Array.from(keepKeys || []));
+        if (!keys.size && owner !== 'route') {
+            clearMarkerFocus(owner);
+            return;
+        }
+        if (STATE.markerFocus._restoreTimer) {
+            clearTimeout(STATE.markerFocus._restoreTimer);
+            STATE.markerFocus._restoreTimer = null;
+        }
+        if (Array.isArray(STATE.markerFocus._pendingRestoreEntries)) {
+            STATE.markerFocus._pendingRestoreEntries.forEach(([key, opacity]) => {
+                if (!STATE.markerFocus.restoreOpacity.has(key)) STATE.markerFocus.restoreOpacity.set(key, opacity);
+            });
+            STATE.markerFocus._pendingRestoreEntries = null;
+        }
+        STATE.markerFocus.active = true;
+        STATE.markerFocus.owner = owner;
+        STATE.markerFocus.keepKeys = keys;
+        ensureMapStoreActionHook();
+        scheduleApplyMarkerFocus(reason);
+    }
+
     function applyMarkerFocusByFps(fps) {
         try {
             const list = Array.isArray(fps) ? fps.map(String).filter(Boolean) : [];
@@ -6741,14 +8079,13 @@
                 return;
             }
 
-            STATE.markerFocus.active = true;
-            STATE.markerFocus.keepKeys = keepKeys;
-            ensureMapStoreActionHook();
-            scheduleApplyMarkerFocus('applyMarkerFocusByFps');
+            applyMarkerFocusByKeys(keepKeys, 'tag', 'applyMarkerFocusByFps');
         } catch (e) {}
     }
 
-    function clearMarkerFocus() {
+    function clearMarkerFocus(owner = null) {
+        if (owner && STATE.markerFocus.owner && STATE.markerFocus.owner !== owner) return;
+        STATE.markerFocus.owner = null;
         if (!STATE.markerFocus.active && (!STATE.markerFocus.restoreOpacity || STATE.markerFocus.restoreOpacity.size === 0)) return;
         STATE.markerFocus.active = false;
         if (STATE.markerFocus.keepKeys) STATE.markerFocus.keepKeys.clear();
@@ -6760,6 +8097,7 @@
 
         const entries = Array.from(restore.entries());
         restore.clear();
+        STATE.markerFocus._pendingRestoreEntries = entries;
 
         const doRestore = async () => {
             if (STATE.markerFocus._busy) return;
@@ -6777,7 +8115,7 @@
                     if (sep <= 0) continue;
                     const typeId = key.slice(0, sep);
                     const idStr = key.slice(sep + 2);
-                    const inner = cache.get(typeId);
+                    const inner = cache.get(typeId) || cache.get(Number(typeId));
                     if (!(inner instanceof Map)) continue;
                     const ctrl = inner.get(idStr) ?? inner.get(Number(idStr));
                     if (!ctrl) continue;
@@ -6791,6 +8129,7 @@
                 try { console.info('[KMP Focus] restore', { changed, total: entries.length }); } catch (e) {}
             } finally {
                 STATE.markerFocus._busy = false;
+                STATE.markerFocus._pendingRestoreEntries = null;
             }
         };
 

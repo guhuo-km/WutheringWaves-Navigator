@@ -33,7 +33,7 @@ def test_compare_versions_uses_fourth_version_segment():
     assert compare_versions("0.1.6.2", "0.1.6.1") == 1
 
 
-def test_http_provider_selects_unified_file_artifact():
+def test_http_provider_file_route_ignores_legacy_full_zip_metadata():
     session = FakeSession(
         {
             "latest_version": "0.2.0",
@@ -42,6 +42,10 @@ def test_http_provider_selects_unified_file_artifact():
                 "windows-x64": {
                     "update_mode": "file",
                     "manifest_url": "https://updates.example.com/manifest.json",
+                    "updater_url": "https://updates.example.com/files/updater",
+                    "updater_sha256": "a" * 64,
+                    "full_zip_url": "https://updates.example.com/releases/0.2.0/portable.zip",
+                    "full_zip_sha256": "b" * 64,
                     "size": 12,
                 }
             },
@@ -60,9 +64,36 @@ def test_http_provider_selects_unified_file_artifact():
     assert result.release_notes == "- ok"
     assert result.update_mode == "file"
     assert result.manifest_url == "https://updates.example.com/manifest.json"
-    assert result.full_zip_url == ""
-    assert result.full_zip_sha256 == ""
     assert result.download_url == ""
+    assert not hasattr(result, "full_zip_url")
+    assert not hasattr(result, "full_zip_sha256")
+    assert result.updater_url == "https://updates.example.com/files/updater"
+    assert result.updater_sha256 == "a" * 64
+
+
+def test_http_provider_rejects_file_update_without_verified_updater_metadata():
+    session = FakeSession(
+        {
+            "latest_version": "0.2.0",
+            "artifacts": {
+                "windows-x64": {
+                    "update_mode": "file",
+                    "manifest_url": "https://updates.example.com/manifest.json",
+                    "size": 12,
+                }
+            },
+        }
+    )
+    provider = HttpUpdateProvider(
+        latest_url="https://updates.example.com/latest.json",
+        artifact_key="windows-x64",
+        session=session,
+    )
+
+    result = provider.check("0.1.0")
+
+    assert result.has_update is False
+    assert "更新器" in result.error_message
 
 
 def test_http_provider_supports_full_update_fallback():

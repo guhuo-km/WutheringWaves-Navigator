@@ -7,44 +7,21 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+SOURCE_ROOT = PROJECT_ROOT / "src"
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
+
+from src.core.update_manifest import is_preserved_update_path
 
 
-PROTECTED_PREFIXES = (
-    "logs/",
-    ".update/",
-    "recorded_routes/",
-    "tiles/",
-    "images/",
-    "src/recorded_routes/",
-    "src/tiles/",
-    "src/images/",
-    "_internal/recorded_routes/",
-    "_internal/tiles/",
-    "_internal/images/",
-)
-
-PROTECTED_FILE_NAMES = {
-    "app_settings.json",
-    "ocr_config.json",
-    "language_config.json",
-    "calibration_data.json",
-    "maps.json",
-}
-
-PROTECTED_FILES = {
-    name for name in PROTECTED_FILE_NAMES
-} | {
-    f"src/{name}" for name in PROTECTED_FILE_NAMES
-} | {
-    f"_internal/{name}" for name in PROTECTED_FILE_NAMES
-} | {
-    "WutheringWaves-Updater.exe"
-} | {
-    "README.txt"
-}
+DOWNLOAD_PAGE_URL = "https://www.wuwuddt.com/download"
 
 
 def normalize_manifest_path(path: Path) -> str:
@@ -52,10 +29,7 @@ def normalize_manifest_path(path: Path) -> str:
 
 
 def should_protect_path(relative_path: str) -> bool:
-    path = relative_path.replace("\\", "/")
-    if path in PROTECTED_FILES:
-        return True
-    return any(path.startswith(prefix) for prefix in PROTECTED_PREFIXES)
+    return is_preserved_update_path(relative_path)
 
 
 def sha256_file(path: Path) -> str:
@@ -79,13 +53,13 @@ def build_manifest(
         protected = should_protect_path(relative_path)
         managed = not protected
         digest = sha256_file(file_path)
-        url_path = digest if managed else relative_path
+        url = f"{file_url_prefix.rstrip('/')}/{digest}" if managed else ""
         files.append(
             {
                 "path": relative_path,
                 "size": file_path.stat().st_size,
                 "sha256": digest,
-                "url": f"{file_url_prefix.rstrip('/')}/{url_path}",
+                "url": url,
                 "managed": managed,
                 "protected": protected,
             }
@@ -102,35 +76,10 @@ def build_manifest(
     }
 
 
-def load_previous_manifest(path: Path | None) -> dict[str, dict]:
-    if path is None:
-        return {}
-    if not path.exists():
-        return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return {entry["path"]: entry for entry in data.get("files", [])}
-
-
-def build_delete_entries(manifest: dict, previous_entries: dict[str, dict] | None = None) -> list[str]:
-    previous_entries = previous_entries or {}
-    current_paths = {entry["path"] for entry in manifest.get("files", [])}
-    delete: list[str] = []
-    for path, previous in sorted(previous_entries.items()):
-        if path in current_paths:
-            continue
-        if previous.get("protected") or not previous.get("managed", True):
-            continue
-        if should_protect_path(path):
-            continue
-        delete.append(path)
-    return delete
-
-
 def copy_changed_files(
     dist_root: Path,
     files_root: Path,
     manifest: dict,
-    previous_entries: dict[str, dict] | None = None,
 ) -> list[str]:
     copied: list[str] = []
     seen_hashes: set[str] = set()
@@ -143,7 +92,7 @@ def copy_changed_files(
         seen_hashes.add(digest)
         target = files_root / digest
         source = dist_root / entry["path"]
-        if target.exists():
+        if target.exists() and sha256_file(target) == digest:
             continue
         files_root.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
@@ -155,12 +104,19 @@ def copy_managed_files(dist_root: Path, files_root: Path, manifest: dict) -> lis
     return copy_changed_files(dist_root, files_root, manifest)
 
 
-def create_portable_zip(dist_root: Path, output_path: Path) -> str:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with ZipFile(output_path, "w", ZIP_DEFLATED) as archive:
-        for file_path in sorted(path for path in dist_root.rglob("*") if path.is_file()):
-            archive.write(file_path, file_path.relative_to(dist_root))
-    return sha256_file(output_path)
+def publish_updater_artifact(dist_root: Path, files_root: Path, file_url_prefix: str) -> dict:
+    updater_path = dist_root / "WutheringWaves-Updater.exe"
+    if not updater_path.exists() or not updater_path.is_file():
+        raise FileNotFoundError(f"updater does not exist: {updater_path}")
+    digest = sha256_file(updater_path)
+    target = files_root / digest
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.exists() or sha256_file(target) != digest:
+        shutil.copy2(updater_path, target)
+    return {
+        "url": f"{file_url_prefix.rstrip('/')}/{digest}",
+        "sha256": digest,
+    }
 
 
 def load_version_file(project_root: Path) -> dict:
@@ -175,8 +131,9 @@ def write_json(path: Path, data: dict) -> None:
 def write_dist_version_file(dist_root: Path, version_info: dict, update_base_url: str) -> Path:
     packaged_info = dict(version_info)
     packaged_info["update_base_url"] = f"{update_base_url.rstrip('/')}/latest.json"
-    version_path = dist_root / "version.json"
+    version_path = dist_root / "_internal" / "version.json"
     write_json(version_path, packaged_info)
+    (dist_root / "version.json").unlink(missing_ok=True)
     return version_path
 
 
@@ -186,13 +143,19 @@ def build_latest_metadata(
     version: str,
     update_base_url: str,
     artifact_size: int,
-    installer_info: dict | None,
+    updater_info: dict,
     release_notes: str = "文件级更新发布。",
 ) -> dict:
     update_base_url = update_base_url.rstrip("/")
     if not update_base_url:
         raise ValueError("update_base_url is required for release metadata")
-    latest = {
+    legacy_download_info = {
+        "version": version,
+        "update_mode": "full",
+        "download_url": DOWNLOAD_PAGE_URL,
+        "installer_url": DOWNLOAD_PAGE_URL,
+    }
+    return {
         "schema": 1,
         "app_id": app_id,
         "channel": channel,
@@ -200,17 +163,20 @@ def build_latest_metadata(
         "release_url": f"{update_base_url}/releases/{version}/release.json",
         "release_notes": release_notes,
         "artifacts": {
-            "windows-x64": {
+            "windows-x64-v2": {
                 "version": version,
                 "update_mode": "file",
                 "manifest_url": f"{update_base_url}/releases/{version}/manifest.json",
                 "size": artifact_size,
-            }
+                "updater_url": updater_info["url"],
+                "updater_sha256": updater_info["sha256"],
+                "download_url": DOWNLOAD_PAGE_URL,
+            },
+            "windows-x64": legacy_download_info,
+            "windows-x64-portable": legacy_download_info,
+            "windows-x64-installer": legacy_download_info,
         },
     }
-    if installer_info is not None:
-        latest["artifacts"]["windows-x64-installer"] = installer_info
-    return latest
 
 
 def main() -> int:
@@ -219,11 +185,6 @@ def main() -> int:
     parser.add_argument("--dist-root", default=None)
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--installer", default=None)
-    parser.add_argument(
-        "--previous-manifest",
-        default=None,
-        help="Previous release manifest used to copy only changed files into portable/files.",
-    )
     parser.add_argument(
         "--update-base-url",
         default=None,
@@ -265,33 +226,36 @@ def main() -> int:
     write_dist_version_file(dist_root, version_info, update_base_url)
 
     manifest = build_manifest(dist_root, app_id, version, channel, f"{update_base_url}/files")
-    previous_manifest = Path(args.previous_manifest).resolve() if args.previous_manifest else None
-    previous_entries = load_previous_manifest(previous_manifest)
-    manifest["delete"] = build_delete_entries(manifest, previous_entries)
-    pool_files = copy_changed_files(dist_root, files_root, manifest, previous_entries)
+    copy_changed_files(dist_root, files_root, manifest)
+    try:
+        updater_info = publish_updater_artifact(
+            dist_root,
+            files_root,
+            f"{update_base_url}/files",
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
     write_json(release_root / "manifest.json", manifest)
 
-    installer_info = None
     if args.installer:
         installer_source = Path(args.installer).resolve()
         installer_target = release_root / "installer" / installer_source.name
         installer_target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(installer_source, installer_target)
-        installer_info = {
-            "version": version,
-            "update_mode": "installer",
-            "installer_url": f"{update_base_url}/releases/{version}/installer/{installer_target.name}",
-            "installer_sha256": sha256_file(installer_target),
-            "size": installer_target.stat().st_size,
-        }
 
     latest = build_latest_metadata(
         app_id=app_id,
         channel=channel,
         version=version,
         update_base_url=update_base_url,
-        artifact_size=sum((files_root / digest).stat().st_size for digest in pool_files),
-        installer_info=installer_info,
+        artifact_size=sum(
+            {
+                entry["sha256"]: int(entry["size"])
+                for entry in manifest["files"]
+                if entry["managed"]
+            }.values()
+        ),
+        updater_info=updater_info,
         release_notes=args.release_notes,
     )
 

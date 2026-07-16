@@ -106,24 +106,41 @@ def main():
         QMessageBox.warning(None, "程序已在运行", "检测到程序已启动，请勿重复打开。")
         sys.exit(0)
 
+    app_root = paths.app_root()
     try:
-        from core.update_lock import is_update_in_progress, update_in_progress_message
+        from core.update_lock import (
+            is_update_in_progress,
+            update_in_progress_message,
+            update_lock,
+        )
 
-        app_root = paths.app_root()
         if is_update_in_progress(app_root):
             QMessageBox.information(None, "更新正在进行", update_in_progress_message())
             sys.exit(0)
         if getattr(sys, "frozen", False):
+            from core.file_updater import recover_interrupted_updates
+
+            with update_lock(app_root):
+                recovered = recover_interrupted_updates(app_root)
+            if recovered:
+                print(f"[UPDATE_RECOVERY] restored interrupted updates: {len(recovered)}")
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"[UPDATE_GUARD] recovery failed: {e}")
+        QMessageBox.information(None, "更新正在进行", update_in_progress_message())
+        sys.exit(1)
+
+    if getattr(sys, "frozen", False):
+        try:
             from core.startup_maintenance import run_startup_maintenance
 
             result = run_startup_maintenance(app_root)
             removed = result.get("removed") or []
             if removed:
                 print(f"[STARTUP_MAINTENANCE] removed obsolete files: {len(removed)}")
-            if result.get("updater_refreshed"):
-                print("[STARTUP_MAINTENANCE] updater refreshed")
-    except Exception as e:
-        print(f"[UPDATE_GUARD] unavailable: {e}")
+        except Exception as e:
+            print(f"[STARTUP_MAINTENANCE] unavailable: {e}")
 
     def _release_single_instance_lock():
         if single_instance_lock.isLocked():

@@ -2,7 +2,7 @@
   "app_id": "wutheringwaves-navigator",
   "name": "WutheringWaves-Navigator",
   "display_name": "呜呜大地图",
-  "version": "0.1.6.21",
+  "version": "0.1.6.23",
   "channel": "stable",
   "update_base_url": ""
 }

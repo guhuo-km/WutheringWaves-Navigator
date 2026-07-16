@@ -14,6 +14,7 @@ from PySide6.QtCore import QObject, Signal, QTimer
 from PySide6.QtWidgets import QMessageBox, QFileDialog
 
 from core import paths
+from core.route_export_paths import resolve_route_export_directory
 
 # 多语言支持
 try:
@@ -307,7 +308,7 @@ class RouteRecorder(QObject):
             filename, _ = QFileDialog.getSaveFileName(
                 parent_widget,
                 "保存路线文件",
-                f"{route_data.name}.json",
+                str(resolve_route_export_directory() / f"{route_data.name}.json"),
                 "JSON files (*.json);;All files (*.*)"
             )
             

@@ -6,6 +6,7 @@ OCR管理器 - 负责协调OCR引擎和UI界面
 """
 
 import json
+import logging
 import os
 import time
 from dataclasses import asdict
@@ -42,6 +43,7 @@ from ocr_engine import OCRWorker
 from ocr_region_calibrator import OCRRegionCalibrator
 from screen_capture import capture_frame_and_region_callback, capture_region_callback
 from core import paths
+from core.gpu_adapters import GpuAdapterSelectionError, normalize_adapter_selection
 from core.map_context import CoordinateCandidate
 from core.observation_evidence_log import route_observation_bundle
 from core.settings_manager import SettingsManager
@@ -872,6 +874,7 @@ class OCRManager(QObject):
     auto_window_status_changed = Signal(dict)  # 自动窗口检测状态更新
     ocr_region_source_changed = Signal(str)  # 'none', 'auto', 'manual'
     minimap_roi_locked = Signal(dict)  # 自动小地图 ROI 锁定后发射
+    gpu_acceleration_failed = Signal(dict)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -900,7 +903,9 @@ class OCRManager(QObject):
             'target_window_name': '',
             'screenshot_mode': 'BitBlt',
             'auto_detect_region_enabled': True,
-            'auto_jump_enabled': True  # 默认启用自动跳转
+            'auto_jump_enabled': True,  # 默认启用自动跳转
+            'gpu_acceleration_enabled': True,
+            'gpu_adapter': None,
         }
         
         # 加载配置
@@ -986,14 +991,46 @@ class OCRManager(QObject):
             print(f"加载OCR配置失败: {e}")
             return self.default_config.copy()
     
-    def save_config(self):
+    def save_config(self) -> bool:
         """保存OCR配置"""
         try:
             self.config_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.ocr_config, f, indent=2, ensure_ascii=False)
+            return True
         except Exception as e:
             print(f"保存OCR配置失败: {e}")
+            return False
+
+    def _gpu_settings_are_locked(self) -> bool:
+        return self.ocr_worker is not None
+
+    def set_gpu_acceleration_enabled(self, enabled: bool) -> bool:
+        if self._gpu_settings_are_locked():
+            return False
+        previous = self.ocr_config.get('gpu_acceleration_enabled', False)
+        self.ocr_config['gpu_acceleration_enabled'] = bool(enabled)
+        if not self.save_config():
+            self.ocr_config['gpu_acceleration_enabled'] = previous
+            return False
+        return True
+
+    def set_gpu_adapter(self, selection: Optional[Dict[str, Any]]) -> bool:
+        if self._gpu_settings_are_locked():
+            return False
+        if selection is None:
+            normalized = None
+        else:
+            try:
+                normalized = normalize_adapter_selection(selection)
+            except GpuAdapterSelectionError:
+                return False
+        previous = self.ocr_config.get('gpu_adapter')
+        self.ocr_config['gpu_adapter'] = normalized
+        if not self.save_config():
+            self.ocr_config['gpu_adapter'] = previous
+            return False
+        return True
 
     def get_ocr_area_source(self) -> str:
         """获取OCR区域来源（auto/manual/none）"""
@@ -1354,6 +1391,8 @@ class OCRManager(QObject):
             self.ocr_worker.ocr_output_updated.connect(self.on_ocr_output_updated)
             self.ocr_worker.capture_area_updated.connect(self.on_capture_area_updated)
             self.ocr_worker.captured_frame_ready.connect(self.on_observation_frame_captured)
+            self.ocr_worker.fatal_gpu_error.connect(self.on_fatal_gpu_error)
+            self.ocr_worker.finished.connect(self._on_ocr_worker_finished)
             
             # 启动OCR
             self.ocr_worker.start_recognition()
@@ -1400,6 +1439,32 @@ class OCRManager(QObject):
         if self.ocr_worker is not None:
             return self.ocr_worker.get_current_state()
         return "STOPPED"
+
+    @Slot()
+    def _on_ocr_worker_finished(self) -> None:
+        worker = self.sender()
+        if self.ocr_worker is worker:
+            worker.deleteLater()
+            self.ocr_worker = None
+
+    @Slot(dict)
+    def on_fatal_gpu_error(self, payload: dict) -> None:
+        details = dict(payload) if isinstance(payload, dict) else {'payload': payload}
+        logger = logging.getLogger(__name__)
+        logger.error("DirectML OCR fatal error: %s", details)
+        worker = self.ocr_worker
+        if worker is not None:
+            worker.should_stop = True
+        if self._log_manager:
+            try:
+                self._log_manager.enqueue(
+                    "recognition",
+                    "DirectML OCR fatal error: " + json.dumps(details, ensure_ascii=False),
+                )
+            except Exception:
+                logger.exception("Failed to persist DirectML OCR fatal error")
+        self.state_changed.emit("STOPPED")
+        self.gpu_acceleration_failed.emit(details)
     
     def update_confidence_threshold(self, threshold: float):
         """更新置信度阈值"""

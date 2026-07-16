@@ -46,12 +46,17 @@ try:
     from core.constants import get_map_urls, DEFAULT_HOTKEYS
     from core.calibration import TransformMatrix
     from core.map_provider_capabilities import capabilities_for_current_map
+    from core.route_export_paths import (
+        is_route_export_download,
+        resolve_route_export_directory,
+    )
     from core.map_control_bridge import (
         build_map_control_command,
         build_tile_metadata_update_listener,
         build_tile_metadata_snapshot_query,
     )
     from core.update_provider import HttpUpdateProvider, UpdateResult
+    from core.update_downloader import prepare_updater_binary
     from core.utils import get_assets_path
     from core.version import find_version_file, load_version_info
     from core.vision_context import build_vision_snapshot, map_context_from_js
@@ -65,12 +70,17 @@ except ImportError:
     from ..core.constants import get_map_urls, DEFAULT_HOTKEYS
     from ..core.calibration import TransformMatrix
     from ..core.map_provider_capabilities import capabilities_for_current_map
+    from ..core.route_export_paths import (
+        is_route_export_download,
+        resolve_route_export_directory,
+    )
     from ..core.map_control_bridge import (
         build_map_control_command,
         build_tile_metadata_update_listener,
         build_tile_metadata_snapshot_query,
     )
     from ..core.update_provider import HttpUpdateProvider, UpdateResult
+    from ..core.update_downloader import prepare_updater_binary
     from ..core.utils import get_assets_path
     from ..core.version import find_version_file, load_version_info
     from ..core.vision_context import build_vision_snapshot, map_context_from_js
@@ -101,15 +111,12 @@ def build_updater_command(
         "--wait-pid",
         str(wait_pid),
     ]
-    if result.full_zip_url:
-        command.extend(["--full-zip-url", result.full_zip_url])
-    if result.full_zip_sha256:
-        command.extend(["--full-zip-sha256", result.full_zip_sha256])
     return command
 
 
 class MainWindow(FluentWindow):
     _update_check_finished = Signal(object, str, str)
+    _updater_prepare_finished = Signal(object, str, bool)
     _system_log_requested = Signal(str, str)
 
     def __init__(self, parent=None):
@@ -136,6 +143,7 @@ class MainWindow(FluentWindow):
         self._about_nav_item = None
         self._about_nav_badge = None
         self._update_check_in_progress = False
+        self._updater_prepare_in_progress = False
         self._last_update_result: Optional[UpdateResult] = None
         self._python_download_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="python-download")
         self._update_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="update-check")
@@ -156,6 +164,7 @@ class MainWindow(FluentWindow):
             artifact_key=self._get_update_artifact_key(),
         )
         self._update_check_finished.connect(self._on_update_check_finished)
+        self._updater_prepare_finished.connect(self._on_updater_prepare_finished)
 
         # 应用保存的主题设置
         self._apply_saved_theme()
@@ -171,7 +180,7 @@ class MainWindow(FluentWindow):
         QTimer.singleShot(100, self._post_init)
 
     def _get_update_artifact_key(self) -> str:
-        return "windows-x64"
+        return "windows-x64-v2"
 
     def _log_version_source(self):
         version_file = str(self._version_file) if self._version_file else "未找到"
@@ -532,7 +541,6 @@ class MainWindow(FluentWindow):
     def _on_tile_metadata_changed(self, updated_at: str):
         if not self._supports_official_tile_metadata():
             return
-        self._app_state.append_system_log(f"小地图瓦片变更通知: updatedAt={updated_at or 'unknown'}", "INFO")
         if self._tile_metadata_refresh_pending:
             return
         self._tile_metadata_refresh_pending = True
@@ -760,8 +768,6 @@ class MainWindow(FluentWindow):
         )
 
     def _build_download_target_path(self, url: str, download_item) -> str:
-        download_dir = self._get_download_dir()
-
         suggested_name = "download.bin"
         try:
             candidate = download_item.downloadFileName()
@@ -780,6 +786,10 @@ class MainWindow(FluentWindow):
                 pass
 
         suggested_name = self._sanitize_filename(suggested_name)
+        if is_route_export_download(url, suggested_name):
+            download_dir = str(resolve_route_export_directory(self._settings))
+        else:
+            download_dir = self._get_download_dir()
         return self._ensure_unique_path(os.path.join(download_dir, suggested_name))
 
     def _get_download_dir(self) -> str:
@@ -904,6 +914,9 @@ class MainWindow(FluentWindow):
         # 8. Settings
         self._settings_interface = SettingsInterface(self._app_state, self)
         self._settings_interface.setObjectName("settingsInterface")
+        if self._ocr_manager:
+            self._settings_interface.set_gpu_configuration(self._ocr_manager.ocr_config)
+            self._settings_interface.set_ocr_running(self._app_state.ocr_running)
         
         # 9. About
         self._about_interface = AboutInterface(self)
@@ -1001,6 +1014,7 @@ class MainWindow(FluentWindow):
             self._app_state.ocr_state_changed.connect(
                 lambda state: self._navigation_interface.update_ocr_status(state != "STOPPED")
             )
+            self._app_state.ocr_state_changed.connect(self._on_ocr_running_changed)
             # Keep Lite runtime in sync with app state changes
             self._app_state.mode_changed.connect(lambda _v: self._inject_kmp_runtime())
             self._app_state.map_provider_changed.connect(lambda _v: self._inject_kmp_runtime())
@@ -1076,6 +1090,16 @@ class MainWindow(FluentWindow):
         # Settings Interface
         self._settings_interface.language_changed.connect(self._on_language_changed)
         self._settings_interface.theme_changed.connect(self._on_theme_changed)
+        self._settings_interface.gpu_acceleration_changed.connect(
+            self._on_gpu_acceleration_changed
+        )
+        self._settings_interface.gpu_adapter_changed.connect(
+            self._on_gpu_adapter_changed
+        )
+        if self._ocr_manager:
+            self._ocr_manager.gpu_acceleration_failed.connect(
+                self._on_gpu_acceleration_failed
+            )
         try:
             self._settings_interface.log_settings_changed.connect(
                 self._on_log_settings_changed
@@ -1366,7 +1390,6 @@ class MainWindow(FluentWindow):
         target_url = (
             result.download_url
             or result.installer_url
-            or result.full_zip_url
             or self._version_info.update_base_url
             or "https://wuwuddt.com"
         )
@@ -1397,11 +1420,99 @@ class MainWindow(FluentWindow):
             QMessageBox.warning(self, "无法自动更新", "更新信息不完整，请打开下载页手动下载。")
             self._open_update_download_url(result)
             return
+        if not result.updater_url or len(result.updater_sha256) != 64:
+            QMessageBox.warning(
+                self,
+                tr("update_auto_unavailable_title", "无法自动更新"),
+                tr(
+                    "update_updater_metadata_incomplete",
+                    "更新器信息不完整，请打开下载页手动下载。",
+                ),
+            )
+            self._open_update_download_url(result)
+            return
         lock_path = self._update_apply_lock_path()
         if lock_path.exists():
             QMessageBox.information(self, "更新正在应用", "更新器已经在运行，请稍等。")
             self._app_state.append_system_log(f"更新器锁已存在: {lock_path}", "INFO")
             return
+        if self._updater_prepare_in_progress:
+            self._app_state.append_system_log(
+                tr(
+                    "update_updater_prepare_duplicate",
+                    "更新器准备中，已忽略重复请求",
+                ),
+                "INFO",
+            )
+            return
+
+        self._updater_prepare_in_progress = True
+        self._app_state.append_system_log(
+            tr("update_updater_preparing", "正在校验并准备更新器"),
+            "INFO",
+        )
+        try:
+            self._update_check_executor.submit(self._run_updater_prepare_thread, result)
+        except Exception as exc:
+            self._updater_prepare_in_progress = False
+            message = tr(
+                "update_updater_prepare_failed",
+                "准备更新器失败: {error}",
+                error=exc,
+            )
+            QMessageBox.warning(
+                self,
+                tr("update_apply_unavailable_title", "无法应用更新"),
+                message,
+            )
+            self._app_state.append_system_log(message, "ERROR")
+
+    def _run_updater_prepare_thread(self, result: UpdateResult):
+        try:
+            replaced = prepare_updater_binary(
+                updater_path=self._updater_exe_path(),
+                updater_url=result.updater_url,
+                updater_sha256=result.updater_sha256,
+                staging_dir=self._app_root_for_update() / ".update" / "bootstrap",
+            )
+            error_message = ""
+        except Exception as exc:
+            replaced = False
+            error_message = str(exc)
+        self._updater_prepare_finished.emit(result, error_message, replaced)
+
+    @Slot(object, str, bool)
+    def _on_updater_prepare_finished(self, result: UpdateResult, error_message: str, replaced: bool):
+        self._updater_prepare_in_progress = False
+        if error_message:
+            message = tr(
+                "update_updater_update_failed",
+                "更新器更新失败: {error}",
+                error=error_message,
+            )
+            QMessageBox.warning(
+                self,
+                tr("update_apply_unavailable_title", "无法应用更新"),
+                message,
+            )
+            self._app_state.append_system_log(message, "ERROR")
+            return
+        if replaced:
+            self._app_state.append_system_log(
+                tr("update_updater_updated", "更新器已更新并通过哈希校验"),
+                "INFO",
+            )
+        else:
+            self._app_state.append_system_log(
+                tr(
+                    "update_updater_already_current",
+                    "当前更新器已是目标版本",
+                ),
+                "INFO",
+            )
+        self._launch_file_updater(result)
+
+    def _launch_file_updater(self, result: UpdateResult):
         updater = self._updater_exe_path()
         if not updater.exists():
             QMessageBox.warning(self, "无法应用更新", "未找到更新器，请打开下载页手动下载新版。")
@@ -2056,6 +2167,36 @@ class MainWindow(FluentWindow):
     def _on_ocr_state_changed(self, state: str):
         self._app_state.ocr_running = (state != "STOPPED")
         self._app_state.append_system_log(f"OCR状态变化: {state}", "INFO")
+
+    @Slot(str)
+    def _on_ocr_running_changed(self, state: str):
+        self._settings_interface.set_ocr_running(state != "STOPPED")
+
+    @Slot(bool)
+    def _on_gpu_acceleration_changed(self, enabled: bool):
+        if not self._ocr_manager:
+            return
+        self._ocr_manager.set_gpu_acceleration_enabled(enabled)
+        self._settings_interface.set_gpu_configuration(self._ocr_manager.ocr_config)
+
+    @Slot(dict)
+    def _on_gpu_adapter_changed(self, selection: dict):
+        if not self._ocr_manager:
+            return
+        self._ocr_manager.set_gpu_adapter(selection)
+        self._settings_interface.set_gpu_configuration(self._ocr_manager.ocr_config)
+
+    @Slot(dict)
+    def _on_gpu_acceleration_failed(self, _details: dict):
+        self._settings_interface.mark_gpu_unavailable()
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle(tr("app_title"))
+        dialog.setText(tr("gpu_acceleration_unavailable_title"))
+        dialog.setInformativeText(tr("gpu_acceleration_unavailable_message"))
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        dialog.setDefaultButton(QMessageBox.StandardButton.Ok)
+        dialog.exec()
     
     @Slot(str)
     def _on_ocr_error(self, error: str):
@@ -2284,7 +2425,10 @@ class MainWindow(FluentWindow):
             save_path, _ = QFileDialog.getSaveFileName(
                 self,
                 "导出路线",
-                f"route_export_{filepath.split('/')[-1]}",
+                str(
+                    resolve_route_export_directory(self._settings)
+                    / f"route_export_{os.path.basename(filepath)}"
+                ),
                 "JSON Files (*.json)"
             )
 
@@ -2658,9 +2802,19 @@ class MainWindow(FluentWindow):
         self._is_closing = True
 
         try:
+            if (
+                self._settings_interface
+                and not self._settings_interface.shutdown_gpu_discovery()
+            ):
+                self._is_closing = False
+                event.ignore()
+                return
+
             # 停止OCR，避免窗口释放后 OCR worker 继续发信号
-            if self._ocr_manager:
-                self._ocr_manager.stop_ocr()
+            if self._ocr_manager and not self._ocr_manager.stop_ocr():
+                self._is_closing = False
+                event.ignore()
+                return
 
             # 停止路线录制
             if self._route_recorder and self._app_state.recording_active:

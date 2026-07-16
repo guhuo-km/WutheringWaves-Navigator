@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Condition, Thread
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from minimap_tile_snapshot import download_tile_snapshot_result, parse_tile_metadata_snapshot_result
 from minimap_tile_downloader import convert_tile_snapshot_to_download_inputs
@@ -47,6 +47,9 @@ class MinimapTileSyncService:
         self._pending_snapshot: str | dict[str, Any] | None = None
         self._shutdown = False
         self._worker: Thread | None = None
+        self._processed_tile_signatures: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+        self._reconciled_area_ids: set[str] = set()
+        self._pending_reconciliation_area_ids: set[str] = set()
         self.last_summary: MinimapTileSyncSummary | None = None
 
     def submit_snapshot(self, snapshot_result: str | dict[str, Any] | None) -> bool:
@@ -99,20 +102,67 @@ class MinimapTileSyncService:
     def _process_snapshot(self, snapshot_result: str | dict[str, Any] | None) -> MinimapTileSyncSummary:
         try:
             snapshot = parse_tile_metadata_snapshot_result(snapshot_result)
-            tile_root = Path(self._tile_root_provider())
-            download_result = self._download_func(snapshot_result, tile_root)
-            if download_result is None:
+            if snapshot is None:
                 return MinimapTileSyncSummary(error="snapshot_parse_failed")
+            sync_snapshot, pending_signatures = self._incremental_snapshot(snapshot)
+            snapshot_area_ids = self._tile_snapshot_area_ids(snapshot)
+            reconcile_area_ids = [
+                area_id
+                for area_id in snapshot_area_ids
+                if area_id not in self._reconciled_area_ids
+                or area_id in self._pending_reconciliation_area_ids
+            ]
+            if not pending_signatures and not reconcile_area_ids:
+                return MinimapTileSyncSummary(
+                    index_pending_count=int(getattr(self._index_queue, "pending_count", 0))
+                )
 
-            index_queued, pending = self._enqueue_changed_tile_indexes(download_result.downloaded_sizes.keys())
-            stale_queued, pending = self._enqueue_stale_sift_indexes(snapshot, pending)
-            missing_queued, pending = self._enqueue_missing_indexes(snapshot, pending)
-            changed_area_ids = sorted(str(area_id) for area_id in download_result.changed_area_ids)
+            tile_root = Path(self._tile_root_provider())
+            download_result = None
+            downloaded_keys = ()
+            if pending_signatures:
+                sync_result = {"ok": True, "data": sync_snapshot}
+                download_result = self._download_func(sync_result, tile_root)
+                if download_result is None:
+                    return MinimapTileSyncSummary(error="snapshot_parse_failed")
+                downloaded_keys = tuple(download_result.downloaded_sizes.keys())
+            index_queued, pending = self._enqueue_changed_tile_indexes(downloaded_keys)
+            stale_queued, pending = self._enqueue_stale_sift_indexes(reconcile_area_ids, pending)
+            missing_queued, pending, incomplete_identities = self._enqueue_missing_indexes(
+                sync_snapshot,
+                pending,
+                excluded_keys=downloaded_keys,
+            )
+            failures = getattr(download_result, "failures", {}) or {} if download_result is not None else {}
+            failed_identities = {
+                self._tile_identity(key)
+                for key in failures
+                if hasattr(key, "area_id")
+            }
+            unresolved_identities = (
+                {self._tile_identity(key) for key in downloaded_keys}
+                | failed_identities
+                | incomplete_identities
+            )
+            for identity, signature in pending_signatures.items():
+                if identity not in unresolved_identities:
+                    self._processed_tile_signatures[identity] = signature
+            if reconcile_area_ids:
+                if stale_queued == 0 and pending == 0:
+                    self._reconciled_area_ids.update(reconcile_area_ids)
+                    self._pending_reconciliation_area_ids.difference_update(reconcile_area_ids)
+                else:
+                    self._pending_reconciliation_area_ids.update(reconcile_area_ids)
+                    self._reconciled_area_ids.difference_update(reconcile_area_ids)
+            changed_area_ids = sorted(
+                str(area_id)
+                for area_id in (getattr(download_result, "changed_area_ids", set()) or set())
+            )
             return MinimapTileSyncSummary(
-                input_count=int(getattr(download_result, "input_count", 0)),
-                skipped_count=int(getattr(download_result, "skipped_count", 0)),
+                input_count=int(getattr(download_result, "input_count", 0) or 0),
+                skipped_count=int(getattr(download_result, "skipped_count", 0) or 0),
                 downloaded_count=len(getattr(download_result, "downloaded_sizes", {}) or {}),
-                failure_count=len(getattr(download_result, "failures", {}) or {}),
+                failure_count=len(failures),
                 changed_area_ids=tuple(changed_area_ids),
                 index_queued_tiles=index_queued,
                 stale_queued_tiles=stale_queued,
@@ -137,26 +187,83 @@ class MinimapTileSyncService:
             pending = int(getattr(result, "pending_count", pending))
         return queued_tiles, pending
 
-    def _enqueue_stale_sift_indexes(self, snapshot: dict[str, Any] | None, pending: int) -> tuple[int, int]:
-        if not isinstance(snapshot, dict):
-            return 0, pending
+    def _enqueue_stale_sift_indexes(self, area_ids: Iterable[str], pending: int) -> tuple[int, int]:
         queued_tiles = 0
-        for area_id in self._tile_snapshot_area_ids(snapshot):
+        for area_id in area_ids:
             result = self._index_queue.enqueue_stale_sift_tiles(area_id)
             queued_tiles += int(getattr(result, "queued_count", 0))
             pending = int(getattr(result, "pending_count", pending))
         return queued_tiles, pending
 
-    def _enqueue_missing_indexes(self, snapshot: dict[str, Any] | None, pending: int) -> tuple[int, int]:
+    def _enqueue_missing_indexes(
+        self,
+        snapshot: dict[str, Any] | None,
+        pending: int,
+        *,
+        excluded_keys: Iterable[Any] = (),
+    ) -> tuple[int, int, set[tuple[Any, ...]]]:
         if not isinstance(snapshot, dict):
-            return 0, pending
-        keys = [item.key for item in convert_tile_snapshot_to_download_inputs(snapshot)]
+            return 0, pending, set()
+        excluded = {self._tile_identity(key) for key in excluded_keys}
+        keys = [
+            item.key
+            for item in convert_tile_snapshot_to_download_inputs(snapshot)
+            if self._tile_identity(item.key) not in excluded
+        ]
         if not keys:
-            return 0, pending
+            return 0, pending, set()
         result = self._index_queue.enqueue_missing_indexes_for_tiles(keys)
         queued_items = int(getattr(result, "queued_count", 0))
         pending = int(getattr(result, "pending_count", pending))
-        return queued_items, pending
+        incomplete = {
+            self._tile_identity(key)
+            for key in (getattr(result, "incomplete_tiles", ()) or ())
+        }
+        return queued_items, pending, incomplete
+
+    def _incremental_snapshot(
+        self,
+        snapshot: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[tuple[Any, ...], tuple[Any, ...]]]:
+        reduced = dict(snapshot)
+        for field in ("standardTiles", "layeredTiles", "gravityTiles"):
+            reduced[field] = []
+
+        pending: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+        for field in ("standardTiles", "layeredTiles", "gravityTiles"):
+            for tile in snapshot.get(field, []) or []:
+                if not isinstance(tile, dict):
+                    continue
+                single = {"standardTiles": [], "layeredTiles": [], "gravityTiles": []}
+                single[field] = [tile]
+                inputs = convert_tile_snapshot_to_download_inputs(single)
+                if not inputs:
+                    continue
+                item = inputs[0]
+                identity = self._tile_identity(item.key)
+                signature = (
+                    item.url,
+                    item.expected_size,
+                    item.key.leaflet_x,
+                    item.key.leaflet_y,
+                    item.key.leaflet_z,
+                )
+                if self._processed_tile_signatures.get(identity) == signature:
+                    continue
+                reduced[field].append(tile)
+                pending[identity] = signature
+        return reduced, pending
+
+    @staticmethod
+    def _tile_identity(key) -> tuple[Any, ...]:
+        return (
+            str(key.area_id),
+            str(key.kind),
+            str(key.layer_id),
+            key.z_level,
+            int(key.x),
+            int(key.y),
+        )
 
     @staticmethod
     def _tile_snapshot_area_ids(snapshot: dict[str, Any]) -> list[str]:

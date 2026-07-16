@@ -6,11 +6,15 @@ import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from zipfile import ZipFile
+from urllib.parse import urlsplit
 
 import requests
 
-from .update_manifest import ReleaseManifest, resolve_manifest_path
+from .update_manifest import (
+    ReleaseManifest,
+    resolve_manifest_path,
+    validate_release_manifest,
+)
 
 
 class UpdateDownloadError(RuntimeError):
@@ -22,7 +26,6 @@ class StagedUpdate:
     version: str
     staging_root: Path
     manifest_path: Path
-    package_path: Path
 
 
 def _sha256_file(path: Path) -> str:
@@ -55,6 +58,42 @@ def _download_bytes(session, url: str, timeout: int) -> bytes:
     return b"".join(chunk for chunk in response.iter_content(chunk_size=1024 * 256) if chunk)
 
 
+def prepare_updater_binary(
+    updater_path: str | Path,
+    updater_url: str,
+    updater_sha256: str,
+    staging_dir: str | Path,
+    session=None,
+    timeout: int = 30,
+) -> bool:
+    target = Path(updater_path)
+    expected_hash = str(updater_sha256 or "").lower()
+    if not updater_url or len(expected_hash) != 64:
+        raise UpdateDownloadError("missing updater metadata")
+    if target.exists() and target.is_file() and _sha256_file(target).lower() == expected_hash:
+        return False
+
+    session = session or requests.Session()
+    staging = Path(staging_dir)
+    staging.mkdir(parents=True, exist_ok=True)
+    downloaded = staging / "WutheringWaves-Updater.new.exe"
+    downloaded.unlink(missing_ok=True)
+
+    _download_to_file(session, updater_url, downloaded, timeout)
+    if _sha256_file(downloaded).lower() != expected_hash:
+        downloaded.unlink(missing_ok=True)
+        raise UpdateDownloadError("updater hash mismatch")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        downloaded.replace(target)
+    except Exception:
+        downloaded.unlink(missing_ok=True)
+        raise
+
+    return True
+
+
 def _resolve_staging_root(staging_base: str | Path, version: str) -> Path:
     try:
         return resolve_manifest_path(staging_base, version)
@@ -62,23 +101,8 @@ def _resolve_staging_root(staging_base: str | Path, version: str) -> Path:
         raise UpdateDownloadError(f"unsafe version path: {version}") from exc
 
 
-def _safe_extract_zip(zip_path: Path, destination: Path) -> None:
-    destination.mkdir(parents=True, exist_ok=True)
-    with ZipFile(zip_path) as archive:
-        for info in archive.infolist():
-            if info.is_dir():
-                continue
-            try:
-                target = resolve_manifest_path(destination, info.filename)
-            except ValueError as exc:
-                raise UpdateDownloadError(f"unsafe zip path: {info.filename}") from exc
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(info) as source, target.open("wb") as output:
-                shutil.copyfileobj(source, output)
-
-
 def _absolute_entry_url(manifest_url: str, entry_url: str) -> str:
-    if entry_url.startswith(("http://", "https://")):
+    if urlsplit(entry_url).scheme.casefold() in {"http", "https"}:
         return entry_url
     base = manifest_url.rsplit("/", 1)[0]
     return f"{base.rstrip('/')}/{entry_url.lstrip('/')}"
@@ -99,7 +123,7 @@ def _stage_changed_manifest_files(
         if entry.protected or not entry.managed:
             continue
         target = resolve_manifest_path(root, entry.path)
-        if target.exists() and _sha256_file(target).lower() == entry.sha256.lower():
+        if target.exists() and target.is_file() and _sha256_file(target).lower() == entry.sha256.lower():
             continue
         changed_entries.append(entry)
 
@@ -120,52 +144,41 @@ def _stage_changed_manifest_files(
 def stage_file_update(
     version: str,
     manifest_url: str,
-    full_zip_url: str,
     staging_base: str | Path,
-    full_zip_sha256: str | None = None,
-    app_root: str | Path | None = None,
+    app_root: str | Path,
     session=None,
     timeout: int = 30,
     progress_callback=None,
 ) -> StagedUpdate:
     if not manifest_url:
         raise UpdateDownloadError("missing update URL")
-    if app_root is None and not full_zip_sha256:
-        raise UpdateDownloadError("missing package hash")
 
     session = session or requests.Session()
     base = Path(staging_base)
     staging_root = _resolve_staging_root(base, version)
     if staging_root.exists():
+        rollback_root = staging_root / ".rollback"
+        if rollback_root.exists():
+            raise UpdateDownloadError(f"previous rollback data exists: {rollback_root}")
         shutil.rmtree(staging_root)
     staging_root.mkdir(parents=True, exist_ok=True)
 
     manifest_path = staging_root / "manifest.json"
-    package_path = staging_root / "update.zip"
 
     try:
         manifest_bytes = _download_bytes(session, manifest_url, timeout)
         manifest_path.write_bytes(manifest_bytes)
         manifest = ReleaseManifest.from_dict(json.loads(manifest_bytes.decode("utf-8")))
-        if app_root is not None:
-            _stage_changed_manifest_files(
-                app_root=app_root,
-                manifest_url=manifest_url,
-                manifest=manifest,
-                staging_root=staging_root,
-                session=session,
-                timeout=timeout,
-                progress_callback=progress_callback,
-            )
-        else:
-            if not full_zip_url:
-                raise UpdateDownloadError("missing update URL")
-            _download_to_file(session, full_zip_url, package_path, timeout, progress_callback)
-
-            if _sha256_file(package_path).lower() != full_zip_sha256.lower():
-                raise UpdateDownloadError("package hash mismatch")
-
-            _safe_extract_zip(package_path, staging_root)
+        validate_release_manifest(manifest, expected_version=version)
+        _stage_changed_manifest_files(
+            app_root=app_root,
+            manifest_url=manifest_url,
+            manifest=manifest,
+            staging_root=staging_root,
+            session=session,
+            timeout=timeout,
+            progress_callback=progress_callback,
+        )
     except Exception:
         shutil.rmtree(staging_root, ignore_errors=True)
         raise
@@ -174,5 +187,4 @@ def stage_file_update(
         version=version,
         staging_root=staging_root,
         manifest_path=manifest_path,
-        package_path=package_path,
     )

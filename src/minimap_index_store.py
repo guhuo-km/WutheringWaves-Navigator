@@ -71,6 +71,24 @@ class MinimapIndexStore:
     def get_tile_status(self, key: TileKey) -> MinimapIndexTileStatus:
         return self.get_tile_status_by_raw_key(canonical_tile_key(key))
 
+    def get_tile_statuses(self, keys: Iterable[TileKey]) -> dict[str, MinimapIndexTileStatus]:
+        raw_keys = list(dict.fromkeys(canonical_tile_key(key) for key in keys))
+        statuses = {
+            raw_key: MinimapIndexTileStatus(tile_key=raw_key)
+            for raw_key in raw_keys
+        }
+        if not raw_keys:
+            return statuses
+        placeholders = ", ".join("?" for _ in raw_keys)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM tile_index_status WHERE tile_key IN ({placeholders})",
+                raw_keys,
+            ).fetchall()
+        for row in rows:
+            statuses[str(row["tile_key"])] = _status_from_row(row)
+        return statuses
+
     def get_tile_status_by_raw_key(self, raw_key: str) -> MinimapIndexTileStatus:
         with self._connect() as conn:
             row = conn.execute(

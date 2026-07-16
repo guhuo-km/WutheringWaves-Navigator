@@ -19,6 +19,7 @@ import traceback
 from PySide6.QtCore import QThread, Signal
 
 from core import paths
+from core.gpu_adapters import enumerate_gpu_adapters, resolve_saved_adapter
 
 
 def cluster_detections_to_rich_clusters(
@@ -230,6 +231,7 @@ class OCRWorker(QThread):
     capture_area_updated = Signal(dict)  # Runtime capture area updates
     captured_frame_ready = Signal(object)  # Shared full frame plus OCR crop
     frame_recognition_completed = Signal(object)  # Per-frame OCR result, coords may be None
+    fatal_gpu_error = Signal(dict)
     
     def __init__(self, config_dict=None, capture_callback=None):
         """
@@ -248,6 +250,11 @@ class OCRWorker(QThread):
         # Worker control
         self.is_running = False
         self.should_stop = False
+        self._gpu_acceleration_enabled = bool(
+            self.config_dict.get('gpu_acceleration_enabled', False)
+        )
+        self._saved_gpu_adapter = self.config_dict.get('gpu_adapter')
+        self._dml_available_providers: List[str] = []
         
         # ONNXRuntime model
         self.model = None
@@ -899,12 +906,45 @@ class OCRWorker(QThread):
                 model_path = paths.model_file("coord_ocr.onnx")
             
             if not model_path.exists():
-                error_msg = f"模型文件不存在: {model_path}"
-                self.logger.error(error_msg)
-                self.error_occurred.emit(error_msg)
-                return False
+                raise FileNotFoundError(f"模型文件不存在: {model_path}")
 
-            self.model = ort.InferenceSession(str(model_path), providers=['CPUExecutionProvider'])
+            if self._gpu_acceleration_enabled:
+                self._dml_available_providers = list(ort.get_available_providers())
+                if 'DmlExecutionProvider' not in self._dml_available_providers:
+                    raise RuntimeError("DmlExecutionProvider is unavailable")
+
+                adapter = resolve_saved_adapter(
+                    self._saved_gpu_adapter,
+                    enumerate_gpu_adapters(),
+                )
+                session_options = ort.SessionOptions()
+                session_options.enable_mem_pattern = False
+                session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+                session_options.add_session_config_entry(
+                    'session.disable_cpu_ep_fallback',
+                    '1',
+                )
+                providers = [(
+                    'DmlExecutionProvider',
+                    {'device_id': str(adapter.dml_device_id)},
+                )]
+                self.model = ort.InferenceSession(
+                    str(model_path),
+                    sess_options=session_options,
+                    providers=providers,
+                    enable_fallback=False,
+                )
+                disable_fallback = getattr(self.model, 'disable_fallback', None)
+                if callable(disable_fallback):
+                    disable_fallback()
+                session_providers = list(self.model.get_providers())
+                if 'DmlExecutionProvider' not in session_providers:
+                    raise RuntimeError("ONNX Runtime session did not activate DmlExecutionProvider")
+            else:
+                self.model = ort.InferenceSession(
+                    str(model_path),
+                    providers=['CPUExecutionProvider'],
+                )
             inputs = self.model.get_inputs()
             if not inputs:
                 raise ValueError("ONNX model has no inputs")
@@ -919,8 +959,41 @@ class OCRWorker(QThread):
         except Exception as e:
             error_msg = f"模型加载失败: {e}"
             self.logger.error(error_msg)
-            self.error_occurred.emit(error_msg)
+            if self._gpu_acceleration_enabled:
+                self._emit_fatal_gpu_error('initialization', e)
+            else:
+                self.error_occurred.emit(error_msg)
             return False
+
+    def _emit_fatal_gpu_error(self, stage: str, error: Exception) -> None:
+        selection = self._saved_gpu_adapter
+        if not isinstance(selection, dict):
+            selection = {}
+        saved_adapter = {
+            field: selection.get(field)
+            for field in (
+                'name',
+                'dml_device_id',
+                'vendor_id',
+                'device_id',
+                'subsys_id',
+                'revision',
+            )
+        }
+        payload = {
+            'stage': stage,
+            'saved_name': selection.get('name'),
+            'saved_device_id': selection.get('dml_device_id'),
+            'saved_adapter': saved_adapter,
+            'provider': 'DmlExecutionProvider',
+            'available_providers': list(self._dml_available_providers),
+            'exception_type': type(error).__name__,
+            'exception_message': str(error),
+            'traceback': traceback.format_exc(),
+        }
+        self.should_stop = True
+        self.logger.error("DirectML OCR fatal error: %s", payload)
+        self.fatal_gpu_error.emit(payload)
     
     def load_settings(self):
         """Load settings from configuration dictionary"""
@@ -1009,8 +1082,9 @@ class OCRWorker(QThread):
         
         # Load model and settings
         if not self.load_model():
-            self.ocr_output_updated.emit("❌ 模型加载失败，请检查models/coord_ocr.onnx文件")
-            self.error_occurred.emit("OCR模型加载失败")
+            if not self._gpu_acceleration_enabled:
+                self.ocr_output_updated.emit("❌ 模型加载失败，请检查models/coord_ocr.onnx文件")
+                self.error_occurred.emit("OCR模型加载失败")
             self.is_running = False
             return
         
@@ -1040,6 +1114,8 @@ class OCRWorker(QThread):
                 
                 # 模型推理
                 detections = self._run_onnx_inference(screenshot)
+                if self._gpu_acceleration_enabled and self.should_stop:
+                    break
                 
                 # 应用跟踪算法
                 success, final_coords = self._apply_tracking_algorithm(detections)
@@ -1142,6 +1218,8 @@ class OCRWorker(QThread):
                 'filtered_boxes': 0,
                 'entries': [],
             }
+            if self._gpu_acceleration_enabled:
+                self._emit_fatal_gpu_error('inference', e)
             return []
 
     def _run_yolo_inference(self, image: npt.NDArray[np.uint8]) -> List[Dict[str, Any]]:
