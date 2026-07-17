@@ -17,8 +17,8 @@ class FakeSession:
         self.data = data
         self.urls = []
 
-    def get(self, url, timeout):
-        self.urls.append((url, timeout))
+    def get(self, url, timeout, headers=None):
+        self.urls.append((url, timeout, headers))
         return FakeResponse(self.data)
 
 
@@ -235,3 +235,23 @@ def test_http_provider_reports_empty_latest_url():
 
     assert result.has_update is False
     assert result.error_message == "更新地址未配置"
+
+
+def test_http_provider_sends_current_version_header():
+    """Known issue: the update site must distinguish repaired 24 from headerless 23."""
+    session = FakeSession({"latest_version": "0.1.6.24", "artifacts": {}})
+    provider = HttpUpdateProvider(
+        latest_url="https://updates.example.com/latest.json",
+        artifact_key="windows-x64-v2",
+        session=session,
+    )
+
+    provider.check("0.1.6.24")
+
+    assert session.urls == [
+        (
+            "https://updates.example.com/latest.json",
+            10,
+            {"X-Wuwa-Navigator-Version": "0.1.6.24"},
+        )
+    ]

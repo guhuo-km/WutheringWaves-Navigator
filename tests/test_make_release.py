@@ -286,6 +286,54 @@ def test_make_release_uses_cli_update_base_url(tmp_path, monkeypatch):
     assert repeated_latest["artifacts"]["windows-x64-v2"]["size"] == first_artifact_size
 
 
+def test_release_metadata_emits_legacy_full_v2_route(tmp_path, monkeypatch):
+    """Known issue: 23 must never receive a manifest or updater URL."""
+    project_root = tmp_path / "project"
+    dist_root = project_root / "dist" / "WutheringWaves-Navigator-Smart"
+    dist_root.mkdir(parents=True)
+    (dist_root / "WutheringWaves-Navigator-Smart.exe").write_bytes(b"exe")
+    (dist_root / "WutheringWaves-Updater.exe").write_bytes(b"updater")
+    (project_root / "version.json").write_text(
+        json.dumps(
+            {
+                "app_id": "wutheringwaves-navigator",
+                "version": "0.1.6.24",
+                "channel": "stable",
+                "update_base_url": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "release"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "make_release.py",
+            "--project-root",
+            str(project_root),
+            "--dist-root",
+            str(dist_root),
+            "--output-root",
+            str(output_root),
+            "--update-base-url",
+            "https://updates.example.com/wuwa/stable",
+        ],
+    )
+
+    assert main() == 0
+
+    legacy = json.loads(
+        (output_root / "stable" / "legacy-latest.json").read_text(encoding="utf-8")
+    )
+    artifact = legacy["artifacts"]["windows-x64-v2"]
+    assert artifact == {
+        "version": "0.1.6.24",
+        "update_mode": "full",
+        "download_url": "https://www.wuwuddt.com/download",
+        "installer_url": "https://www.wuwuddt.com/download",
+    }
+
+
 def test_make_release_keeps_explicit_installer_file_but_legacy_keys_still_open_download_page(
     tmp_path, monkeypatch
 ):

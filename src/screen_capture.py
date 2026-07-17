@@ -21,11 +21,11 @@ import logging
 
 
 @dataclass(frozen=True)
-class CapturedFrameRegion:
-    frame: np.ndarray
-    crop: np.ndarray
-    origin: Tuple[int, int]
-    source: str = "unknown"
+class RecognitionCapture:
+    ocr_crop: Optional[np.ndarray]
+    minimap_frame: Optional[np.ndarray]
+    minimap_search_rect: Optional[Tuple[int, int, int, int]]
+    source: str
     target_window_name: str = ""
 
 
@@ -70,24 +70,7 @@ class ScreenCapture:
             return True
         return False
     
-    def capture_region(self, x: int, y: int, width: int, height: int, 
-                      mode: str = 'BitBlt', target_window_name: str = '') -> Optional[np.ndarray]:
-        """
-        捕获指定区域的屏幕截图
-        
-        Args:
-            x, y: 截图区域左上角坐标
-            width, height: 截图区域尺寸
-            mode: 截图模式 ('BitBlt' 或 'PrintWindow')
-            target_window_name: 目标窗口名称（可选）
-        
-        Returns:
-            numpy.ndarray: 截图图像，BGR格式，或None如果失败
-        """
-        result = self.capture_frame_and_region(x, y, width, height, mode, target_window_name)
-        return result.crop if result is not None else None
-
-    def capture_frame_and_region(
+    def capture_recognition_inputs(
         self,
         x: int,
         y: int,
@@ -95,76 +78,107 @@ class ScreenCapture:
         height: int,
         mode: str = 'BitBlt',
         target_window_name: str = '',
-    ) -> Optional[CapturedFrameRegion]:
-        """Capture one shared frame and crop the requested OCR region from it."""
+        minimap_search_region: Optional[Dict[str, int]] = None,
+    ) -> Optional[RecognitionCapture]:
+        """Capture independent OCR and minimap inputs from one target decision."""
         try:
-            if mode == 'PrintWindow' and target_window_name:
-                frame_result = self._capture_window_frame(target_window_name)
-                if frame_result is None:
-                    crop = self._capture_window_region(x, y, width, height, target_window_name)
-                    if crop is None:
-                        return None
-                    return CapturedFrameRegion(
-                        frame=crop,
-                        crop=crop,
-                        origin=(int(x), int(y)),
-                        source="fallback_region",
-                        target_window_name=target_window_name,
-                    )
-                frame, window_rect = frame_result
-                window_x, window_y, _, _ = window_rect
-                crop = crop_image_region(frame, x - window_x, y - window_y, width, height)
-                if crop.size == 0:
-                    return None
-                return CapturedFrameRegion(
-                    frame=frame,
-                    crop=crop,
-                    origin=(int(window_x), int(window_y)),
-                    source="window",
+            full_capture = self._capture_full_target_frame(mode, target_window_name)
+            if full_capture is not None:
+                frame, origin, source = full_capture
+                origin_x, origin_y = origin
+                ocr_crop = crop_image_region(frame, x - origin_x, y - origin_y, width, height)
+                if ocr_crop.size == 0:
+                    ocr_crop = None
+                search_rect = self._relative_search_rect(frame, origin, minimap_search_region)
+                return RecognitionCapture(
+                    ocr_crop=ocr_crop,
+                    minimap_frame=frame if search_rect is not None else None,
+                    minimap_search_rect=search_rect,
+                    source=source,
                     target_window_name=target_window_name,
                 )
 
-            frame_origin_x = 0
-            frame_origin_y = 0
-            if target_window_name:
-                window_rect = self._find_window_rect_by_name(target_window_name)
-                if window_rect is not None:
-                    frame_origin_x, frame_origin_y, right, bottom = window_rect
-                    frame = self._capture_screen_region(
-                        frame_origin_x,
-                        frame_origin_y,
-                        right - frame_origin_x,
-                        bottom - frame_origin_y,
+            ocr_crop = self._capture_screen_region(x, y, width, height)
+            minimap_frame = None
+            minimap_search_rect = None
+            if minimap_search_region:
+                region_x = int(minimap_search_region.get("x", 0) or 0)
+                region_y = int(minimap_search_region.get("y", 0) or 0)
+                region_width = int(minimap_search_region.get("width", 0) or 0)
+                region_height = int(minimap_search_region.get("height", 0) or 0)
+                if region_width > 0 and region_height > 0:
+                    minimap_frame = self._capture_screen_region(
+                        region_x,
+                        region_y,
+                        region_width,
+                        region_height,
                     )
-                else:
-                    frame = None
-            else:
-                screen_width, screen_height = self.get_screen_size()
-                frame = self._capture_screen_region(0, 0, screen_width, screen_height)
-
-            if frame is None:
-                frame = self._capture_screen_region(x, y, width, height)
-                if frame is None:
-                    return None
-                return CapturedFrameRegion(
-                    frame=frame,
-                    crop=frame,
-                    origin=(int(x), int(y)),
-                    source="fallback_region",
-                    target_window_name=target_window_name,
-                )
-            crop = crop_image_region(frame, x - frame_origin_x, y - frame_origin_y, width, height)
-            source = "window" if target_window_name else "fullscreen"
-            return CapturedFrameRegion(
-                frame=frame,
-                crop=crop,
-                origin=(frame_origin_x, frame_origin_y),
-                source=source,
+                    if minimap_frame is not None and minimap_frame.size:
+                        frame_height, frame_width = minimap_frame.shape[:2]
+                        minimap_search_rect = (0, 0, frame_width, frame_height)
+                    else:
+                        minimap_frame = None
+            if ocr_crop is None and minimap_frame is None:
+                return None
+            return RecognitionCapture(
+                ocr_crop=ocr_crop,
+                minimap_frame=minimap_frame,
+                minimap_search_rect=minimap_search_rect,
+                source="split_region_fallback",
                 target_window_name=target_window_name,
             )
         except Exception as e:
             self.logger.error(f"截图失败: {e}")
             return None
+
+    def _capture_full_target_frame(
+        self,
+        mode: str,
+        target_window_name: str,
+    ) -> Optional[Tuple[np.ndarray, Tuple[int, int], str]]:
+        if target_window_name:
+            if mode == 'PrintWindow':
+                print_window_result = self._capture_window_frame(target_window_name)
+                if print_window_result is not None:
+                    frame, window_rect = print_window_result
+                    return frame, (int(window_rect[0]), int(window_rect[1])), "window_full"
+            window_rect = self._find_window_rect_by_name(target_window_name)
+            if window_rect is None:
+                return None
+            left, top, right, bottom = [int(value) for value in window_rect]
+            frame = self._capture_screen_region(left, top, right - left, bottom - top)
+            if frame is None:
+                return None
+            return frame, (left, top), "window_full"
+
+        screen_width, screen_height = self.get_screen_size()
+        frame = self._capture_screen_region(0, 0, screen_width, screen_height)
+        if frame is None:
+            return None
+        return frame, (0, 0), "fullscreen_full"
+
+    @staticmethod
+    def _relative_search_rect(
+        frame: np.ndarray,
+        origin: Tuple[int, int],
+        minimap_search_region: Optional[Dict[str, int]],
+    ) -> Optional[Tuple[int, int, int, int]]:
+        frame_height, frame_width = frame.shape[:2]
+        if minimap_search_region is None:
+            return (0, 0, max(1, frame_width // 8), max(1, frame_height // 4))
+
+        origin_x, origin_y = origin
+        left = int(minimap_search_region.get("x", 0) or 0) - int(origin_x)
+        top = int(minimap_search_region.get("y", 0) or 0) - int(origin_y)
+        width = int(minimap_search_region.get("width", 0) or 0)
+        height = int(minimap_search_region.get("height", 0) or 0)
+        left = max(0, left)
+        top = max(0, top)
+        right = min(frame_width, left + max(0, width))
+        bottom = min(frame_height, top + max(0, height))
+        if right <= left or bottom <= top:
+            return None
+        return (left, top, right - left, bottom - top)
     
     def _capture_screen_region(self, x: int, y: int, width: int, height: int) -> Optional[np.ndarray]:
         """
@@ -227,104 +241,6 @@ class ScreenCapture:
                     win32gui.ReleaseDC(0, screen_dc)
                 except Exception:
                     pass
-    
-    def _capture_window_region(self, x: int, y: int, width: int, height: int, 
-                              window_name: str) -> Optional[np.ndarray]:
-        """
-        使用PrintWindow方式捕获指定窗口的区域
-        """
-        hwnd = None
-        window_dc = None
-        mem_dc = None
-        save_dc = None
-        save_bitmap = None
-        fallback_to_screen = False
-        try:
-            # 查找窗口
-            hwnd = win32gui.FindWindow(None, window_name)
-            if not hwnd:
-                # 如果找不到完全匹配的窗口名，尝试部分匹配
-                hwnd = self._find_window_partial(window_name)
-                if not hwnd:
-                    self.logger.warning(f"未找到窗口: {window_name}")
-                    return self._capture_screen_region(x, y, width, height)  # 降级到屏幕截图
-            
-            # 获取窗口位置和大小
-            window_rect = win32gui.GetWindowRect(hwnd)
-            window_x, window_y, window_right, window_bottom = window_rect
-            window_width = window_right - window_x
-            window_height = window_bottom - window_y
-            
-            # 获取窗口DC
-            window_dc = win32gui.GetWindowDC(hwnd)
-            
-            # 创建内存DC
-            mem_dc = win32ui.CreateDCFromHandle(window_dc)
-            save_dc = mem_dc.CreateCompatibleDC()
-            
-            # 创建位图
-            save_bitmap = win32ui.CreateBitmap()
-            save_bitmap.CreateCompatibleBitmap(mem_dc, window_width, window_height)
-            save_dc.SelectObject(save_bitmap)
-            
-            # 使用PrintWindow截取整个窗口
-            result = win32gui.PrintWindow(hwnd, save_dc.GetSafeHdc(), 3)  # PW_RENDERFULLCONTENT
-            
-            if result:
-                # 获取位图数据
-                bmp_info = save_bitmap.GetInfo()
-                bmp_str = save_bitmap.GetBitmapBits(True)
-                
-                # 转换为numpy数组
-                image = np.frombuffer(bmp_str, dtype=np.uint8)
-                image = image.reshape((bmp_info['bmHeight'], bmp_info['bmWidth'], 4))
-                
-                # 转换BGRA到BGR
-                image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-                
-                # 裁剪指定区域（需要转换坐标）
-                # 将屏幕坐标转换为窗口坐标
-                region_x = max(0, x - window_x)
-                region_y = max(0, y - window_y)
-                region_x2 = min(window_width, region_x + width)
-                region_y2 = min(window_height, region_y + height)
-                
-                if region_x < region_x2 and region_y < region_y2:
-                    cropped_image = image[region_y:region_y2, region_x:region_x2]
-
-                    return cropped_image
-
-            # 如果PrintWindow失败，降级到BitBlt
-            fallback_to_screen = True
-            
-        except Exception as e:
-            self.logger.error(f"PrintWindow截图失败: {e}")
-            fallback_to_screen = True
-        finally:
-            if save_bitmap is not None:
-                try:
-                    win32gui.DeleteObject(save_bitmap.GetHandle())
-                except Exception:
-                    pass
-            if save_dc is not None:
-                try:
-                    save_dc.DeleteDC()
-                except Exception:
-                    pass
-            if mem_dc is not None:
-                try:
-                    mem_dc.DeleteDC()
-                except Exception:
-                    pass
-            if hwnd and window_dc is not None:
-                try:
-                    win32gui.ReleaseDC(hwnd, window_dc)
-                except Exception:
-                    pass
-
-        if fallback_to_screen:
-            return self._capture_screen_region(x, y, width, height)  # 降级到屏幕截图
-        return None
     
     def _find_window_partial(self, partial_name: str) -> Optional[int]:
         """
@@ -629,32 +545,23 @@ def get_screen_capture() -> ScreenCapture:
     return _screen_capture_instance
 
 
-def capture_region_callback(x: int, y: int, width: int, height: int, 
-                           mode: str, target_window_name: str) -> Optional[np.ndarray]:
-    """
-    OCR引擎使用的截图回调函数
-    
-    Args:
-        x, y: 截图区域左上角坐标
-        width, height: 截图区域尺寸
-        mode: 截图模式
-        target_window_name: 目标窗口名称
-    
-    Returns:
-        numpy.ndarray: 截图图像或None
-    """
-    screen_capture = get_screen_capture()
-    return screen_capture.capture_region(x, y, width, height, mode, target_window_name)
-
-
-def capture_frame_and_region_callback(
+def capture_recognition_inputs_callback(
     x: int,
     y: int,
     width: int,
     height: int,
     mode: str,
     target_window_name: str,
-) -> Optional[CapturedFrameRegion]:
-    """Capture one shared frame and the requested OCR crop."""
+    minimap_search_region: Optional[Dict[str, int]],
+) -> Optional[RecognitionCapture]:
+    """Capture the OCR crop and minimap input for one recognition frame."""
     screen_capture = get_screen_capture()
-    return screen_capture.capture_frame_and_region(x, y, width, height, mode, target_window_name)
+    return screen_capture.capture_recognition_inputs(
+        x,
+        y,
+        width,
+        height,
+        mode,
+        target_window_name,
+        minimap_search_region,
+    )

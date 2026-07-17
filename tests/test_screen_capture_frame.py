@@ -9,13 +9,9 @@ class FakeScreenCapture(ScreenCapture):
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self.calls = []
-        self.screen_size = (320, 240)
         self.window_rect = (100, 200, 300, 400)
-        self.screen_frame = np.zeros((240, 320, 3), dtype=np.uint8)
         self.window_frame = np.zeros((200, 200, 3), dtype=np.uint8)
-
-    def get_screen_size(self):
-        return self.screen_size
+        self.print_window_succeeds = True
 
     def _find_window_rect_by_name(self, window_name):
         return self.window_rect if window_name == "game" else None
@@ -24,88 +20,82 @@ class FakeScreenCapture(ScreenCapture):
         self.calls.append(("screen", x, y, width, height))
         if (x, y, width, height) == (100, 200, 200, 200):
             return self.window_frame.copy()
-        if (x, y, width, height) == (0, 0, 320, 240):
-            return self.screen_frame.copy()
-        return np.zeros((height, width, 3), dtype=np.uint8)
-
-    def _capture_window_region(self, x, y, width, height, window_name):
-        self.calls.append(("printwindow_region", x, y, width, height, window_name))
-        return np.full((height, width, 3), 55, dtype=np.uint8)
+        if (x, y, width, height) == (20, 30, 40, 50):
+            return np.full((height, width, 3), 44, dtype=np.uint8)
+        if (x, y, width, height) == (100, 200, 25, 50):
+            return np.full((height, width, 3), 88, dtype=np.uint8)
+        return None
 
     def _capture_window_frame(self, window_name):
         self.calls.append(("printwindow_frame", window_name))
+        if not self.print_window_succeeds:
+            return None
         return self.window_frame.copy(), self.window_rect
 
 
-def test_capture_region_with_target_window_captures_whole_window_then_crops():
+def test_recognition_capture_uses_one_full_window_for_ocr_and_minimap():
     capture = FakeScreenCapture()
     capture.window_frame[30:80, 20:60] = 123
 
-    image = capture.capture_region(120, 230, 40, 50, mode="BitBlt", target_window_name="game")
+    result = capture.capture_recognition_inputs(
+        120,
+        230,
+        40,
+        50,
+        mode="BitBlt",
+        target_window_name="game",
+        minimap_search_region={"x": 100, "y": 200, "width": 25, "height": 50},
+    )
 
     assert capture.calls == [("screen", 100, 200, 200, 200)]
-    assert image.shape == (50, 40, 3)
-    assert image.mean() == 123
-
-
-def test_capture_region_without_target_window_captures_whole_screen_then_crops():
-    capture = FakeScreenCapture()
-    capture.screen_frame[30:80, 20:60] = 222
-
-    image = capture.capture_region(20, 30, 40, 50, mode="BitBlt", target_window_name="")
-
-    assert capture.calls == [("screen", 0, 0, 320, 240)]
-    assert image.shape == (50, 40, 3)
-    assert image.mean() == 222
-
-
-def test_capture_frame_and_region_returns_shared_frame_and_crop():
-    capture = FakeScreenCapture()
-    capture.window_frame[30:80, 20:60] = 77
-
-    result = capture.capture_frame_and_region(120, 230, 40, 50, mode="BitBlt", target_window_name="game")
-
-    assert capture.calls == [("screen", 100, 200, 200, 200)]
-    assert result.origin == (100, 200)
-    assert result.source == "window"
+    assert result.source == "window_full"
     assert result.target_window_name == "game"
-    assert result.frame.shape == (200, 200, 3)
-    assert result.crop.shape == (50, 40, 3)
-    assert result.crop.mean() == 77
+    assert result.ocr_crop.shape == (50, 40, 3)
+    assert result.ocr_crop.mean() == 123
+    assert result.minimap_frame.shape == (200, 200, 3)
+    assert result.minimap_search_rect == (0, 0, 25, 50)
 
 
-def test_capture_frame_and_region_printwindow_returns_whole_window_frame():
-    capture = FakeScreenCapture()
-    capture.window_frame[30:80, 20:60] = 88
-
-    result = capture.capture_frame_and_region(120, 230, 40, 50, mode="PrintWindow", target_window_name="game")
-
-    assert capture.calls == [("printwindow_frame", "game")]
-    assert result.origin == (100, 200)
-    assert result.source == "window"
-    assert result.target_window_name == "game"
-    assert result.frame.shape == (200, 200, 3)
-    assert result.crop.shape == (50, 40, 3)
-    assert result.crop.mean() == 88
-
-
-def test_capture_frame_and_region_without_target_marks_fullscreen_source():
+def test_recognition_capture_returns_independent_regions_when_full_window_fails():
     capture = FakeScreenCapture()
 
-    result = capture.capture_frame_and_region(20, 30, 40, 50, mode="BitBlt", target_window_name="")
+    result = capture.capture_recognition_inputs(
+        20,
+        30,
+        40,
+        50,
+        mode="BitBlt",
+        target_window_name="missing-game",
+        minimap_search_region={"x": 100, "y": 200, "width": 25, "height": 50},
+    )
 
-    assert capture.calls == [("screen", 0, 0, 320, 240)]
-    assert result.origin == (0, 0)
-    assert result.source == "fullscreen"
-    assert result.target_window_name == ""
+    assert capture.calls == [
+        ("screen", 20, 30, 40, 50),
+        ("screen", 100, 200, 25, 50),
+    ]
+    assert result.source == "split_region_fallback"
+    assert result.ocr_crop.mean() == 44
+    assert result.minimap_frame.mean() == 88
+    assert result.minimap_search_rect == (0, 0, 25, 50)
 
 
-def test_capture_frame_and_region_missing_target_marks_fallback_region_source():
+def test_printwindow_failure_retries_full_target_with_bitblt():
     capture = FakeScreenCapture()
+    capture.print_window_succeeds = False
 
-    result = capture.capture_frame_and_region(20, 30, 40, 50, mode="BitBlt", target_window_name="missing-game")
+    result = capture.capture_recognition_inputs(
+        120,
+        230,
+        40,
+        50,
+        mode="PrintWindow",
+        target_window_name="game",
+        minimap_search_region={"x": 100, "y": 200, "width": 25, "height": 50},
+    )
 
-    assert capture.calls == [("screen", 20, 30, 40, 50)]
-    assert result.origin == (20, 30)
-    assert result.source == "fallback_region"
-    assert result.target_window_name == "missing-game"
+    assert capture.calls == [
+        ("printwindow_frame", "game"),
+        ("screen", 100, 200, 200, 200),
+    ]
+    assert result.source == "window_full"
+    assert result.minimap_frame.shape == (200, 200, 3)

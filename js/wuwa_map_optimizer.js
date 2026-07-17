@@ -8618,52 +8618,6 @@
         bindSidecarAddTag(dom, fp, data);
     }
 
-    /*
-     * ==============================
-     * 后端重做/对接备忘（Tag UGC）
-     * ==============================
-     *
-     * 前端身份来源（不上传 token，仅用作本地判断是否登录）：
-     * - localStorage.AKI_MAP_USER_INFO(JSON) -> { userId, userName, ... }
-     * - userId：不可变唯一ID（作者/投票者主键）
-     * - userName：展示名（可变）；前端会在每次拉取/写入前调用 upsert_user 让后端自动同步
-     *
-     * 前端“未登录”策略：
-     * - 如果拿不到 userId：只读（可查看/搜索标签），禁止 add/vote/delete（按钮禁用）
-     * - 后端仍应校验：所有写操作必须带 p_user_id（以及可选 p_user_name）
-     *
-     * 当前前端期望的接口（可自由改名/改路径，但需保持语义）：
-     * 1) GET  tag_details?fingerprint=eq.{fp}
-     *    - 返回该 fp 下标签列表（建议已聚合，一条=一个 tag 文本）
-     *    - 每条至少包含：
-     *      - text (string, 大小写敏感；建议后端存储时 trim/合并多空格)
-     *      - score (number)
-     *      - my_vote (number: -1/0/1) 或 myVote（当前 userId 对该 tag 的投票）
-     *      - author_userid / authorUserId (string)（作者 userId）
-     *      - author_username / authorUserName (string)（作者展示名）
-     *
-     * 2) POST /rpc/upsert_user
-     *    - body: { p_user_id, p_user_name }
-     *    - 语义：以 userId 为主键同步最新 userName（仅展示用途）
-     *
-     * 3) POST /rpc/add_tag
-     *    - body: { p_fp, p_text, p_user_id, p_user_name }
-     *    - 语义：新增标签（fp + text 唯一）
-     *    - 规则：重复提交（同 fp+text 已存在）=> 等价于对“最早那条标签”执行一次点赞（同一 userId 已赞过则 no-op）
-     *
-     * 4) POST /rpc/vote_tag
-     *    - body: { p_fp, p_text, p_user_id, p_user_name, p_val }  // p_val: 1 或 -1
-     *    - 语义：对标签投票（同一 userId 对同一 tag 最多一票；重复同值可视为 no-op）
-     *    - 注：作者自己的标签，前端不会发 -1（会走 delete_tag），后端仍建议做一致性保护
-     *
-     * 5) POST /rpc/delete_tag
-     *    - body: { p_fp, p_text, p_user_id, p_user_name }
-     *    - 语义：硬删除标签（以及该标签的投票记录），仅允许作者 userId 删除
-     *
-     * 安全/一致性建议（你后端推倒重做时可参考）：
-     * - 目前前端只传 userId/userName，理论上可被伪造；若要防伪，可引入“用酷街区 token 换取/校验 userId”的服务端校验层
-     * - text 做长度限制、字符规范化（trim/合并多空格）、rate limit、以及服务端存储前的输出转义/净化
-     */
 
     hookNetwork();
     installMapControlApi();

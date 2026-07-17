@@ -179,6 +179,23 @@ def build_latest_metadata(
     }
 
 
+def build_legacy_latest_metadata(latest: dict) -> dict:
+    """Return the full-install metadata served to headerless legacy clients."""
+    version = str(latest["latest_version"])
+    full_install = {
+        "version": version,
+        "update_mode": "full",
+        "download_url": DOWNLOAD_PAGE_URL,
+        "installer_url": DOWNLOAD_PAGE_URL,
+    }
+    legacy = dict(latest)
+    legacy["artifacts"] = {
+        artifact_key: dict(full_install)
+        for artifact_key in latest["artifacts"]
+    }
+    return legacy
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create WutheringWaves Navigator release artifacts")
     parser.add_argument("--project-root", default=Path(__file__).resolve().parents[1])
@@ -273,6 +290,10 @@ def main() -> int:
 
     write_json(release_root / "release.json", release)
     write_json(output_root / channel / "latest.json", latest)
+    write_json(
+        output_root / channel / "legacy-latest.json",
+        build_legacy_latest_metadata(latest),
+    )
     return 0
 
 

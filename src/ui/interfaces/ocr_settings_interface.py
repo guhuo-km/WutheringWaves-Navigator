@@ -247,7 +247,7 @@ class OCRSettingsInterface(QWidget):
         self.auto_roi_lock_tolerance_label = BodyLabel()
         threshold_grid.addWidget(self.auto_roi_lock_tolerance_label, 2, 0)
         self.auto_roi_lock_tolerance_spin = self._create_int_spin(
-            0, 100, "minimap_stability.auto_roi_lock_tolerance_px", 2
+            0, 100, "minimap_stability.auto_roi_lock_tolerance_px", 15
         )
         threshold_grid.addWidget(self.auto_roi_lock_tolerance_spin, 2, 2)
 
@@ -365,9 +365,6 @@ class OCRSettingsInterface(QWidget):
 
     def is_auto_detect_enabled(self) -> bool:
         return bool(self._auto_detect_switch.isChecked())
-
-    def is_minimap_auto_calibration_enabled(self) -> bool:
-        return bool(self.minimap_auto_calibration_switch.isChecked())
 
     def get_interval(self) -> int:
         return int(self.interval_spin.value())

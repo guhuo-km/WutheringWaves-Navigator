@@ -9,6 +9,7 @@ import os
 import multiprocessing
 import io
 import tempfile
+import subprocess
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -63,7 +64,7 @@ def _ensure_stdio_streams() -> None:
         sys.stderr = _fallback_stream()
 
 
-def main():
+def main() -> int:
     multiprocessing.freeze_support()
     _ensure_stdio_streams()
     sys.argv = configure_debug_recognition_from_argv(sys.argv)
@@ -86,6 +87,7 @@ def main():
     from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
     from PySide6.QtGui import QIcon
     from qfluentwidgets import setTheme, Theme
+    from language_manager import tr
     from core.utils import get_assets_path
     
     os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "1"
@@ -173,8 +175,26 @@ def main():
         main_window.setWindowIcon(QIcon(app_icon_path))
     main_window.show()
     
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    pending_update_command = main_window.take_pending_update_command()
+    if pending_update_command:
+        try:
+            subprocess.Popen(pending_update_command)
+        except Exception as exc:
+            from updater_app import append_update_failure_log
+
+            append_update_failure_log(app_root, "launch", exc)
+            QMessageBox.critical(
+                None,
+                tr("update_apply_unavailable_title", "无法应用更新"),
+                tr(
+                    "update_updater_launch_failed",
+                    "启动更新器失败: {error}",
+                    error=exc,
+                ),
+            )
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

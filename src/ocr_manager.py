@@ -41,7 +41,7 @@ except ImportError:
 
 from ocr_engine import OCRWorker
 from ocr_region_calibrator import OCRRegionCalibrator
-from screen_capture import capture_frame_and_region_callback, capture_region_callback
+from screen_capture import capture_recognition_inputs_callback
 from core import paths
 from core.gpu_adapters import GpuAdapterSelectionError, normalize_adapter_selection
 from core.map_context import CoordinateCandidate
@@ -946,6 +946,7 @@ class OCRManager(QObject):
         self._vision_tile_root: Optional[Path] = None
         self._minimap_auto_candidates: list[MinimapRoi] = []
         self._minimap_auto_search_active = False
+        self._last_minimap_auto_frame_result = None
         self._coordinate_continuity = ContinuityState()
         self._observation_worker = MinimapObservationWorker(self._collect_minimap_observation)
         self._observation_worker.result_ready.connect(self._handle_observation_completed)
@@ -1223,8 +1224,7 @@ class OCRManager(QObject):
         self.ocr_config['ocr_capture_area'] = region
         self.ocr_config['ocr_capture_area_source'] = 'auto'
 
-        if not self.ocr_config.get('target_window_name'):
-            self.ocr_config['target_window_name'] = window_title
+        self.ocr_config['target_window_name'] = window_title
 
         self.save_config()
 
@@ -1235,9 +1235,16 @@ class OCRManager(QObject):
 
         if self.ocr_worker is not None and self.ocr_worker.is_running:
             interval = self.ocr_config.get('ocr_interval', 1000)
-            window_name = self.ocr_config.get('target_window_name', '')
+            minimap_search_region = self._calculate_minimap_search_region(
+                self._current_game_window_rect
+            )
             try:
-                self.ocr_worker.update_capture_settings(region, interval, window_name)
+                self.ocr_worker.update_capture_settings(
+                    region,
+                    interval,
+                    window_title,
+                    minimap_search_region,
+                )
             except Exception as e:
                 print(f"Auto window detect: update capture settings failed: {e}")
 
@@ -1371,10 +1378,18 @@ class OCRManager(QObject):
             
             worker_config = dict(self.ocr_config)
             worker_config['detailed_ocr_logging'] = bool(self._detailed_ocr_logging)
+            if (
+                self.ocr_config.get('ocr_capture_area_source') == 'auto'
+                and self._current_game_window_rect is not None
+            ):
+                worker_config['minimap_search_region'] = self._calculate_minimap_search_region(
+                    self._current_game_window_rect
+                )
             self.ocr_worker = OCRWorker(config_dict=worker_config)
             self.ocr_worker.set_detailed_log_sink(self._enqueue_detailed_ocr_log)
-            self.ocr_worker.set_capture_callback(capture_region_callback)
-            self.ocr_worker.set_frame_capture_callback(capture_frame_and_region_callback)
+            self.ocr_worker.set_recognition_capture_callback(
+                capture_recognition_inputs_callback
+            )
 
             try:
                 self.ocr_worker.update_confidence_thresholds(
@@ -1535,6 +1550,7 @@ class OCRManager(QObject):
     def start_minimap_auto_search(self):
         """Start finding the minimap circle in the top-left search area of the game window."""
         self._minimap_auto_candidates.clear()
+        self._last_minimap_auto_frame_result = None
         self._minimap_auto_search_active = True
         self._settings.set("minimap_roi.status", "searching", save=False)
         try:
@@ -1545,6 +1561,7 @@ class OCRManager(QObject):
     def stop_minimap_auto_search(self):
         """Stop finding the minimap circle; keep the last locked ROI if one exists."""
         self._minimap_auto_candidates.clear()
+        self._last_minimap_auto_frame_result = None
         self._minimap_auto_search_active = False
         width = int(self._settings.get("minimap_roi.width", 0) or 0)
         height = int(self._settings.get("minimap_roi.height", 0) or 0)
@@ -1564,7 +1581,7 @@ class OCRManager(QObject):
 
         self._minimap_auto_candidates.append(roi)
         self._minimap_auto_candidates = self._minimap_auto_candidates[-3:]
-        tolerance = int(self._settings.get("minimap_stability.auto_roi_lock_tolerance_px", 2) or 2)
+        tolerance = int(self._settings.get("minimap_stability.auto_roi_lock_tolerance_px", 15) or 15)
         if not should_lock_auto_roi(self._minimap_auto_candidates, required_frames=3, tolerance_px=tolerance):
             return False
 
@@ -1581,6 +1598,7 @@ class OCRManager(QObject):
         except Exception:
             pass
         self._minimap_auto_candidates.clear()
+        self._last_minimap_auto_frame_result = None
         self._minimap_auto_search_active = False
         self.minimap_roi_locked.emit(
             {
@@ -1696,7 +1714,8 @@ class OCRManager(QObject):
         )
 
     def _collect_minimap_observation(self, ocr_candidate: CoordinateCandidate | None) -> dict:
-        if self.latest_observation_frame is None:
+        frame_result = self.latest_observation_frame
+        if frame_result is None:
             return {
                 "visual_candidate": None,
                 "visual_result": None,
@@ -1704,15 +1723,29 @@ class OCRManager(QObject):
                 "visual_failure_reason": "no_observation_frame",
                 "heading_failure_reason": "no_observation_frame",
             }
-        frame = self._minimap_frame_from_capture(self.latest_observation_frame)
-        if self._minimap_auto_search_active:
-            candidate = detect_minimap_circle_roi(
-                frame,
-                self._minimap_search_rect(frame),
-                require_arrow_anchor=True,
-            )
-            if candidate is not None:
-                self._handle_minimap_auto_candidate(candidate)
+        frame = getattr(frame_result, "minimap_frame", None)
+        if frame is None:
+            return {
+                "visual_candidate": None,
+                "visual_result": None,
+                "heading_candidate": None,
+                "visual_failure_reason": "no_minimap_frame",
+                "heading_failure_reason": "no_minimap_frame",
+            }
+        if (
+            self._minimap_auto_search_active
+            and frame_result is not self._last_minimap_auto_frame_result
+        ):
+            self._last_minimap_auto_frame_result = frame_result
+            search_rect = getattr(frame_result, "minimap_search_rect", None)
+            if search_rect is not None:
+                candidate = detect_minimap_circle_roi(
+                    frame,
+                    search_rect,
+                    require_arrow_anchor=True,
+                )
+                if candidate is not None:
+                    self._handle_minimap_auto_candidate(candidate)
         roi = self._build_minimap_roi_from_settings()
         if roi is None:
             if self._minimap_auto_search_active:
@@ -1768,32 +1801,6 @@ class OCRManager(QObject):
                 "error": str(e),
             }
 
-    def _minimap_frame_from_capture(self, frame_result):
-        """Return the game-window-relative frame used by minimap ROI and vision paths."""
-        frame = getattr(frame_result, "frame", frame_result)
-        rect = self._current_game_window_rect
-        if frame is None or rect is None:
-            return frame
-
-        try:
-            frame_height, frame_width = frame.shape[:2]
-            origin_x, origin_y = getattr(frame_result, "origin", (0, 0))
-            left, top, right, bottom = [int(value) for value in rect]
-            rel_left = left - int(origin_x)
-            rel_top = top - int(origin_y)
-            rel_right = right - int(origin_x)
-            rel_bottom = bottom - int(origin_y)
-        except Exception:
-            return frame
-
-        if rel_left == 0 and rel_top == 0 and rel_right == frame_width and rel_bottom == frame_height:
-            return frame
-        if rel_left < 0 or rel_top < 0 or rel_right > frame_width or rel_bottom > frame_height:
-            return frame
-        if rel_right <= rel_left or rel_bottom <= rel_top:
-            return frame
-        return frame[rel_top:rel_bottom, rel_left:rel_right]
-
     def _export_minimap_frame_package(
         self,
         frame,
@@ -1847,10 +1854,6 @@ class OCRManager(QObject):
             )
         except Exception:
             return None
-
-    def _minimap_search_rect(self, frame) -> Tuple[int, int, int, int]:
-        frame_height, frame_width = frame.shape[:2]
-        return (0, 0, max(1, int(frame_width / 8)), max(1, int(frame_height / 4)))
 
     def _calculate_minimap_search_region(self, rect: Tuple[int, int, int, int]) -> Dict[str, int]:
         left, top, right, bottom = rect
@@ -1968,8 +1971,10 @@ class OCRManager(QObject):
 
     @Slot(object)
     def on_observation_frame_captured(self, frame_result):
-        """Store the latest shared full-frame capture for minimap observation."""
+        """Store the shared frame and immediately advance an active minimap search."""
         self.latest_observation_frame = frame_result
+        if self._minimap_auto_search_active:
+            self._submit_recognition_frame(None)
     
     def cleanup(self):
         """清理资源"""

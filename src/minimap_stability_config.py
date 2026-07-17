@@ -11,7 +11,7 @@ class MinimapStabilityConfig:
     history_xy_threshold: int = 150
     history_x_threshold: int = 150
     history_y_threshold: int = 150
-    auto_roi_lock_tolerance_px: int = 2
+    auto_roi_lock_tolerance_px: int = 15
     heading_match_confidence_threshold: float = 0.65
     heading_recognition_enabled: bool = True
     rough_candidate_limit: int = 20

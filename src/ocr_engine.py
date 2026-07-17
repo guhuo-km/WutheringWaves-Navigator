@@ -229,22 +229,20 @@ class OCRWorker(QThread):
     error_occurred = Signal(str)  # Error message
     ocr_output_updated = Signal(str)  # Raw OCR output text
     capture_area_updated = Signal(dict)  # Runtime capture area updates
-    captured_frame_ready = Signal(object)  # Shared full frame plus OCR crop
+    captured_frame_ready = Signal(object)  # Minimap input for the current capture
     frame_recognition_completed = Signal(object)  # Per-frame OCR result, coords may be None
     fatal_gpu_error = Signal(dict)
     
-    def __init__(self, config_dict=None, capture_callback=None):
+    def __init__(self, config_dict=None):
         """
         Initialize OCR Worker
         
         Args:
             config_dict: Dictionary containing configuration parameters (optional)
-            capture_callback: Function to capture screen regions (optional)
         """
         super().__init__()
         self.config_dict = config_dict or {}
-        self.capture_callback = capture_callback
-        self.frame_capture_callback = None
+        self.recognition_capture_callback = None
         self.logger = logging.getLogger(__name__)
         
         # Worker control
@@ -274,7 +272,7 @@ class OCRWorker(QThread):
         self._last_inference_debug: Dict[str, Any] = {}
         self._last_candidate_clusters: List[Dict[str, Any]] = []
         self._last_selection_details: List[Dict[str, Any]] = []
-        self._last_capture_frame_result = None
+        self._last_recognition_capture = None
 
         self._capture_error_count = 0
         
@@ -286,6 +284,7 @@ class OCRWorker(QThread):
         
         # OCR capture area and interval
         self.capture_area = None
+        self.minimap_search_region = None
         self.ocr_interval = 1000  # milliseconds
         self.target_window_name = ""  # Target window name for screenshot
         self.detailed_ocr_logging = bool(config.get('detailed_ocr_logging', False))
@@ -407,19 +406,9 @@ class OCRWorker(QThread):
                 pass
         self.ocr_output_updated.emit(line)
     
-    def set_capture_callback(self, capture_callback):
-        """Set screen capture callback function
-        
-        Args:
-            capture_callback: Function that captures screen region
-                             Should accept: (x, y, width, height, mode, target_window_name)
-                             Should return: numpy array of captured image or None if failed
-        """
-        self.capture_callback = capture_callback
-
-    def set_frame_capture_callback(self, capture_callback):
-        """Set callback that returns the shared full frame plus OCR crop."""
-        self.frame_capture_callback = capture_callback
+    def set_recognition_capture_callback(self, capture_callback):
+        """Set the callback that returns independent OCR and minimap inputs."""
+        self.recognition_capture_callback = capture_callback
     
     def _remove_timestamp_from_coord_string(self, coord_str: str) -> str:
         """
@@ -1014,6 +1003,7 @@ class OCRWorker(QThread):
         
         # Load target window name (if using window-specific capture)
         self.target_window_name = config.get('target_window_name', '')
+        self.minimap_search_region = config.get('minimap_search_region')
         
         self.logger.info(f"OCR设置加载完成: 区域{self.capture_area}, 间隔{self.ocr_interval}ms")
     
@@ -1137,7 +1127,7 @@ class OCRWorker(QThread):
     def _capture_ocr_region(self) -> Optional[npt.NDArray[np.uint8]]:
         """Capture the OCR region from screen"""
         try:
-            if self.capture_callback is None and self.frame_capture_callback is None:
+            if self.recognition_capture_callback is None:
                 self.logger.error("No capture callback provided")
                 return None
 
@@ -1162,23 +1152,15 @@ class OCRWorker(QThread):
                 int(self.capture_area.get('height', 0) or 0),
                 mode,
                 self.target_window_name,
+                self.minimap_search_region,
             )
-
-            if self.frame_capture_callback is not None:
-                result = self.frame_capture_callback(*args)
-                self._last_capture_frame_result = result
-                if result is None:
-                    return None
-                try:
-                    self.captured_frame_ready.emit(result)
-                except Exception:
-                    pass
-                return result.crop
-
-            # Use callback function to capture screen region
-            screenshot = self.capture_callback(*args)
-            
-            return screenshot
+            result = self.recognition_capture_callback(*args)
+            self._last_recognition_capture = result
+            if result is None:
+                return None
+            if result.minimap_frame is not None:
+                self.captured_frame_ready.emit(result)
+            return result.ocr_crop
             
         except Exception as e:
             self._capture_error_count += 1
@@ -1400,7 +1382,7 @@ class OCRWorker(QThread):
             self.coordinates_detected.emit(*new_coords)
             self.frame_recognition_completed.emit({
                 "ocr_coord": new_coords,
-                "frame_result": self._last_capture_frame_result,
+                "frame_result": self._last_recognition_capture,
             })
             final_output = f"✓ 坐标: ({new_coords[0]}, {new_coords[1]}, {new_coords[2]})"
             self.ocr_output_updated.emit(final_output)
@@ -1431,7 +1413,7 @@ class OCRWorker(QThread):
             self.ocr_output_updated.emit(debug_info)
         self.frame_recognition_completed.emit({
             "ocr_coord": None,
-            "frame_result": self._last_capture_frame_result,
+            "frame_result": self._last_recognition_capture,
         })
         return False, None
 
@@ -1485,10 +1467,20 @@ class OCRWorker(QThread):
         except Exception as e:
             self.logger.error(f"更新高级OCR参数失败: {e}")
     
-    def update_capture_settings(self, capture_area: Dict[str, int], interval: int, window_name: str):
+    def update_capture_settings(
+        self,
+        capture_area: Dict[str, int],
+        interval: int,
+        window_name: str,
+        minimap_search_region: Optional[Dict[str, int]] = None,
+    ):
         """Update capture settings"""
         self.capture_area = capture_area
         self.ocr_interval = interval
         self.target_window_name = window_name
+        self.minimap_search_region = minimap_search_region
         self._emit_capture_area_updated()
-        self.logger.info(f"截图设置已更新: 区域{capture_area}, 间隔{interval}ms, 窗口'{window_name}'")
+        self.logger.info(
+            f"截图设置已更新: 区域{capture_area}, 间隔{interval}ms, "
+            f"窗口'{window_name}', 小地图搜索区域{minimap_search_region}"
+        )

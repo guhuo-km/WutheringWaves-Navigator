@@ -3,7 +3,6 @@ import os
 import sys
 import json
 import math
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Any, Dict
@@ -11,7 +10,7 @@ from urllib.parse import urlparse, parse_qs
 
 from PySide6.QtCore import Qt, QUrl, QTimer, Slot, QStandardPaths, Signal, QRect
 from PySide6.QtGui import QIcon, QColor, QDesktopServices
-from PySide6.QtWidgets import QApplication, QSizePolicy, QMessageBox
+from PySide6.QtWidgets import QApplication, QSizePolicy, QMessageBox, QProgressDialog
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
 from PySide6.QtWebChannel import QWebChannel
@@ -144,6 +143,8 @@ class MainWindow(FluentWindow):
         self._about_nav_badge = None
         self._update_check_in_progress = False
         self._updater_prepare_in_progress = False
+        self._updater_prepare_dialog: Optional[QProgressDialog] = None
+        self._pending_update_command: Optional[list[str]] = None
         self._last_update_result: Optional[UpdateResult] = None
         self._python_download_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="python-download")
         self._update_check_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="update-check")
@@ -1447,6 +1448,7 @@ class MainWindow(FluentWindow):
             return
 
         self._updater_prepare_in_progress = True
+        self._show_updater_prepare_dialog()
         self._app_state.append_system_log(
             tr("update_updater_preparing", "正在校验并准备更新器"),
             "INFO",
@@ -1455,6 +1457,7 @@ class MainWindow(FluentWindow):
             self._update_check_executor.submit(self._run_updater_prepare_thread, result)
         except Exception as exc:
             self._updater_prepare_in_progress = False
+            self._close_updater_prepare_dialog()
             message = tr(
                 "update_updater_prepare_failed",
                 "准备更新器失败: {error}",
@@ -1466,6 +1469,28 @@ class MainWindow(FluentWindow):
                 message,
             )
             self._app_state.append_system_log(message, "ERROR")
+
+    def _show_updater_prepare_dialog(self):
+        dialog = QProgressDialog(
+            tr("update_updater_prepare_detail", "正在下载并校验更新器，请稍候。"),
+            None,
+            0,
+            0,
+            self,
+        )
+        dialog.setWindowTitle(tr("update_updater_prepare_title", "正在准备更新"))
+        dialog.setWindowModality(Qt.ApplicationModal)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setMinimumDuration(0)
+        dialog.show()
+        self._updater_prepare_dialog = dialog
+
+    def _close_updater_prepare_dialog(self):
+        if self._updater_prepare_dialog is not None:
+            self._updater_prepare_dialog.close()
+            self._updater_prepare_dialog.deleteLater()
+            self._updater_prepare_dialog = None
 
     def _run_updater_prepare_thread(self, result: UpdateResult):
         try:
@@ -1484,6 +1509,7 @@ class MainWindow(FluentWindow):
     @Slot(object, str, bool)
     def _on_updater_prepare_finished(self, result: UpdateResult, error_message: str, replaced: bool):
         self._updater_prepare_in_progress = False
+        self._close_updater_prepare_dialog()
         if error_message:
             message = tr(
                 "update_updater_update_failed",
@@ -1525,13 +1551,26 @@ class MainWindow(FluentWindow):
             result=result,
             wait_pid=os.getpid(),
         )
-        try:
-            subprocess.Popen(args, cwd=str(self._app_root_for_update()))
-        except Exception as exc:
-            QMessageBox.warning(self, "无法应用更新", f"启动更新器失败: {exc}")
-            self._app_state.append_system_log(f"启动更新器失败: {exc}", "ERROR")
+        self._pending_update_command = args
+        if self.close():
             return
-        QApplication.quit()
+
+        self._pending_update_command = None
+        message = tr(
+            "update_updater_close_failed",
+            "主程序未能关闭，更新未启动。",
+        )
+        QMessageBox.warning(
+            self,
+            tr("update_apply_unavailable_title", "无法应用更新"),
+            message,
+        )
+        self._app_state.append_system_log(message, "ERROR")
+
+    def take_pending_update_command(self) -> Optional[list[str]]:
+        command = self._pending_update_command
+        self._pending_update_command = None
+        return command
 
     def _setup_overlay_manager(self):
         """设置透明覆盖层管理器（中心圆点）"""
@@ -1874,11 +1913,6 @@ class MainWindow(FluentWindow):
         if self._ocr_manager and not self._app_state.ocr_running:
             success = self._ocr_manager.start_ocr()
             if success:
-                if (
-                    self._ocr_settings_interface
-                    and self._ocr_settings_interface.is_minimap_auto_calibration_enabled()
-                ):
-                    self._request_minimap_auto_recalibration()
                 self._app_state.ocr_running = True
                 self._app_state.append_system_log("OCR识别已启动", "INFO")
             else:
@@ -1933,10 +1967,11 @@ class MainWindow(FluentWindow):
 
             self._ocr_manager.ocr_config['screenshot_mode'] = screenshot_mode
             self._ocr_manager.ocr_config['ocr_interval'] = int(interval)
-            self._ocr_manager.ocr_config['target_window_name'] = target_window
             self._ocr_manager.ocr_config['digit_confidence_threshold'] = float(digit_conf)
             self._ocr_manager.ocr_config['symbol_confidence_threshold'] = float(symbol_conf)
             self._ocr_manager.ocr_config['auto_detect_region_enabled'] = bool(auto_detect_enabled)
+            if not auto_detect_enabled:
+                self._ocr_manager.ocr_config['target_window_name'] = target_window
             self._settings.set("minimap_stability.heading_recognition_enabled", bool(heading_enabled))
             self._ocr_manager.save_config()
 
@@ -1956,7 +1991,19 @@ class MainWindow(FluentWindow):
                     pass
                 try:
                     area = self._ocr_manager.ocr_config.get('ocr_capture_area') or {}
-                    worker.update_capture_settings(area, int(interval), target_window)
+                    active_target = self._ocr_manager.ocr_config.get('target_window_name', '')
+                    game_rect = self._ocr_manager._current_game_window_rect
+                    minimap_search_region = (
+                        self._ocr_manager._calculate_minimap_search_region(game_rect)
+                        if auto_detect_enabled and game_rect is not None
+                        else None
+                    )
+                    worker.update_capture_settings(
+                        area,
+                        int(interval),
+                        active_target,
+                        minimap_search_region,
+                    )
                 except Exception:
                     pass
         except Exception as e:
@@ -1982,6 +2029,10 @@ class MainWindow(FluentWindow):
         else:
             if hasattr(self._ocr_manager, 'stop_auto_window_detect'):
                 self._ocr_manager.stop_auto_window_detect()
+            if self._ocr_settings_interface:
+                self._ocr_manager.ocr_config['target_window_name'] = (
+                    self._ocr_settings_interface.get_target_window_name()
+                )
             restored = False
             if hasattr(self._ocr_manager, 'restore_manual_region_if_available'):
                 restored = self._ocr_manager.restore_manual_region_if_available()

@@ -386,6 +386,15 @@ def test_minimap_calibration_buttons_are_connected_to_main_window():
     assert 'stop_minimap_auto_search' in main_window_text
 
 
+def test_ocr_start_does_not_create_a_minimap_recalibration_request():
+    main_window_text = MAIN_WINDOW.read_text(encoding="utf-8")
+    start_ocr_body = main_window_text.split("    def _start_ocr(self):", 1)[1].split(
+        "    def _stop_ocr(self):", 1
+    )[0]
+
+    assert "_request_minimap_auto_recalibration" not in start_ocr_body
+
+
 def test_new_ui_i18n_keys_exist_in_both_language_files():
     zh = json.loads((LANGUAGES / "zh_CN.json").read_text(encoding="utf-8"))
     en = json.loads((LANGUAGES / "en_US.json").read_text(encoding="utf-8"))

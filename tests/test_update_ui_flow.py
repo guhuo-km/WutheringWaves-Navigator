@@ -23,12 +23,15 @@ def test_updater_bootstrap_ui_text_uses_translation_resources():
         "update_auto_unavailable_title",
         "update_apply_unavailable_title",
         "update_updater_metadata_incomplete",
-        "update_updater_prepare_duplicate",
-        "update_updater_preparing",
-        "update_updater_prepare_failed",
+    "update_updater_prepare_duplicate",
+    "update_updater_preparing",
+    "update_updater_prepare_title",
+    "update_updater_prepare_detail",
+    "update_updater_prepare_failed",
         "update_updater_update_failed",
         "update_updater_updated",
-        "update_updater_already_current",
+    "update_updater_already_current",
+    "update_updater_close_failed",
     }
 
     for key in keys:
@@ -108,6 +111,8 @@ def test_start_file_update_prepares_verified_updater_before_launch(monkeypatch, 
     window._updater_prepare_in_progress = False
     window._update_check_executor = ImmediateExecutor()
     window._app_state = AppState()
+    window._show_updater_prepare_dialog = lambda: None
+    window._close_updater_prepare_dialog = lambda: None
     window._app_root_for_update = lambda: tmp_path
     window._update_apply_lock_path = lambda: tmp_path / ".update" / "apply.lock"
     window._updater_exe_path = lambda: tmp_path / "WutheringWaves-Updater.exe"

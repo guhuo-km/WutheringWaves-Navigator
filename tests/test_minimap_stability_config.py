@@ -13,7 +13,7 @@ def test_minimap_stability_config_uses_confirmed_defaults():
     assert config.history_xy_threshold == 150
     assert config.history_x_threshold == 150
     assert config.history_y_threshold == 150
-    assert config.auto_roi_lock_tolerance_px == 2
+    assert config.auto_roi_lock_tolerance_px == 15
     assert config.heading_match_confidence_threshold == 0.65
     assert config.heading_recognition_enabled is True
     assert config.rough_candidate_limit == 20

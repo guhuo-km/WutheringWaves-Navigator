@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 from core.file_updater import apply_staged_update, recover_interrupted_updates
@@ -23,6 +24,14 @@ STAGE_LABELS = {
 }
 
 UPDATER_UI_BACKEND = "tkinter"
+
+
+def append_update_failure_log(app_root: str | Path, stage: str, error: Exception) -> None:
+    log_path = Path(app_root) / "logs" / "update.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"[{timestamp}] [{stage}] {error}\n")
 
 
 def updater_stage_label(stage: str) -> str:
@@ -207,14 +216,22 @@ class UpdaterWindow:
         self.root.destroy()
 
     def run(self) -> int:
+        current_stage = "waiting"
+
+        def report_progress(stage: str, percent: int):
+            nonlocal current_stage
+            current_stage = stage
+            self.root.after(0, self._on_progress, stage, percent)
+
         def worker():
             try:
                 self.main_exe_path = run_update_flow(
                     self.args,
-                    progress_callback=lambda stage, percent: self.root.after(0, self._on_progress, stage, percent),
+                    progress_callback=report_progress,
                 )
                 self.root.after(0, self._on_finished, True, "")
             except Exception as exc:
+                append_update_failure_log(self.args.app_root, current_stage, exc)
                 self.root.after(0, self._on_finished, False, str(exc))
 
         threading.Thread(target=worker, daemon=False).start()

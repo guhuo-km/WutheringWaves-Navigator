@@ -9,6 +9,7 @@ import pytest
 
 from src.updater_app import (
     UPDATER_UI_BACKEND,
+    append_update_failure_log,
     parse_update_args,
     run_update_flow,
     updater_stage_label,
@@ -328,3 +329,35 @@ def test_update_in_progress_message_is_user_facing():
 
     assert "正在应用更新" in message
     assert "apply.lock" not in message
+
+
+def test_updater_failure_records_reason_and_releases_lock(tmp_path):
+    """Known issue: failed updates need a durable reason and must not remain occupied."""
+    args = parse_update_args(
+        [
+            "--app-root",
+            str(tmp_path),
+            "--main-exe",
+            "app.exe",
+            "--version",
+            "0.1.6.24",
+            "--manifest-url",
+            "https://updates.example.com/missing-manifest.json",
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="manifest unavailable"):
+        run_update_flow(
+            args,
+            progress_callback=lambda *_args: None,
+            stage_update=lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("manifest unavailable")
+            ),
+            wait_for_exit=lambda *_args: True,
+        )
+
+    append_update_failure_log(tmp_path, "download", RuntimeError("manifest unavailable"))
+
+    assert not update_lock_path(tmp_path).exists()
+    assert "download" in (tmp_path / "logs" / "update.log").read_text(encoding="utf-8")
+    assert "manifest unavailable" in (tmp_path / "logs" / "update.log").read_text(encoding="utf-8")

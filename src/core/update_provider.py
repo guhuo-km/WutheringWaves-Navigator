@@ -99,7 +99,11 @@ class HttpUpdateProvider:
             )
 
         try:
-            response = self.session.get(self.latest_url, timeout=self.timeout)
+            response = self.session.get(
+                self.latest_url,
+                timeout=self.timeout,
+                headers={"X-Wuwa-Navigator-Version": current_version},
+            )
             response.raise_for_status()
             data = response.json()
         except Exception as exc:
