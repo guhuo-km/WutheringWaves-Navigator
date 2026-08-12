@@ -430,6 +430,40 @@ def test_visual_locator_caches_ready_rough_entries_until_index_files_change(tmp_
     assert read_calls == [str(rough_path)]
 
 
+def test_visual_locator_cached_rough_entries_do_not_rescan_directory(tmp_path, monkeypatch):
+    key = TileKey(area_id="906", layer_id="default", z_level=None, kind="standard", x=2, y=-1)
+    rough_root = tmp_path / "906" / "indexes" / "rough_windows"
+    rough_root.mkdir(parents=True)
+    (rough_root / "candidate.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "work_key": "rough|candidate",
+                "window_type": "tile",
+                "tile_keys": [canonical_tile_key(key)],
+                "vector": [1.0, 0.0, 0.0],
+            }
+        ),
+        encoding="utf-8",
+    )
+    tile_path = tmp_path / "906" / "standard" / "default" / "base" / "2_-1.png"
+    tile_path.parent.mkdir(parents=True)
+    cv2.imwrite(str(tile_path), np.zeros((16, 16, 3), dtype=np.uint8))
+    store = MinimapIndexStore(tmp_path, "906")
+    store.record_tile_available(key, png_path=str(tile_path), mtime_ns=1, size=2)
+    store.mark_rough_ready(key)
+
+    locator = MinimapVisualLocator(tile_root=tmp_path)
+    assert len(locator._load_tile_rough_entries("906")) == 1
+    monkeypatch.setattr(
+        type(rough_root),
+        "glob",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("rescanned rough directory")),
+    )
+
+    assert len(locator._load_tile_rough_entries("906")) == 1
+
+
 def test_visual_locator_caches_sift_npz_until_file_changes(tmp_path, monkeypatch):
     key = TileKey(area_id="906", layer_id="default", z_level=None, kind="standard", x=2, y=-1)
     tile_path = tmp_path / "906" / "standard" / "default" / "base" / "2_-1.png"

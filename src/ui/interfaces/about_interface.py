@@ -352,7 +352,7 @@ class AboutInterface(ScrollArea):
         self.credits_title.setText(tr("about_credits_title", "致谢"))
         credit_keys = [
             ("about_credit_fluent", "PyQt-Fluent-Widgets - 现代Fluent Design UI框架"),
-            ("about_credit_ocr", "PaddleOCR / YOLO - 坐标识别引擎"),
+            ("about_credit_ocr", "YOLO - 坐标识别引擎"),
             ("about_credit_maps", "地图数据来自官方来源"),
         ]
         for label, (key, default) in zip(self._credit_labels, credit_keys):

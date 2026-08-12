@@ -904,7 +904,6 @@ def test_ocr_manager_passes_current_stability_config_to_observation_paths(monkey
                 "minimap_roi.height": 50,
                 "minimap_roi.shape": "circle",
                 "minimap_roi.source": "manual",
-                "minimap_stability.heading_match_confidence_threshold": 0.55,
                 "minimap_stability.coordinate_agreement_x_threshold": 12,
                 "minimap_stability.coordinate_agreement_y_threshold": 34,
             }
@@ -925,7 +924,6 @@ def test_ocr_manager_passes_current_stability_config_to_observation_paths(monkey
     manager._collect_minimap_observation(CoordinateCandidate(100, 200, 30, source="ocr"))
 
     assert captured
-    assert captured[0].heading_match_confidence_threshold == 0.55
     assert captured[0].coordinate_agreement_x_threshold == 12
     assert captured[0].coordinate_agreement_y_threshold == 34
 

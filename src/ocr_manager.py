@@ -48,10 +48,11 @@ from core.map_context import CoordinateCandidate
 from core.observation_evidence_log import route_observation_bundle
 from core.settings_manager import SettingsManager
 from coordinate_continuity import ContinuityState
-from coordinate_decision import choose_coordinate
+from coordinate_decision import CoordinateDecision, choose_coordinate
 from minimap_frame_package import write_minimap_frame_package
 from minimap_observation_worker import MinimapObservationWorker
 from minimap_observation_pipeline import run_observation_paths
+from minimap_visual_locator import MinimapVisualLocator, VisualMatchConfig
 from minimap_roi import (
     MinimapRoi,
     detect_minimap_circle_roi,
@@ -944,6 +945,8 @@ class OCRManager(QObject):
         self._current_game_window_rect: Optional[tuple[int, int, int, int]] = None
         self._vision_map_context = None
         self._vision_tile_root: Optional[Path] = None
+        self._vision_locator = None
+        self._vision_locator_key = None
         self._minimap_auto_candidates: list[MinimapRoi] = []
         self._minimap_auto_search_active = False
         self._last_minimap_auto_frame_result = None
@@ -1655,20 +1658,22 @@ class OCRManager(QObject):
         heading_candidate = observation.get("heading_candidate")
         self.latest_heading_candidate = heading_candidate if isinstance(heading_candidate, dict) else None
         visual_candidate = self._candidate_from_observation(observation.get("visual_candidate"))
-        stability_config = load_minimap_stability_config(self._settings)
-        decision = choose_coordinate(
-            ocr_candidate,
-            visual_candidate,
-            self._coordinate_continuity,
-            agreement_xy_threshold=(
-                stability_config.coordinate_agreement_x_threshold,
-                stability_config.coordinate_agreement_y_threshold,
-            ),
-            history_xy_threshold=(
-                stability_config.history_x_threshold,
-                stability_config.history_y_threshold,
-            ),
-        )
+        decision = observation.get("_decision_object")
+        if not isinstance(decision, CoordinateDecision):
+            stability_config = load_minimap_stability_config(self._settings)
+            decision = choose_coordinate(
+                ocr_candidate,
+                visual_candidate,
+                self._coordinate_continuity,
+                agreement_xy_threshold=(
+                    stability_config.coordinate_agreement_x_threshold,
+                    stability_config.coordinate_agreement_y_threshold,
+                ),
+                history_xy_threshold=(
+                    stability_config.history_x_threshold,
+                    stability_config.history_y_threshold,
+                ),
+            )
         if decision.coord is None:
             self._route_observation_evidence(ocr_candidate, visual_candidate, decision, observation)
             return
@@ -1712,6 +1717,24 @@ class OCRManager(QObject):
             shape=shape,
             source=str(self._settings.get("minimap_roi.source", "manual") or "manual"),
         )
+
+    def _get_vision_locator(
+        self,
+        *,
+        tile_root: Path | None,
+        area_id: object,
+        rough_candidate_limit: int,
+    ) -> MinimapVisualLocator | None:
+        if tile_root is None or area_id is None:
+            return None
+        key = (str(Path(tile_root).resolve()), str(area_id), int(rough_candidate_limit))
+        if key != self._vision_locator_key:
+            self._vision_locator = MinimapVisualLocator(
+                Path(tile_root),
+                config=VisualMatchConfig(rough_candidate_limit=int(rough_candidate_limit)),
+            )
+            self._vision_locator_key = key
+        return self._vision_locator
 
     def _collect_minimap_observation(self, ocr_candidate: CoordinateCandidate | None) -> dict:
         frame_result = self.latest_observation_frame
@@ -1776,6 +1799,11 @@ class OCRManager(QObject):
                 map_context=map_context,
                 tile_root=tile_root,
             )
+            vision_locator = self._get_vision_locator(
+                tile_root=tile_root,
+                area_id=getattr(map_context, "area_id", None),
+                rough_candidate_limit=stability_config.rough_candidate_limit,
+            )
             observation = run_observation_paths(
                 frame,
                 roi=roi,
@@ -1785,6 +1813,7 @@ class OCRManager(QObject):
                 continuity=self._coordinate_continuity,
                 stability_config=stability_config,
                 detect_heading_enabled=detect_heading_now,
+                vision_locator=vision_locator,
             )
             if not heading_enabled:
                 observation["heading_candidate"] = None

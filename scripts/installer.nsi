@@ -4,7 +4,7 @@
 Unicode true
 
 !define APP_NAME "呜呜大地图"
-!define APP_VERSION "0.1.6.25"
+!define APP_VERSION "0.1.7"
 !define APP_EXE "WutheringWaves-Navigator-Smart.exe"
 !define APP_PUBLISHER "B站UP主 uid:1876277780"
 !define APP_URL "https://space.bilibili.com/1876277780"
@@ -79,7 +79,7 @@ UninstPage custom un.KeepUserDataPage un.KeepUserDataPageLeave
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
 ; 版本信息
-VIProductVersion "0.1.6.25"
+VIProductVersion "0.1.7.0"
 VIAddVersionKey "ProductName" "${APP_NAME}"
 VIAddVersionKey "CompanyName" "${APP_PUBLISHER}"
 VIAddVersionKey "LegalCopyright" "Copyright (C) 2024 ${APP_PUBLISHER}. 免费开源软件"

@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 
-from minimap_heading import load_heading_template
 from minimap_roi import (
     MinimapRoi,
     crop_minimap_from_frame,
@@ -13,15 +12,10 @@ from screen_capture import crop_image_region
 
 
 def _paint_heading_arrow(frame: np.ndarray, center: tuple[int, int]) -> None:
-    template = load_heading_template()
-    h, w = template.bgr.shape[:2]
-    left = int(center[0] - w // 2)
-    top = int(center[1] - h // 2)
-    alpha = (template.mask.astype(np.float32) / 255.0)[:, :, None]
-    frame[top:top + h, left:left + w] = (
-        template.bgr.astype(np.float32) * alpha
-        + frame[top:top + h, left:left + w].astype(np.float32) * (1.0 - alpha)
-    ).astype(np.uint8)
+    points = np.array([(0, -28), (17, 17), (0, 10), (-17, 17)], dtype=np.int32)
+    points[:, 0] += center[0]
+    points[:, 1] += center[1]
+    cv2.fillPoly(frame, [points], (0, 210, 255))
 
 
 def test_manual_and_auto_roi_use_same_value_shape():
@@ -109,7 +103,6 @@ def test_auto_minimap_circle_roi_requires_arrow_anchor_when_requested():
         frame,
         search_rect=(0, 0, 160, 140),
         require_arrow_anchor=True,
-        arrow_confidence_threshold=0.9,
     )
 
     assert roi is None
@@ -125,7 +118,6 @@ def test_auto_minimap_circle_roi_prefers_circle_near_heading_arrow():
         frame,
         search_rect=(0, 0, 320, 260),
         require_arrow_anchor=True,
-        arrow_confidence_threshold=0.9,
     )
 
     assert roi is not None

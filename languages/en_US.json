@@ -712,6 +712,6 @@
   "update_updater_launch_failed": "Failed to start updater: {error}",
   "about_credits_title": "Credits",
   "about_credit_fluent": "PyQt-Fluent-Widgets - modern Fluent Design UI framework",
-  "about_credit_ocr": "PaddleOCR / YOLO - coordinate recognition engine",
+  "about_credit_ocr": "YOLO - coordinate recognition engine",
   "about_credit_maps": "Map data comes from official sources"
 }

@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import numpy.typing as npt
 
-from minimap_heading import generate_rotated_templates, load_heading_template
+from minimap_heading import detect_heading_geometry
 
 
 @dataclass(frozen=True)
@@ -65,25 +65,9 @@ def crop_minimap_from_frame(
     return crop_image_region(frame, roi.x, roi.y, roi.width, roi.height)
 
 
-def _resize_template(
-    image: npt.NDArray[np.uint8],
-    scale: float,
-    interpolation: int,
-) -> npt.NDArray[np.uint8]:
-    if scale == 1.0:
-        return image
-    height, width = image.shape[:2]
-    scaled_width = max(1, int(round(width * scale)))
-    scaled_height = max(1, int(round(height * scale)))
-    return cv2.resize(image, (scaled_width, scaled_height), interpolation=interpolation)
-
-
 def detect_minimap_arrow_anchor(
     frame: npt.NDArray[np.uint8],
     search_rect: tuple[int, int, int, int],
-    *,
-    confidence_threshold: float = 0.72,
-    scale_candidates: Sequence[float] = (0.75, 0.875, 1.0, 1.125, 1.25),
 ) -> MinimapArrowAnchor | None:
     """Locate the fixed player arrow inside the minimap search rectangle."""
     if frame is None or frame.size == 0:
@@ -108,41 +92,16 @@ def detect_minimap_arrow_anchor(
     else:
         search_bgr = search[:, :, :3]
 
-    try:
-        template = load_heading_template()
-    except (FileNotFoundError, ValueError):
+    geometry, _, _ = detect_heading_geometry(search_bgr)
+    if geometry is None:
         return None
-
-    best: MinimapArrowAnchor | None = None
-    for rotated in generate_rotated_templates(template, bucket_count=36, step_degrees=10.0):
-        for scale in scale_candidates:
-            scaled_bgr = _resize_template(rotated.bgr, float(scale), cv2.INTER_LINEAR)
-            scaled_mask = _resize_template(rotated.mask, float(scale), cv2.INTER_NEAREST)
-            th, tw = scaled_bgr.shape[:2]
-            if th <= 0 or tw <= 0 or th > search_bgr.shape[0] or tw > search_bgr.shape[1]:
-                continue
-            if cv2.countNonZero(scaled_mask.astype(np.uint8)) == 0:
-                continue
-            result = cv2.matchTemplate(
-                search_bgr,
-                scaled_bgr,
-                cv2.TM_CCORR_NORMED,
-                mask=scaled_mask.astype(np.uint8),
-            )
-            result = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
-            _, score, _, max_loc = cv2.minMaxLoc(result)
-            if best is None or float(score) > best.score:
-                best = MinimapArrowAnchor(
-                    x=int(round(left + max_loc[0] + tw / 2.0)),
-                    y=int(round(top + max_loc[1] + th / 2.0)),
-                    score=float(score),
-                    angle_degrees=rotated.angle_degrees,
-                    scale=float(scale),
-                )
-
-    if best is None or best.score < float(confidence_threshold):
-        return None
-    return best
+    return MinimapArrowAnchor(
+        x=int(round(left + geometry.centroid_x)),
+        y=int(round(top + geometry.centroid_y)),
+        score=geometry.confidence,
+        angle_degrees=geometry.angle_degrees,
+        scale=1.0,
+    )
 
 
 def detect_minimap_circle_roi(
@@ -150,7 +109,6 @@ def detect_minimap_circle_roi(
     search_rect: tuple[int, int, int, int],
     *,
     require_arrow_anchor: bool = False,
-    arrow_confidence_threshold: float = 0.72,
 ) -> MinimapRoi | None:
     """Detect a circular minimap ROI inside an explicitly supplied search rectangle."""
     if frame is None or frame.size == 0:
@@ -172,7 +130,6 @@ def detect_minimap_circle_roi(
         arrow_anchor = detect_minimap_arrow_anchor(
             frame,
             (left, top, right - left, bottom - top),
-            confidence_threshold=arrow_confidence_threshold,
         )
         if arrow_anchor is None:
             return None

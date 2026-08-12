@@ -11,7 +11,7 @@ import numpy as np
 
 from core import paths
 from core.map_context import CoordinateCandidate, MapContext
-from minimap_heading import collect_heading_match_debug
+from minimap_heading import collect_heading_geometry_debug
 from minimap_roi import MinimapRoi
 from minimap_roi import crop_minimap_from_frame, normalize_minimap_crop
 from minimap_stability_config import MinimapStabilityConfig
@@ -99,31 +99,24 @@ def _write_debug_artifacts(
     artifacts["minimap_mask"] = "minimap_mask.png"
 
     config = stability_config or MinimapStabilityConfig()
-    heading_debug = collect_heading_match_debug(
-        normalized.exact_image,
-        normalized.mask,
-        confidence_threshold=float(config.heading_match_confidence_threshold),
-        top_n=12,
-    )
-    center_image = heading_debug.get("center_image")
-    center_mask = heading_debug.get("center_mask")
-    if isinstance(center_image, np.ndarray) and center_image.size:
-        _write_image(package_dir / "heading_center_crop.png", center_image)
-        artifacts["heading_center_crop"] = "heading_center_crop.png"
-    if isinstance(center_mask, np.ndarray) and center_mask.size:
-        _write_image(package_dir / "heading_center_mask.png", center_mask)
-        artifacts["heading_center_mask"] = "heading_center_mask.png"
+    heading_debug = collect_heading_geometry_debug(normalized.exact_image, normalized.mask)
+    color_mask = heading_debug.get("color_mask")
+    overlay = heading_debug.get("overlay")
+    if isinstance(color_mask, np.ndarray) and color_mask.size:
+        _write_image(package_dir / "heading_color_mask.png", color_mask)
+        artifacts["heading_color_mask"] = "heading_color_mask.png"
+    if isinstance(overlay, np.ndarray) and overlay.size:
+        _write_image(package_dir / "heading_geometry_overlay.png", overlay)
+        artifacts["heading_geometry_overlay"] = "heading_geometry_overlay.png"
     _write_json(
-        package_dir / "heading_scores.json",
+        package_dir / "heading_geometry.json",
         {
             "candidate": heading_debug.get("candidate"),
-            "scores": heading_debug.get("scores", []),
+            "geometry": heading_debug.get("geometry"),
             "reason": heading_debug.get("reason", ""),
-            "best_score": heading_debug.get("best_score"),
-            "confidence_threshold": heading_debug.get("confidence_threshold"),
         },
     )
-    artifacts["heading_scores"] = "heading_scores.json"
+    artifacts["heading_geometry"] = "heading_geometry.json"
     return artifacts
 
 

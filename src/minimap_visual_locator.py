@@ -58,6 +58,10 @@ class MinimapVisualLocator:
         self.last_trace: dict[str, Any] = {"manifests": []}
         self._last_rough_index_source = ""
         self._last_sift_index_source = ""
+        self._rough_matrix_cache: dict[str, tuple[tuple, np.ndarray]] = {}
+        self._combined_sift_cache: dict[tuple, dict[str, np.ndarray]] = {}
+        self._sift_detector = None
+        self._sift_matcher = None
 
     def search_root(self, context: MapContext) -> Path:
         return self.tile_root / context.area_id / context.layer_id
@@ -790,30 +794,43 @@ class MinimapVisualLocator:
             return None
 
         query_vector = compute_hsv_texture_descriptor(query_color, mask=query_mask)
-        scored = []
-        for entry in rough_entries:
-            vector = np.asarray(entry.get("vector", []), dtype=np.float32)
-            if vector.size == 0:
-                continue
-            vector_norm = float(np.linalg.norm(vector))
-            query_norm = float(np.linalg.norm(query_vector))
-            if vector_norm > 0:
-                vector = vector / vector_norm
-            query = query_vector / query_norm if query_norm > 0 else query_vector
-            scored.append((float(np.dot(query, vector)), entry))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        hits = scored[: max(1, int(self.config.rough_candidate_limit))]
+        query_norm = float(np.linalg.norm(query_vector))
+        query = query_vector / query_norm if query_norm > 0 else query_vector
+        rough_matrix = self._rough_matrix_for_entries(context.area_id, rough_entries)
+        if rough_matrix.size == 0:
+            return None
+        scores = rough_matrix @ query
+        limit = min(max(1, int(self.config.rough_candidate_limit)), len(rough_entries))
+        if limit == len(rough_entries):
+            hit_indexes = np.argsort(scores)[::-1]
+        else:
+            partition = np.argpartition(scores, -limit)[-limit:]
+            hit_indexes = partition[np.argsort(scores[partition])[::-1]]
+        hits = [(float(scores[index]), rough_entries[int(index)]) for index in hit_indexes]
         self.last_trace["rough_candidates_used"] = len(hits)
         if not hits:
             return None
 
-        detector = create_sift_detector()
+        if self._sift_detector is None:
+            self._sift_detector = create_sift_detector()
+        detector = self._sift_detector
         query_keypoints, query_descriptors = detector.detectAndCompute(query_color, query_mask)
         if query_descriptors is None or len(query_keypoints) < 3:
             return None
         query_descriptors = query_descriptors.astype(np.float32)
-        matcher = cv2.BFMatcher(cv2.NORM_L2)
+        if self._sift_matcher is None:
+            self._sift_matcher = cv2.BFMatcher(cv2.NORM_L2)
+        matcher = self._sift_matcher
         candidate_rows: list[dict[str, Any]] = []
+        observation_state = TileIndexStateStore(self.tile_root, str(context.area_id))
+        observation_index_store = MinimapIndexStore(self.tile_root, str(context.area_id))
+        observation_tile_keys = [
+            key
+            for _, entry in hits
+            for key in (parse_canonical_tile_key(raw) for raw in entry.get("tile_keys", []))
+            if key is not None
+        ]
+        observation_statuses = observation_index_store.get_tile_statuses(observation_tile_keys)
 
         for rank, (score, entry) in enumerate(hits, start=1):
             tile_keys = [
@@ -835,7 +852,13 @@ class MinimapVisualLocator:
                 "skip_reason": "",
             }
             self.last_trace["rough_hits"].append(hit_trace)
-            index = self._load_existing_sift_tiles(context.area_id, tile_keys)
+            index = self._load_existing_sift_tiles(
+                context.area_id,
+                tile_keys,
+                state=observation_state,
+                index_store=observation_index_store,
+                sqlite_statuses=observation_statuses,
+            )
             if index is None:
                 hit_trace["skip_reason"] = "missing_sift_index"
                 self.last_trace["rough_candidates_skipped_missing"] += 1
@@ -923,21 +946,21 @@ class MinimapVisualLocator:
         root = self.tile_root / str(area_id) / "indexes" / "rough_windows"
         if not root.exists():
             return []
-        rough_paths = tuple(sorted(root.glob("*.json")))
         index_root = self.tile_root / str(area_id) / "indexes"
         cache_key = (
             str(self.tile_root.resolve()),
             str(area_id),
-            tuple(self._file_stamp_tuple(path) for path in rough_paths),
             self._file_stamp_tuple(index_root / "tile_index_state.json"),
             self._file_stamp_tuple(index_root / "minimap_index.sqlite3"),
         )
         cached = self._GLOBAL_TILE_ROUGH_ENTRIES_CACHE.get(cache_key)
         if cached is not None:
             return list(cached)
+        rough_paths = tuple(sorted(root.glob("*.json")))
         state = TileIndexStateStore(self.tile_root, str(area_id))
         index_store = MinimapIndexStore(self.tile_root, str(area_id))
-        entries: list[dict[str, Any]] = []
+        parsed_entries: list[tuple[dict[str, Any], list[TileKey]]] = []
+        all_tile_keys: list[TileKey] = []
         for path in rough_paths:
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
@@ -952,27 +975,75 @@ class MinimapVisualLocator:
             ]
             if not tile_keys:
                 continue
-            skip_entry = False
-            for key in tile_keys:
-                if not self._tile_rough_ready(key, state, index_store):
-                    skip_entry = True
-                    break
-            if skip_entry:
+            parsed_entries.append((raw, tile_keys))
+            all_tile_keys.extend(tile_keys)
+        statuses = index_store.get_tile_statuses(all_tile_keys)
+        entries: list[dict[str, Any]] = []
+        for raw, tile_keys in parsed_entries:
+            if any(not self._tile_rough_ready(key, state, index_store, sqlite_statuses=statuses) for key in tile_keys):
                 continue
+            vector = np.asarray(raw.get("vector", []), dtype=np.float32)
+            if vector.size:
+                vector_norm = float(np.linalg.norm(vector))
+                raw["normalized_vector"] = (vector / vector_norm).tolist() if vector_norm > 0 else vector.tolist()
             entries.append(raw)
-        self._GLOBAL_TILE_ROUGH_ENTRIES_CACHE[cache_key] = list(entries)
+        settled_cache_key = (
+            str(self.tile_root.resolve()),
+            str(area_id),
+            self._file_stamp_tuple(index_root / "tile_index_state.json"),
+            self._file_stamp_tuple(index_root / "minimap_index.sqlite3"),
+        )
+        self._GLOBAL_TILE_ROUGH_ENTRIES_CACHE[settled_cache_key] = list(entries)
+        self._rough_matrix_cache.pop(str(area_id), None)
         return entries
 
-    def _load_existing_sift_tiles(self, area_id: str, tile_keys: list[TileKey]) -> dict[str, np.ndarray] | None:
+    def _rough_matrix_for_entries(self, area_id: str, entries: list[dict[str, Any]]) -> np.ndarray:
+        cache_key = (id(entries[0]) if entries else 0, len(entries))
+        cached = self._rough_matrix_cache.get(str(area_id))
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        vectors = [
+            np.asarray(entry.get("normalized_vector", entry.get("vector", [])), dtype=np.float32)
+            for entry in entries
+        ]
+        if not vectors or any(vector.size == 0 for vector in vectors):
+            matrix = np.empty((0, 0), dtype=np.float32)
+        else:
+            matrix = np.ascontiguousarray(np.vstack(vectors), dtype=np.float32)
+        self._rough_matrix_cache[str(area_id)] = (cache_key, matrix)
+        return matrix
+
+    def _load_existing_sift_tiles(
+        self,
+        area_id: str,
+        tile_keys: list[TileKey],
+        *,
+        state: TileIndexStateStore | None = None,
+        index_store: MinimapIndexStore | None = None,
+        sqlite_statuses: dict[str, Any] | None = None,
+    ) -> dict[str, np.ndarray] | None:
         root = self.tile_root / str(area_id) / "indexes" / "sift_tiles"
-        state = TileIndexStateStore(self.tile_root, str(area_id))
-        index_store = MinimapIndexStore(self.tile_root, str(area_id))
+        state = state or TileIndexStateStore(self.tile_root, str(area_id))
+        index_store = index_store or MinimapIndexStore(self.tile_root, str(area_id))
+        sqlite_statuses = sqlite_statuses or {}
+        index_root = self.tile_root / str(area_id) / "indexes"
+        combined_cache_key = (
+            str(area_id),
+            tuple(canonical_tile_key(key) for key in tile_keys),
+            self._file_stamp_tuple(index_root / "tile_index_state.json"),
+            self._file_stamp_tuple(index_root / "minimap_index.sqlite3"),
+        )
+        cached_combined = self._combined_sift_cache.get(combined_cache_key)
+        if cached_combined is not None:
+            return cached_combined
         descriptors: list[np.ndarray] = []
         global_xy: list[np.ndarray] = []
         repaired: list[tuple[TileKey, TileIndexStatus]] = []
         for key in tile_keys:
             path = root / f"{_safe_tile_index_name('sift|' + canonical_tile_key(key))}.npz"
-            sqlite_status = index_store.get_tile_status(key)
+            sqlite_status = sqlite_statuses.get(canonical_tile_key(key))
+            if sqlite_status is None:
+                sqlite_status = index_store.get_tile_status(key)
             if sqlite_status.exists:
                 if not sqlite_status.tile_present or not sqlite_status.sift_ready or sqlite_status.stale_reason:
                     return None
@@ -1013,10 +1084,12 @@ class MinimapVisualLocator:
             for key, status in repaired:
                 state.set_tile_status(key, status)
             state.save()
-        return {
+        combined = {
             "descriptors": np.vstack(descriptors).astype(np.float32),
             "global_xy": np.vstack(global_xy).astype(np.float32),
         }
+        self._combined_sift_cache[combined_cache_key] = combined
+        return combined
 
     def _load_sift_arrays_cached(self, path: Path) -> dict[str, np.ndarray]:
         cache_key = self._file_stamp_tuple(path)
@@ -1042,8 +1115,11 @@ class MinimapVisualLocator:
         key: TileKey,
         state: TileIndexStateStore,
         index_store: MinimapIndexStore,
+        sqlite_statuses: dict[str, Any] | None = None,
     ) -> bool:
-        sqlite_status = index_store.get_tile_status(key)
+        sqlite_status = (sqlite_statuses or {}).get(canonical_tile_key(key))
+        if sqlite_status is None:
+            sqlite_status = index_store.get_tile_status(key)
         if sqlite_status.exists:
             return sqlite_status.tile_present and sqlite_status.rough_ready
         status = state.get_tile_status(key)

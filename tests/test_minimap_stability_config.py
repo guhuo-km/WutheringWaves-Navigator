@@ -14,7 +14,6 @@ def test_minimap_stability_config_uses_confirmed_defaults():
     assert config.history_x_threshold == 150
     assert config.history_y_threshold == 150
     assert config.auto_roi_lock_tolerance_px == 15
-    assert config.heading_match_confidence_threshold == 0.65
     assert config.heading_recognition_enabled is True
     assert config.rough_candidate_limit == 20
 
@@ -29,7 +28,6 @@ def test_minimap_stability_config_loads_existing_settings_values():
             "minimap_stability.history_x_threshold": "121",
             "minimap_stability.history_y_threshold": "122",
             "minimap_stability.auto_roi_lock_tolerance_px": "3",
-            "minimap_stability.heading_match_confidence_threshold": "0.7",
             "minimap_stability.heading_recognition_enabled": False,
             "minimap_stability.rough_candidate_limit": "12",
         }
@@ -46,6 +44,5 @@ def test_minimap_stability_config_loads_existing_settings_values():
     assert config.history_x_threshold == 121
     assert config.history_y_threshold == 122
     assert config.auto_roi_lock_tolerance_px == 3
-    assert config.heading_match_confidence_threshold == 0.7
     assert config.heading_recognition_enabled is False
     assert config.rough_candidate_limit == 12

@@ -465,7 +465,7 @@
   "about_description": "一个用于鸣潮游戏的智能地图导航工具，支持OCR坐标识别和路线录制",
   "credits_title": "致谢",
   "credit_fluent": "PyQt-Fluent-Widgets - 现代Fluent Design UI框架",
-  "credit_ocr": "PaddleOCR / YOLO - 坐标识别引擎",
+  "credit_ocr": "YOLO - 坐标识别引擎",
   "credit_maps": "地图数据来自官方来源",
   "config_paths": "配置文件路径",
   "routes_dir": "路线目录",
@@ -793,6 +793,6 @@
   "update_updater_launch_failed": "启动更新器失败: {error}",
   "about_credits_title": "致谢",
   "about_credit_fluent": "PyQt-Fluent-Widgets - 现代Fluent Design UI框架",
-  "about_credit_ocr": "PaddleOCR / YOLO - 坐标识别引擎",
+  "about_credit_ocr": "YOLO - 坐标识别引擎",
   "about_credit_maps": "地图数据来自官方来源"
 }

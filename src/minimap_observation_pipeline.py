@@ -34,6 +34,7 @@ def run_observation_paths(
     continuity: ContinuityState | None = None,
     stability_config: MinimapStabilityConfig | None = None,
     detect_heading_enabled: bool = True,
+    vision_locator: MinimapVisualLocator | None = None,
 ) -> dict[str, Any]:
     """Run the current OCR/visual/heading decision pipeline on one provided frame."""
     total_start = time.perf_counter()
@@ -64,7 +65,6 @@ def run_observation_paths(
             heading_candidate = detect_heading(
                 normalized.exact_image,
                 normalized.mask,
-                confidence_threshold=stability_config.heading_match_confidence_threshold,
             )
             if heading_candidate is None:
                 heading_failure_reason = "no_heading_match"
@@ -74,7 +74,7 @@ def run_observation_paths(
 
         if map_context is not None and tile_root is not None:
             stage_start = time.perf_counter()
-            locator = MinimapVisualLocator(
+            locator = vision_locator or MinimapVisualLocator(
                 tile_root,
                 config=VisualMatchConfig(
                     rough_candidate_limit=stability_config.rough_candidate_limit,
@@ -138,5 +138,6 @@ def run_observation_paths(
             "source": decision.source,
             "reason": decision.reason,
         },
+        "_decision_object": decision,
     }
 

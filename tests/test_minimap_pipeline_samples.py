@@ -16,7 +16,7 @@ if str(SRC) not in sys.path:
 from core.map_context import CoordinateCandidate, MapContext, TileKey
 from core.paths import minimap_tile_cache_dir
 from coordinate_continuity import ContinuityState
-from coordinate_decision import choose_coordinate
+from coordinate_decision import CoordinateDecision, choose_coordinate
 import minimap_observation_pipeline as pipeline
 from minimap_heading import HeadingCandidate
 from minimap_frame_package import read_minimap_frame_package, write_minimap_frame_package
@@ -125,6 +125,17 @@ def test_decision_function_handles_supplied_candidates():
     result = choose_coordinate(ocr, visual, ContinuityState(), agreement_xy_threshold=50)
     assert result.coord == (100, 200, 30)
     assert result.reason == "ocr_visual_agree"
+
+
+def test_observation_pipeline_exposes_single_decision_object():
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    result = run_observation_paths(
+        frame,
+        ocr_candidate=CoordinateCandidate(100, 200, 30, source="ocr"),
+    )
+
+    assert isinstance(result["_decision_object"], CoordinateDecision)
+    assert result["_decision_object"].coord == tuple(result["decision"]["coord"])
 
 
 def test_heading_result_serializes_for_logs():
@@ -725,9 +736,9 @@ def test_frame_package_can_export_heading_debug_artifacts(tmp_path):
         "minimap_crop",
         "normalized_minimap",
         "minimap_mask",
-        "heading_center_crop",
-        "heading_center_mask",
-        "heading_scores",
+        "heading_color_mask",
+        "heading_geometry_overlay",
+        "heading_geometry",
     ]:
         assert key in artifacts
         assert (Path(package["packagePath"]).parent / artifacts[key]).exists()
