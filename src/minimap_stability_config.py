@@ -14,6 +14,7 @@ class MinimapStabilityConfig:
     auto_roi_lock_tolerance_px: int = 15
     heading_recognition_enabled: bool = True
     rough_candidate_limit: int = 20
+    single_source_promotion_frames: int = 5
 
 
 def _read_setting(settings, key: str, default):
@@ -43,4 +44,5 @@ def load_minimap_stability_config(settings=None) -> MinimapStabilityConfig:
         auto_roi_lock_tolerance_px=int(_read_setting(settings, f"{prefix}.auto_roi_lock_tolerance_px", defaults.auto_roi_lock_tolerance_px)),
         heading_recognition_enabled=bool(_read_setting(settings, f"{prefix}.heading_recognition_enabled", defaults.heading_recognition_enabled)),
         rough_candidate_limit=int(_read_setting(settings, f"{prefix}.rough_candidate_limit", defaults.rough_candidate_limit)),
+        single_source_promotion_frames=int(_read_setting(settings, f"{prefix}.single_source_promotion_frames", defaults.single_source_promotion_frames)),
     )

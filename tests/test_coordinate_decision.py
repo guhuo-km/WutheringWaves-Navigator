@@ -159,3 +159,54 @@ def test_choose_coordinate_prefers_ocr_when_both_conflicting_candidates_are_near
     )
     assert result.coord == (140, 220, 31)
     assert result.reason == "both_near_history_prefer_ocr"
+
+
+def _continuity_with_single_source_streak(source, xy, frames, previous=(10000, 10000, 30)):
+    state = ContinuityState()
+    state.accept(previous)
+    for _ in range(frames):
+        ocr_xy = xy if source == "ocr" else None
+        visual_xy = xy if source == "visual" else None
+        state.note_single_source_frame(ocr_xy, visual_xy, tolerance=50)
+    return state
+
+
+def test_choose_coordinate_promotes_stable_ocr_only_far_from_history():
+    state = _continuity_with_single_source_streak("ocr", (9978, 8784), 5)
+    ocr = CoordinateCandidate(9978, 8784, 54, source="ocr")
+    result = choose_coordinate(ocr, None, state, promotion_frames=5)
+    assert result.coord == (9978, 8784, 54)
+    assert result.reason == "ocr_only_stable_promotion"
+
+
+def test_choose_coordinate_rejects_single_source_below_promotion_frames():
+    state = _continuity_with_single_source_streak("ocr", (9978, 8784), 4)
+    ocr = CoordinateCandidate(9978, 8784, 54, source="ocr")
+    result = choose_coordinate(ocr, None, state, promotion_frames=5)
+    assert result.coord is None
+    assert result.reason == "ocr_only_far_from_history"
+
+
+def test_choose_coordinate_rejects_promotion_when_candidate_leaves_streak():
+    state = _continuity_with_single_source_streak("ocr", (9978, 8784), 5)
+    ocr = CoordinateCandidate(5000, 5000, 54, source="ocr")
+    result = choose_coordinate(ocr, None, state, promotion_frames=5)
+    assert result.coord is None
+    assert result.reason == "ocr_only_far_from_history"
+
+
+def test_choose_coordinate_promotes_visual_only_with_last_z():
+    state = _continuity_with_single_source_streak("visual", (9978, 8784), 5, previous=(10935, 10795, 54))
+    visual = CoordinateCandidate(9978, 8784, None, source="visual")
+    result = choose_coordinate(None, visual, state, promotion_frames=5)
+    assert result.coord == (9978, 8784, 54)
+    assert result.reason == "visual_only_stable_promotion"
+
+
+def test_choose_coordinate_promotion_does_not_apply_when_both_sources_present():
+    state = _continuity_with_single_source_streak("ocr", (9978, 8784), 5)
+    ocr = CoordinateCandidate(9978, 8784, 54, source="ocr")
+    visual = CoordinateCandidate(-9978, -8784, None, source="visual")
+    result = choose_coordinate(ocr, visual, state, promotion_frames=5)
+    assert result.coord is None
+    assert result.reason == "conflict_both_far_from_history"

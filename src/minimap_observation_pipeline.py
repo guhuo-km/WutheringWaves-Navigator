@@ -112,6 +112,7 @@ def run_observation_paths(
             stability_config.history_x_threshold,
             stability_config.history_y_threshold,
         ),
+        promotion_frames=stability_config.single_source_promotion_frames,
     )
     timings_ms["decision"] = (time.perf_counter() - stage_start) * 1000.0
     timings_ms["total"] = (time.perf_counter() - total_start) * 1000.0

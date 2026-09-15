@@ -16,6 +16,7 @@ def test_minimap_stability_config_uses_confirmed_defaults():
     assert config.auto_roi_lock_tolerance_px == 15
     assert config.heading_recognition_enabled is True
     assert config.rough_candidate_limit == 20
+    assert config.single_source_promotion_frames == 5
 
 
 def test_minimap_stability_config_loads_existing_settings_values():
@@ -30,6 +31,7 @@ def test_minimap_stability_config_loads_existing_settings_values():
             "minimap_stability.auto_roi_lock_tolerance_px": "3",
             "minimap_stability.heading_recognition_enabled": False,
             "minimap_stability.rough_candidate_limit": "12",
+            "minimap_stability.single_source_promotion_frames": "7",
         }
 
         def get(self, key, default=None):
@@ -46,3 +48,4 @@ def test_minimap_stability_config_loads_existing_settings_values():
     assert config.auto_roi_lock_tolerance_px == 3
     assert config.heading_recognition_enabled is False
     assert config.rough_candidate_limit == 12
+    assert config.single_source_promotion_frames == 7

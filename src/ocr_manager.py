@@ -1673,8 +1673,10 @@ class OCRManager(QObject):
                     stability_config.history_x_threshold,
                     stability_config.history_y_threshold,
                 ),
+                promotion_frames=stability_config.single_source_promotion_frames,
             )
         if decision.coord is None:
+            self._note_single_source_frame(ocr_candidate, visual_candidate)
             self._route_observation_evidence(ocr_candidate, visual_candidate, decision, observation)
             return
 
@@ -1695,6 +1697,21 @@ class OCRManager(QObject):
                 self.jump_callback(final_x, final_y, final_z)
             except Exception as e:
                 print(f"自动跳转失败: {e}")
+
+    def _note_single_source_frame(
+        self,
+        ocr_candidate: CoordinateCandidate | None,
+        visual_candidate: CoordinateCandidate | None,
+    ) -> None:
+        stability_config = load_minimap_stability_config(self._settings)
+        self._coordinate_continuity.note_single_source_frame(
+            ocr_candidate.as_xy_tuple() if ocr_candidate is not None else None,
+            visual_candidate.as_xy_tuple() if visual_candidate is not None else None,
+            (
+                stability_config.coordinate_agreement_x_threshold,
+                stability_config.coordinate_agreement_y_threshold,
+            ),
+        )
 
     def _build_minimap_roi_from_settings(self) -> Optional[MinimapRoi]:
         if self._minimap_auto_search_active:

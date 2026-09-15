@@ -5,6 +5,7 @@ from minimap_retrieval_index import (
     CandidateWindow,
     build_candidate_windows,
     compute_hsv_texture_descriptor,
+    compute_spatial_texture_descriptor,
     retrieve_top_k,
 )
 
@@ -102,3 +103,22 @@ def test_hsv_descriptor_uses_masked_pixels_only():
     right_descriptor = compute_hsv_texture_descriptor(image, mask=right_mask)
 
     assert not np.allclose(left_descriptor, right_descriptor)
+
+
+def test_spatial_descriptor_is_finite_normalized_and_preserves_layout():
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    image[:32, :32] = (0, 0, 255)
+    image[32:, 32:] = (255, 0, 0)
+    swapped = np.zeros_like(image)
+    swapped[:32, :32] = (255, 0, 0)
+    swapped[32:, 32:] = (0, 0, 255)
+
+    first = compute_spatial_texture_descriptor(image)
+    repeated = compute_spatial_texture_descriptor(image)
+    changed = compute_spatial_texture_descriptor(swapped)
+
+    assert first.shape == (210,)
+    assert np.all(np.isfinite(first))
+    assert np.isclose(np.linalg.norm(first), 1.0)
+    assert np.array_equal(first, repeated)
+    assert not np.allclose(first, changed)

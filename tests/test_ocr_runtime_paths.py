@@ -1298,3 +1298,131 @@ def test_ocr_manager_runs_locked_minimap_observation_on_provided_minimap_frame(m
     assert used_frame is game_frame
     assert used_frame.shape == (900, 1600, 3)
     assert kwargs["roi"] == MinimapRoi(10, 20, 40, 50, "circle", "manual")
+
+
+class _PromotionSettings:
+    def __init__(self, promotion_frames: int):
+        self._values = {
+            "minimap_roi.x": 10,
+            "minimap_roi.y": 20,
+            "minimap_roi.width": 40,
+            "minimap_roi.height": 50,
+            "minimap_roi.shape": "circle",
+            "minimap_roi.source": "manual",
+            "minimap_stability.coordinate_agreement_x_threshold": 50,
+            "minimap_stability.coordinate_agreement_y_threshold": 50,
+            "minimap_stability.history_x_threshold": 150,
+            "minimap_stability.history_y_threshold": 150,
+            "minimap_stability.single_source_promotion_frames": promotion_frames,
+        }
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+
+def _visual_candidate(x: int, y: int) -> dict:
+    return {"x": x, "y": y, "z": None, "source": "visual", "confidence": 0.99}
+
+
+class _FrameSequence:
+    """Feed per-frame OCR/visual candidates through the real manager frame path."""
+
+    def __init__(self, monkeypatch, promotion_frames: int):
+        self.visuals: list[dict | None] = []
+        self.index = 0
+        self.emitted: list[tuple[int, int, int]] = []
+        self.manager = OCRManager()
+        self.manager.auto_jump_enabled = False
+        self.manager._settings = _PromotionSettings(promotion_frames)
+        self.manager.coordinates_detected.connect(lambda x, y, z: self.emitted.append((x, y, z)))
+        frame = np.zeros((100, 120, 3), dtype=np.uint8)
+        self.manager.latest_observation_frame = _recognition_capture(frame)
+        monkeypatch.setattr("ocr_manager.run_observation_paths", self._run_observation_paths)
+
+    def _run_observation_paths(self, frame, **kwargs):
+        visual = self.visuals[self.index]
+        self.index += 1
+        return {
+            "visual_candidate": visual,
+            "visual_result": None,
+            "heading_candidate": None,
+        }
+
+    def send(self, ocr: CoordinateCandidate | None, visual: dict | None) -> None:
+        self.visuals.append(visual)
+        _complete_frame_sync(self.manager, ocr)
+
+
+def test_ocr_manager_promotes_stable_single_source_coordinate_after_far_displacement(monkeypatch):
+    sequence = _FrameSequence(monkeypatch, promotion_frames=3)
+
+    # 正常状态：两路一致，历史坐标建立
+    sequence.send(CoordinateCandidate(100, 200, 30, source="ocr"), _visual_candidate(100, 200))
+    assert sequence.emitted == [(100, 200, 30)]
+
+    # 远距离位移后视觉一路失灵，OCR 连续给出稳定的新坐标
+    far = CoordinateCandidate(9000, 9000, 30, source="ocr")
+    for _ in range(3):
+        sequence.send(far, None)
+    assert sequence.emitted == [(100, 200, 30)]
+
+    # 稳定序列达到 N 之后，采纳新坐标为新基准
+    sequence.send(far, None)
+    assert sequence.emitted == [(100, 200, 30), (9000, 9000, 30)]
+    assert sequence.manager._coordinate_continuity.previous_coordinate == (9000, 9000, 30)
+
+    # 采纳之后回到正常路径：新位置附近的单路帧直接接受
+    sequence.send(CoordinateCandidate(9010, 9005, 30, source="ocr"), None)
+    assert sequence.emitted[-1] == (9010, 9005, 30)
+    assert sequence.index == 6
+
+
+def test_ocr_manager_rejects_conflicting_two_source_frames_and_resets_streak(monkeypatch):
+    sequence = _FrameSequence(monkeypatch, promotion_frames=3)
+
+    sequence.send(CoordinateCandidate(100, 200, 30, source="ocr"), _visual_candidate(100, 200))
+    far = CoordinateCandidate(16000, 16000, 30, source="ocr")
+
+    sequence.send(far, None)
+    sequence.send(far, None)
+    assert sequence.manager._coordinate_continuity.single_source_count == 2
+
+    # 两路都在出坐标但互相矛盾且都远离历史：维持原判定，拒绝并清空序列
+    sequence.send(far, _visual_candidate(12000, 12000))
+    assert sequence.emitted == [(100, 200, 30)]
+    assert sequence.manager._coordinate_continuity.single_source_count == 0
+
+    # 序列已被重置，随后单路帧必须从头累计，不能立即采纳
+    sequence.send(far, None)
+    assert sequence.manager._coordinate_continuity.single_source_count == 1
+    assert sequence.emitted == [(100, 200, 30)]
+
+    sequence.send(far, None)
+    sequence.send(far, None)
+    assert sequence.emitted == [(100, 200, 30)]
+
+    sequence.send(far, None)
+    assert sequence.emitted == [(100, 200, 30), (16000, 16000, 30)]
+    assert sequence.index == 8
+
+
+def test_ocr_manager_promotes_only_after_drifting_values_settle(monkeypatch):
+    sequence = _FrameSequence(monkeypatch, promotion_frames=3)
+
+    sequence.send(CoordinateCandidate(100, 200, 30, source="ocr"), _visual_candidate(100, 200))
+
+    # 单路一直有输出，但数值每次都在漂移，不满足稳定条件，不能采纳
+    for step in range(6):
+        sequence.send(CoordinateCandidate(10000 + step * 100, 10000, 30, source="ocr"), None)
+    assert sequence.emitted == [(100, 200, 30)]
+    assert sequence.manager._coordinate_continuity.previous_coordinate == (100, 200, 30)
+
+    # 数值稳定下来之后，才允许累计到 N 并采纳
+    settled = CoordinateCandidate(10600, 10000, 30, source="ocr")
+    for _ in range(3):
+        sequence.send(settled, None)
+    assert sequence.emitted == [(100, 200, 30)]
+
+    sequence.send(settled, None)
+    assert sequence.emitted == [(100, 200, 30), (10600, 10000, 30)]
+    assert sequence.index == 11

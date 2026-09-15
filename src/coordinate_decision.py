@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from core.map_context import CoordinateCandidate
-from coordinate_continuity import AxisThreshold, ContinuityState, xy_within_previous
+from coordinate_continuity import AxisThreshold, ContinuityState, xy_within, xy_within_previous
 
 
 @dataclass(frozen=True)
@@ -14,16 +14,25 @@ class CoordinateDecision:
     reason: str
 
 
-def _xy_within(a: tuple[int, int], b: tuple[int, int], threshold: AxisThreshold) -> bool:
-    threshold_x, threshold_y = threshold if isinstance(threshold, tuple) else (threshold, threshold)
-    return abs(a[0] - b[0]) <= threshold_x and abs(a[1] - b[1]) <= threshold_y
-
-
 def _candidate_tuple(candidate: CoordinateCandidate, fallback_z: int | None = None) -> tuple[int, int, int]:
     z = candidate.z if candidate.z is not None else fallback_z
     if z is None:
         raise ValueError("coordinate_candidate_missing_z")
     return (candidate.x, candidate.y, z)
+
+
+def _single_source_promotion_ready(
+    continuity: ContinuityState,
+    source: str,
+    xy: tuple[int, int],
+    min_frames: int,
+    tolerance: AxisThreshold,
+) -> bool:
+    if continuity.single_source != source or continuity.single_source_xy is None:
+        return False
+    if continuity.single_source_count < min_frames:
+        return False
+    return xy_within(xy, continuity.single_source_xy, tolerance)
 
 
 def choose_coordinate(
@@ -32,13 +41,14 @@ def choose_coordinate(
     continuity: ContinuityState,
     agreement_xy_threshold: AxisThreshold = 50,
     history_xy_threshold: AxisThreshold = 150,
+    promotion_frames: int = 5,
 ) -> CoordinateDecision:
     if ocr and visual:
         ocr_coord = _candidate_tuple(ocr)
         visual_z = ocr.z if ocr.z is not None else (
             continuity.previous_coordinate[2] if continuity.previous_coordinate is not None else None
         )
-        if _xy_within(ocr.as_xy_tuple(), visual.as_xy_tuple(), agreement_xy_threshold):
+        if xy_within(ocr.as_xy_tuple(), visual.as_xy_tuple(), agreement_xy_threshold):
             return CoordinateDecision(ocr_coord, "ocr", "ocr_visual_agree")
 
         ocr_near = xy_within_previous(continuity, ocr_coord, history_xy_threshold)
@@ -69,6 +79,14 @@ def choose_coordinate(
             return CoordinateDecision(ocr_coord, "ocr", "ocr_only")
         if ocr_near:
             return CoordinateDecision(ocr_coord, "ocr", "ocr_only_near_history")
+        if _single_source_promotion_ready(
+            continuity,
+            "ocr",
+            ocr.as_xy_tuple(),
+            promotion_frames,
+            agreement_xy_threshold,
+        ):
+            return CoordinateDecision(ocr_coord, "ocr", "ocr_only_stable_promotion")
         return CoordinateDecision(None, "none", "ocr_only_far_from_history")
 
     if visual:
@@ -78,6 +96,14 @@ def choose_coordinate(
         visual_near = xy_within_previous(continuity, visual_coord, history_xy_threshold)
         if visual_near:
             return CoordinateDecision(visual_coord, "visual", "visual_only_near_history")
+        if _single_source_promotion_ready(
+            continuity,
+            "visual",
+            visual.as_xy_tuple(),
+            promotion_frames,
+            agreement_xy_threshold,
+        ):
+            return CoordinateDecision(visual_coord, "visual", "visual_only_stable_promotion")
         return CoordinateDecision(
             None,
             "none",

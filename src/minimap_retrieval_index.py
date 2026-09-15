@@ -6,6 +6,24 @@ import cv2
 import numpy as np
 
 
+ROUGH_DESCRIPTOR_VERSION = 2
+
+
+def build_spatial_descriptor_mask(
+    height: int,
+    width: int,
+    *,
+    center_exclusion_ratio: float = 0.18,
+) -> np.ndarray:
+    mask = np.zeros((int(height), int(width)), dtype=np.uint8)
+    center = (int(width) // 2, int(height) // 2)
+    radius = max(1, min(int(width), int(height)) // 2)
+    cv2.circle(mask, center, radius, 255, -1)
+    exclusion = max(1, int(round(min(int(width), int(height)) * center_exclusion_ratio)))
+    cv2.circle(mask, center, exclusion, 0, -1)
+    return mask
+
+
 @dataclass(frozen=True)
 class CandidateWindow:
     region_id: str
@@ -136,6 +154,77 @@ def compute_hsv_texture_descriptor(image_bgr: np.ndarray, mask: np.ndarray | Non
     )
 
     vector = np.concatenate([hist, texture]).astype(np.float32)
+    norm = float(np.linalg.norm(vector))
+    if norm > 0:
+        vector /= norm
+    return vector
+
+
+def compute_spatial_texture_descriptor(
+    image_bgr: np.ndarray,
+    mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Return the version-2 spatial rough descriptor.
+
+    The fixed 1x1 + 2x2 layout preserves where colors and edges occur while
+    remaining small enough for a per-frame matrix search.  The query and tile
+    paths intentionally share this exact implementation.
+    """
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError("image_bgr must be a BGR image")
+    if mask is not None:
+        if mask.ndim != 2 or mask.shape[:2] != image_bgr.shape[:2]:
+            raise ValueError("mask shape must match image_bgr")
+        base_mask = mask.astype(np.uint8)
+    else:
+        base_mask = np.full(image_bgr.shape[:2], 255, dtype=np.uint8)
+
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    magnitude = cv2.magnitude(sobel_x, sobel_y)
+    abs_x = np.abs(sobel_x)
+    abs_y = np.abs(sobel_y)
+    height, width = gray.shape[:2]
+    parts: list[np.ndarray] = []
+
+    for rows, cols in ((1, 1), (2, 2)):
+        for row in range(rows):
+            y0 = row * height // rows
+            y1 = (row + 1) * height // rows
+            for col in range(cols):
+                x0 = col * width // cols
+                x1 = (col + 1) * width // cols
+                cell_mask = base_mask[y0:y1, x0:x1]
+                valid = cell_mask > 0
+                if not np.any(valid):
+                    parts.append(np.zeros(42, dtype=np.float32))
+                    continue
+                cell_hsv = hsv[y0:y1, x0:x1]
+                hist = cv2.calcHist(
+                    [cell_hsv], [0, 1, 2], cell_mask,
+                    [6, 3, 2], [0, 180, 0, 256, 0, 256],
+                ).astype(np.float32).reshape(-1)
+                selected_gray = gray[y0:y1, x0:x1][valid]
+                selected_mag = magnitude[y0:y1, x0:x1][valid]
+                selected_x = abs_x[y0:y1, x0:x1][valid]
+                selected_y = abs_y[y0:y1, x0:x1][valid]
+                edge_total = selected_x + selected_y
+                edge_epsilon = np.finfo(np.float32).eps
+                horizontal_ratio = float(np.mean(selected_y / (edge_total + edge_epsilon)))
+                vertical_ratio = float(np.mean(selected_x / (edge_total + edge_epsilon)))
+                stats = np.array([
+                    float(np.mean(selected_gray)) / 255.0,
+                    float(np.std(selected_gray)) / 255.0,
+                    float(np.mean(selected_mag)) / 255.0,
+                    float(np.std(selected_mag)) / 255.0,
+                    horizontal_ratio,
+                    vertical_ratio,
+                ], dtype=np.float32)
+                parts.append(np.concatenate([hist, stats]).astype(np.float32))
+
+    vector = np.concatenate(parts).astype(np.float32)
     norm = float(np.linalg.norm(vector))
     if norm > 0:
         vector /= norm
