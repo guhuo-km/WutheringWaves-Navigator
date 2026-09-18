@@ -26,6 +26,7 @@ languages/                   i18n 文本
 config/                      配置模板
 scripts/                     构建、安装器和 release 元数据脚本
 tests/                       pytest 测试
+web/                         地图窗口页面和地图交互脚本
 version.json                 版本信息
 ```
 
