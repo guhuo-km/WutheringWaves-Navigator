@@ -63,12 +63,15 @@ python src/main_app.py
 
 ## OCR 模型
 
-当前公开源码包含 ONNX OCR 模型：
+当前公开源码包含 OCR 模型：
 
 ```text
-src/models/coord_ocr.onnx
-src/models/class_names.txt
+models/coord_ocr.onnx
+models/coord_ocr.pt
+models/class_names.txt
 ```
+
+`coord_ocr.onnx` 是运行时加载的模型，缺失时 OCR 功能无法启动；`coord_ocr.pt` 是等价的 PyTorch 版本，仅供参照。
 
 如果你替换自训练模型，请保持类别顺序与 `class_names.txt` 一致。
 
