@@ -34,6 +34,9 @@ venv.bak/
 .worktrees/
 worktrees/
 
+# Agent local state (private maintainer records, not source)
+.workbuddy/
+
 # IDEs
 .vscode/
 .idea/
@@ -120,3 +123,6 @@ src/login_history.json
 *.onnx
 !models/coord_ocr.onnx
 models/*.7z
+
+# docs-ai 语料索引 (由 services/docs-ai/scripts/sync-corpus.mjs 生成)
+services/docs-ai/corpus/

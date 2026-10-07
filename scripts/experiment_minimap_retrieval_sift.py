@@ -34,10 +34,10 @@ from minimap_retrieval_index import (  # noqa: E402
 )
 from minimap_roi import (  # noqa: E402
     build_minimap_texture_match_mask,
-    crop_minimap_from_frame,
     detect_minimap_circle_roi,
     normalize_minimap_crop,
 )
+from screen_capture import FramePatch, auto_minimap_search_rect  # noqa: E402
 
 BANNER = """MINIMAP RETRIEVAL SIFT EXPERIMENT ONLY
 This script does not validate production behavior.
@@ -359,9 +359,8 @@ def _load_rough_image_for_query(output_dir: Path, tile_root: Path | None) -> np.
 
 
 def _auto_minimap_roi(frame: np.ndarray):
-    height, width = frame.shape[:2]
-    search_rect = (0, 0, max(1, width // 8), max(1, height // 4))
-    return detect_minimap_circle_roi(frame, search_rect)
+    search_rect = auto_minimap_search_rect(int(frame.shape[1]), int(frame.shape[0]))
+    return detect_minimap_circle_roi(FramePatch.whole(frame).sub_rect(*search_rect))
 
 
 def _run_rough_index(args: argparse.Namespace) -> None:
@@ -414,7 +413,7 @@ def _run_rough_query(args: argparse.Namespace) -> None:
     roi = _auto_minimap_roi(frame)
     if roi is None:
         raise ValueError("auto_minimap_roi_failed")
-    crop = crop_minimap_from_frame(frame, roi)
+    crop = FramePatch.whole(frame).crop(roi.x, roi.y, roi.width, roi.height)
     normalized = normalize_minimap_crop(crop, roi.shape)
     query_mask = build_minimap_texture_match_mask(normalized.mask)
     query = cv2.bitwise_and(normalized.exact_image, normalized.exact_image, mask=query_mask)
@@ -461,7 +460,7 @@ def _extract_query_sift(frame_path: Path):
     roi = _auto_minimap_roi(frame)
     if roi is None:
         raise ValueError("auto_minimap_roi_failed")
-    crop = crop_minimap_from_frame(frame, roi)
+    crop = FramePatch.whole(frame).crop(roi.x, roi.y, roi.width, roi.height)
     normalized = normalize_minimap_crop(crop, roi.shape)
     detector = create_sift_detector()
     keypoints, descriptors = detector.detectAndCompute(normalized.exact_image, normalized.mask)

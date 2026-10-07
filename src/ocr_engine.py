@@ -20,6 +20,7 @@ from PySide6.QtCore import QThread, Signal
 
 from core import paths
 from core.gpu_adapters import enumerate_gpu_adapters, resolve_saved_adapter
+from screen_capture import normalize_capture_mode
 
 
 def cluster_detections_to_rich_clusters(
@@ -230,6 +231,7 @@ class OCRWorker(QThread):
     ocr_output_updated = Signal(str)  # Raw OCR output text
     capture_area_updated = Signal(dict)  # Runtime capture area updates
     captured_frame_ready = Signal(object)  # Minimap input for the current capture
+    capture_no_window = Signal()  # Auto mode produced no usable window this round
     frame_recognition_completed = Signal(object)  # Per-frame OCR result, coords may be None
     fatal_gpu_error = Signal(dict)
     
@@ -281,13 +283,19 @@ class OCRWorker(QThread):
         self.confidence_threshold = config.get('confidence_threshold', 0.45)
         self.digit_confidence_threshold = config.get('digit_confidence_threshold', self.confidence_threshold)
         self.symbol_confidence_threshold = config.get('symbol_confidence_threshold', self.confidence_threshold)
+        raw_split_width_factor = config.get('coordinate_split_width_factor', 0.4)
+        self.coordinate_split_width_factor = (
+            0.4 if raw_split_width_factor is None else float(raw_split_width_factor)
+        )
         
         # OCR capture area and interval
         self.capture_area = None
         self.minimap_search_region = None
         self.ocr_interval = 1000  # milliseconds
         self.target_window_name = ""  # Target window name for screenshot
+        self.target_hwnd = int(config.get('target_hwnd', 0) or 0)
         self.detailed_ocr_logging = bool(config.get('detailed_ocr_logging', False))
+        self.save_minimap_frame_packages = bool(config.get('save_minimap_frame_packages', False))
         self._detailed_log_sink: Optional[Callable[[str], None]] = None
         
         self.logger.info("OCR工作线程初始化完成")
@@ -701,7 +709,7 @@ class OCRWorker(QThread):
         avg_width = sum(widths) / len(widths) if widths else 10.0
 
         gap, left, right = max(candidates, key=lambda item: item[0])
-        if gap < median_gap + avg_width * 0.5:
+        if gap < median_gap + avg_width * float(self.coordinate_split_width_factor):
             return None
         return left, right
 
@@ -988,14 +996,17 @@ class OCRWorker(QThread):
         """Load settings from configuration dictionary"""
         config = self.config_dict
         
-        # Load OCR capture area
+        # Load OCR capture area (None means "auto": derived from the captured frame)
         ocr_area = config.get('ocr_capture_area', {})
-        self.capture_area = {
-            'x': ocr_area.get('x', 100),
-            'y': ocr_area.get('y', 100),
-            'width': ocr_area.get('width', 200),
-            'height': ocr_area.get('height', 50)
-        }
+        if ocr_area is None:
+            self.capture_area = None
+        else:
+            self.capture_area = {
+                'x': ocr_area.get('x', 100),
+                'y': ocr_area.get('y', 100),
+                'width': ocr_area.get('width', 200),
+                'height': ocr_area.get('height', 50)
+            }
         self._emit_capture_area_updated()
         
         # Load OCR interval
@@ -1004,6 +1015,7 @@ class OCRWorker(QThread):
         # Load target window name (if using window-specific capture)
         self.target_window_name = config.get('target_window_name', '')
         self.minimap_search_region = config.get('minimap_search_region')
+        self.target_hwnd = int(config.get('target_hwnd', 0) or 0)
         
         self.logger.info(f"OCR设置加载完成: 区域{self.capture_area}, 间隔{self.ocr_interval}ms")
     
@@ -1042,10 +1054,15 @@ class OCRWorker(QThread):
             f"识别阈值已更新: 数字={self.digit_confidence_threshold:.2f}, 符号={self.symbol_confidence_threshold:.2f}"
         )
 
+    def update_coordinate_split_width_factor(self, factor: float):
+        """Update the numeric-group split width factor dynamically."""
+        self.coordinate_split_width_factor = float(factor)
+        self.logger.info(f"坐标拆分宽度系数已更新: {self.coordinate_split_width_factor:.2f}")
+
     def update_screenshot_mode(self, screenshot_mode: str):
         """Update screenshot mode dynamically."""
-        self.config_dict['screenshot_mode'] = screenshot_mode
-        self.logger.info(f"截图方式已更新为: {screenshot_mode}")
+        self.config_dict['screenshot_mode'] = normalize_capture_mode(screenshot_mode)
+        self.logger.info(f"截图方式已更新为: {self.config_dict['screenshot_mode']}")
 
     def _get_confidence_threshold_for_class(self, class_id: int) -> float:
         ch = OCRWorker._class_id_to_char_static(class_id)
@@ -1099,6 +1116,8 @@ class OCRWorker(QThread):
                 screenshot = self._capture_ocr_region()
                 if screenshot is None:
                     self.ocr_output_updated.emit("⚠ 截图失败，请检查OCR区域设置")
+                    if self.capture_area is None:
+                        self.capture_no_window.emit()
                     self.msleep(self.ocr_interval)
                     continue
                 
@@ -1131,34 +1150,36 @@ class OCRWorker(QThread):
                 self.logger.error("No capture callback provided")
                 return None
 
-            if not isinstance(self.capture_area, dict):
-                self.logger.error("No capture area configured")
+            if self.capture_area is not None and not isinstance(self.capture_area, dict):
+                self.logger.error("Invalid capture area configuration")
                 return None
-            
-            # Get screenshot mode from config (optional)
-            config = self.config_dict
-            screenshot_mode = config.get('screenshot_mode', 'BitBlt')
-            
-            # Convert mode string to expected format
-            if 'PrintWindow' in screenshot_mode:
-                mode = 'PrintWindow'
+
+            mode = normalize_capture_mode(self.config_dict.get('screenshot_mode', 'auto'))
+
+            if self.capture_area is None:
+                # Auto region: ScreenCapture derives the OCR crop from the captured frame size.
+                region_args: Tuple[Optional[int], Optional[int], Optional[int], Optional[int]] = (
+                    None, None, None, None
+                )
             else:
-                mode = 'BitBlt'
-            
-            args = (
-                int(self.capture_area.get('x', 0) or 0),
-                int(self.capture_area.get('y', 0) or 0),
-                int(self.capture_area.get('width', 0) or 0),
-                int(self.capture_area.get('height', 0) or 0),
+                region_args = (
+                    int(self.capture_area.get('x', 0) or 0),
+                    int(self.capture_area.get('y', 0) or 0),
+                    int(self.capture_area.get('width', 0) or 0),
+                    int(self.capture_area.get('height', 0) or 0),
+                )
+            result = self.recognition_capture_callback(
+                *region_args,
                 mode,
                 self.target_window_name,
                 self.minimap_search_region,
+                target_hwnd=self.target_hwnd,
+                include_full_frame=self.save_minimap_frame_packages,
             )
-            result = self.recognition_capture_callback(*args)
             self._last_recognition_capture = result
             if result is None:
                 return None
-            if result.minimap_frame is not None:
+            if result.minimap_patch is not None:
                 self.captured_frame_ready.emit(result)
             return result.ocr_crop
             
@@ -1469,18 +1490,29 @@ class OCRWorker(QThread):
     
     def update_capture_settings(
         self,
-        capture_area: Dict[str, int],
+        capture_area: Optional[Dict[str, int]],
         interval: int,
         window_name: str,
-        minimap_search_region: Optional[Dict[str, int]] = None,
+        target_hwnd: Optional[int] = None,
     ):
-        """Update capture settings"""
+        """Update capture settings. ``capture_area=None`` selects the frame-relative auto region;
+        ``target_hwnd=None`` keeps the currently tracked window handle.
+
+        The minimap rectangle is owned by ``update_minimap_capture_region`` so that a
+        settings refresh cannot reset it.
+        """
         self.capture_area = capture_area
         self.ocr_interval = interval
         self.target_window_name = window_name
-        self.minimap_search_region = minimap_search_region
+        if target_hwnd is not None:
+            self.target_hwnd = int(target_hwnd)
         self._emit_capture_area_updated()
         self.logger.info(
             f"截图设置已更新: 区域{capture_area}, 间隔{interval}ms, "
-            f"窗口'{window_name}', 小地图搜索区域{minimap_search_region}"
+            f"窗口'{window_name}', 句柄{self.target_hwnd}"
         )
+
+    def update_minimap_capture_region(self, region: Optional[Dict[str, int]]) -> None:
+        """Set the minimap rectangle the capture path crops; None selects the frame's auto search area."""
+        self.minimap_search_region = region
+        self.logger.info(f"小地图截取区域已更新: {region}")

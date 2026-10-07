@@ -3,12 +3,11 @@ import numpy as np
 
 from minimap_roi import (
     MinimapRoi,
-    crop_minimap_from_frame,
     detect_minimap_circle_roi,
     normalize_minimap_crop,
     should_lock_auto_roi,
 )
-from screen_capture import crop_image_region
+from screen_capture import FramePatch
 
 
 def _paint_heading_arrow(frame: np.ndarray, center: tuple[int, int]) -> None:
@@ -42,15 +41,35 @@ def test_auto_roi_does_not_lock_when_recent_frames_are_unstable():
     assert not should_lock_auto_roi(frames, required_frames=3, tolerance_px=2)
 
 
-def test_crop_minimap_from_frame_uses_single_screenshot_frame():
+def test_frame_patch_crop_uses_whole_frame_coordinates():
     frame = np.zeros((100, 120, 3), dtype=np.uint8)
     frame[30:50, 20:60] = 255
     roi = MinimapRoi(x=20, y=30, width=40, height=20, shape="ellipse", source="manual")
 
-    crop = crop_minimap_from_frame(frame, roi)
+    crop = FramePatch.whole(frame).crop(roi.x, roi.y, roi.width, roi.height)
 
     assert crop.shape == (20, 40, 3)
     assert crop.mean() == 255
+
+
+def test_frame_patch_crop_clips_secondary_region_to_patch_extent():
+    frame = np.zeros((100, 120, 3), dtype=np.uint8)
+    frame[10:30, 40:70] = 100
+    patch = FramePatch.whole(frame).sub_rect(40, 10, 30, 20)
+
+    crop = patch.crop(40, 10, 30, 20)
+
+    assert patch.origin_x == 40
+    assert patch.origin_y == 10
+    assert crop.shape == (20, 30, 3)
+    assert crop.mean() == 100
+
+
+def test_frame_patch_crop_of_area_outside_patch_is_empty():
+    frame = np.zeros((100, 120, 3), dtype=np.uint8)
+    patch = FramePatch.whole(frame).sub_rect(0, 0, 20, 20)
+
+    assert patch.crop(50, 60, 10, 10).shape == (0, 0, 3)
 
 
 def test_normalize_minimap_crop_outputs_exact_and_rough_images_with_mask():
@@ -62,22 +81,12 @@ def test_normalize_minimap_crop_outputs_exact_and_rough_images_with_mask():
     assert normalized.rough_color_image.shape == (52, 52, 3)
 
 
-def test_screen_capture_can_extract_secondary_region_from_existing_frame():
-    frame = np.zeros((100, 120, 3), dtype=np.uint8)
-    frame[10:30, 40:70] = 100
-
-    crop = crop_image_region(frame, 40, 10, 30, 20)
-
-    assert crop.shape == (20, 30, 3)
-    assert crop.mean() == 100
-
-
-def test_detect_minimap_circle_roi_uses_explicit_search_rect():
+def test_detect_minimap_circle_roi_uses_patch_extent_as_search_range():
     frame = np.zeros((220, 320, 3), dtype=np.uint8)
     cv2.circle(frame, (80, 70), 42, (255, 255, 255), 3)
     cv2.circle(frame, (260, 170), 42, (255, 255, 255), 3)
 
-    roi = detect_minimap_circle_roi(frame, search_rect=(0, 0, 160, 140))
+    roi = detect_minimap_circle_roi(FramePatch.whole(frame).sub_rect(0, 0, 160, 140))
 
     assert roi is not None
     assert roi.source == "auto"
@@ -88,11 +97,22 @@ def test_detect_minimap_circle_roi_uses_explicit_search_rect():
     assert abs(roi.height - 84) <= 6
 
 
-def test_detect_minimap_circle_roi_returns_none_without_search_rect_hit():
+def test_detect_minimap_circle_roi_returns_none_outside_patch():
     frame = np.zeros((220, 320, 3), dtype=np.uint8)
     cv2.circle(frame, (260, 170), 42, (255, 255, 255), 3)
 
-    assert detect_minimap_circle_roi(frame, search_rect=(0, 0, 160, 140)) is None
+    assert detect_minimap_circle_roi(FramePatch.whole(frame).sub_rect(0, 0, 160, 140)) is None
+
+
+def test_detect_minimap_circle_roi_reports_whole_frame_coordinates():
+    frame = np.zeros((220, 320, 3), dtype=np.uint8)
+    cv2.circle(frame, (180, 110), 42, (255, 255, 255), 3)
+
+    roi = detect_minimap_circle_roi(FramePatch.whole(frame).sub_rect(100, 0, 160, 200))
+
+    assert roi is not None
+    assert abs((roi.x + roi.width // 2) - 180) <= 3
+    assert abs((roi.y + roi.height // 2) - 110) <= 3
 
 
 def test_auto_minimap_circle_roi_requires_arrow_anchor_when_requested():
@@ -100,8 +120,7 @@ def test_auto_minimap_circle_roi_requires_arrow_anchor_when_requested():
     cv2.circle(frame, (80, 70), 42, (255, 255, 255), 3)
 
     roi = detect_minimap_circle_roi(
-        frame,
-        search_rect=(0, 0, 160, 140),
+        FramePatch.whole(frame).sub_rect(0, 0, 160, 140),
         require_arrow_anchor=True,
     )
 
@@ -115,8 +134,7 @@ def test_auto_minimap_circle_roi_prefers_circle_near_heading_arrow():
     _paint_heading_arrow(frame, (240, 130))
 
     roi = detect_minimap_circle_roi(
-        frame,
-        search_rect=(0, 0, 320, 260),
+        FramePatch.whole(frame).sub_rect(0, 0, 320, 260),
         require_arrow_anchor=True,
     )
 

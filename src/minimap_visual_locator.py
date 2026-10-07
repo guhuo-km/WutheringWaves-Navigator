@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dataclasses import dataclass
 import hashlib
@@ -11,13 +13,27 @@ import numpy as np
 import numpy.typing as npt
 
 from core.map_context import CoordinateCandidate, MapContext, TileKey
-from minimap_index_store import MinimapIndexStore
+from minimap_candidate_regions import (
+    CandidateRegionGroup,
+    PlaneKey,
+    build_candidate_regions,
+    build_radius_regions,
+    select_radius_feature_indices,
+    select_region_feature_indices,
+)
+from minimap_index_store import CURRENT_TILE_INDEX_VERSION, MinimapIndexStore
 from minimap_coordinate_transform import game_xy_to_stitched_pixel, stitched_pixel_to_game_xy
+from minimap_orb_query import OrbQueryIndex
+from minimap_orb_store import ORB_AREA_INDEX_NAME
 from minimap_retrieval_index import CandidateDescriptor, CandidateWindow, build_candidate_windows, compute_hsv_texture_descriptor, retrieve_top_k
 from minimap_sift_index import create_sift_detector, extract_owned_sift_features_from_expanded_tile, resolve_tile_image_path
 from minimap_sift_matcher import estimate_similarity_from_matches, filter_ratio_matches, select_best_sift_candidate
 from minimap_stitched_resources import StitchedManifest
-from minimap_tile_index_state import TileIndexStateStore, TileIndexStatus, canonical_tile_key, parse_canonical_tile_key
+from minimap_tile_index_state import COARSE_WINDOW_SIZE, TileIndexStateStore, TileIndexStatus, canonical_tile_key, parse_canonical_tile_key
+
+_ROUGH_SCHEMES = ("hsv", "orb")
+# Radius in absolute map pixels around the previous accepted coordinate for the history shortcut.
+HISTORY_SHORTCUT_RADIUS_PX = 300.0
 
 
 @dataclass(frozen=True)
@@ -39,29 +55,83 @@ class VisualLocalizationResult:
 
 @dataclass(frozen=True)
 class VisualMatchConfig:
-    rough_candidate_limit: int = 20
-    sift_min_inliers: int = 3
+    rough_candidate_limit: int = 72
+    history_shortcut_radius_px: float = HISTORY_SHORTCUT_RADIUS_PX
+    sift_min_inliers: int = 5
     sift_ratio: float = 0.75
     sift_window_size: int = 512
     sift_stride: int = 256
 
 
+@dataclass(frozen=True)
+class _RegionGroupPlan:
+    """One map plane to localize; ``center_px`` picks features by history circle instead of by ``group.rectangles``."""
+
+    rank: int
+    group: CandidateRegionGroup
+    score: float
+    sources: tuple[str, ...]
+    source_scores: dict[str, float | None]
+    work_key: str
+    center_px: tuple[float, float] | None = None
+
+
+class _BoundedMapping:
+    """Mapping that evicts its least recently used key once it exceeds ``limit``."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = int(limit)
+        self._items: OrderedDict[Any, Any] = OrderedDict()
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        if key in self._items:
+            self._items.move_to_end(key)
+            return self._items[key]
+        return default
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        self._items[key] = value
+        self._items.move_to_end(key)
+        while len(self._items) > self.limit:
+            self._items.popitem(last=False)
+
+    def __contains__(self, key: Any) -> bool:
+        return key in self._items
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def clear(self) -> None:
+        self._items.clear()
+
+
+# One area-8 key holds 4848 parsed rough-window entries, measured at 93 MB.
+_ROUGH_ENTRIES_CACHE_LIMIT = 3
+# 32 covers the observed per-frame region-group count (P50=8, P90=13, max=21) with headroom:
+# a limit below one frame's group count evicts inside the frame and zeroes reuse (4: 0.0 hit rate, 167.6 ms/frame; 16: 1.0, 121.0 ms).
+_COMBINED_SIFT_CACHE_LIMIT = 32
+# One tile's SIFT arrays measure 0.58 MB; the limit covers one region's working set.
+_EXISTING_SIFT_ARRAY_CACHE_LIMIT = 128
+
+
 class MinimapVisualLocator:
     _GLOBAL_TILE_SIFT_CACHE: dict[tuple, dict[str, np.ndarray]] = {}
     _GLOBAL_ROUGH_DESCRIPTOR_CACHE: dict[tuple[str, int, int, int, int], list[CandidateDescriptor]] = {}
-    _GLOBAL_TILE_ROUGH_ENTRIES_CACHE: dict[tuple, list[dict[str, Any]]] = {}
-    _GLOBAL_EXISTING_SIFT_ARRAY_CACHE: dict[tuple, dict[str, np.ndarray]] = {}
+    _GLOBAL_TILE_ROUGH_ENTRIES_CACHE: _BoundedMapping = _BoundedMapping(_ROUGH_ENTRIES_CACHE_LIMIT)
+    _GLOBAL_EXISTING_SIFT_ARRAY_CACHE: _BoundedMapping = _BoundedMapping(_EXISTING_SIFT_ARRAY_CACHE_LIMIT)
 
     def __init__(self, tile_root: Path, config: VisualMatchConfig | None = None):
         self.tile_root = Path(tile_root)
         self.config = config or VisualMatchConfig()
         self.last_trace: dict[str, Any] = {"manifests": []}
+        self._history_shortcut_active = False
         self._last_rough_index_source = ""
         self._last_sift_index_source = ""
         self._rough_matrix_cache: dict[str, tuple[tuple, np.ndarray]] = {}
-        self._combined_sift_cache: dict[tuple, dict[str, np.ndarray]] = {}
+        self._combined_sift_cache: _BoundedMapping = _BoundedMapping(_COMBINED_SIFT_CACHE_LIMIT)
         self._sift_detector = None
         self._sift_matcher = None
+        self._orb_query = OrbQueryIndex()
 
     def search_root(self, context: MapContext) -> Path:
         return self.tile_root / context.area_id / context.layer_id
@@ -138,6 +208,23 @@ class MinimapVisualLocator:
         else:
             color = image[:, :, :3]
         return color, np.asarray(minimap_mask, dtype=np.uint8)
+
+    def _extract_query_sift_features(
+        self,
+        query_color: npt.NDArray[np.uint8],
+        query_mask: npt.NDArray[np.uint8],
+    ) -> tuple[Any, npt.NDArray[np.float32]] | None:
+        if self._sift_detector is None:
+            self._sift_detector = create_sift_detector()
+        query_keypoints, query_descriptors = self._sift_detector.detectAndCompute(query_color, query_mask)
+        if query_descriptors is None or len(query_keypoints) < 3:
+            return None
+        return query_keypoints, query_descriptors.astype(np.float32)
+
+    def _get_sift_matcher(self):
+        if self._sift_matcher is None:
+            self._sift_matcher = cv2.BFMatcher(cv2.NORM_L2)
+        return self._sift_matcher
 
     def _rough_retrieval_hits(
         self,
@@ -605,6 +692,38 @@ class MinimapVisualLocator:
         )
         return np.flatnonzero(mask)
 
+    def _rough_entry_sift_rect(self, raw: dict[str, Any]) -> tuple[int, int, int, int] | None:
+        if int(raw.get("version") or 0) != 2:
+            return None
+        try:
+            left = int(raw["left"])
+            top = int(raw["top"])
+            width = int(raw["width"])
+            height = int(raw["height"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if width != COARSE_WINDOW_SIZE or height != COARSE_WINDOW_SIZE:
+            return None
+        return (left, top, width, height)
+
+    def _region_feature_indices(
+        self,
+        global_xy: np.ndarray,
+        rect: tuple[int, int, int, int],
+    ) -> np.ndarray:
+        if global_xy is None or len(global_xy) == 0:
+            return np.empty(0, dtype=np.int64)
+        left, top, width, height = rect
+        right = left + width
+        bottom = top + height
+        mask = (
+            (global_xy[:, 0] >= left)
+            & (global_xy[:, 0] < right)
+            & (global_xy[:, 1] >= top)
+            & (global_xy[:, 1] < bottom)
+        )
+        return np.flatnonzero(mask)
+
     def _match_with_sift(
         self,
         normalized_minimap_image: Any,
@@ -767,12 +886,39 @@ class MinimapVisualLocator:
         context: MapContext,
         active_game_xy: tuple[int | float, int | float] | None = None,
     ):
-        # OCR coordinates and precomputed scale are deliberately not inputs to SIFT localization.
-        return self._match_with_tile_indexes(
-            normalized_minimap_image,
-            minimap_mask,
-            context,
-        )
+        # active_game_xy is the previous frame's accepted coordinate and only seeds the history
+        # shortcut circle centre; the full path never reads it.
+        if self._history_shortcut_active and active_game_xy is not None:
+            result = self._match_with_history_shortcut(
+                normalized_minimap_image,
+                minimap_mask,
+                context,
+                active_game_xy,
+            )
+        else:
+            result = self._match_with_tile_indexes(
+                normalized_minimap_image,
+                minimap_mask,
+                context,
+            )
+        self._history_shortcut_active = result is not None
+        return result
+
+    def _hsv_rough_scores(
+        self,
+        area_id: str,
+        query_color: Any,
+        query_mask: Any,
+        rough_entries: list[dict[str, Any]],
+    ) -> npt.NDArray[np.float32]:
+        """Read-only HSV texture branch: query descriptor dotted against the rough matrix."""
+        query_vector = compute_hsv_texture_descriptor(query_color, mask=query_mask)
+        query_norm = float(np.linalg.norm(query_vector))
+        query = query_vector / query_norm if query_norm > 0 else query_vector
+        rough_matrix = self._rough_matrix_for_entries(area_id, rough_entries)
+        if rough_matrix.size == 0:
+            return np.zeros(0, dtype=np.float32)
+        return (rough_matrix @ query).astype(np.float32)
 
     def _match_with_tile_indexes(
         self,
@@ -781,9 +927,12 @@ class MinimapVisualLocator:
         context: MapContext,
     ) -> VisualLocalizationResult | None:
         self.last_trace = {
+            "match_path": "full",
             "rough_index_source": "tile_index",
             "rough_candidates_available": 0,
             "rough_candidates_used": 0,
+            "hsv_candidates_used": 0,
+            "orb_candidates_used": 0,
             "rough_candidates_skipped_missing": 0,
             "rough_hits": [],
         }
@@ -793,56 +942,188 @@ class MinimapVisualLocator:
         if not rough_entries:
             return None
 
-        query_vector = compute_hsv_texture_descriptor(query_color, mask=query_mask)
-        query_norm = float(np.linalg.norm(query_vector))
-        query = query_vector / query_norm if query_norm > 0 else query_vector
-        rough_matrix = self._rough_matrix_for_entries(context.area_id, rough_entries)
-        if rough_matrix.size == 0:
+        observation_index_store = MinimapIndexStore(self.tile_root, str(context.area_id))
+        orb_status = "ready" if observation_index_store.is_area_orb_ready(context.area_id) else "not_ready"
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            hsv_future = executor.submit(
+                self._hsv_rough_scores,
+                context.area_id,
+                query_color,
+                query_mask,
+                rough_entries,
+            )
+            orb_future = (
+                executor.submit(
+                    self._orb_query.score,
+                    self._index_root(context.area_id) / ORB_AREA_INDEX_NAME,
+                    query_color,
+                )
+                if orb_status == "ready"
+                else None
+            )
+            hsv_scores = hsv_future.result()
+            orb_document_keys: tuple[str, ...] = ()
+            orb_scores = np.zeros(0, dtype=np.float32)
+            if orb_future is not None:
+                try:
+                    orb_document_keys, orb_scores = orb_future.result()
+                except Exception as exc:
+                    # match() runs on the observation worker thread; a dead ORB line means no ORB candidates.
+                    orb_status = f"unavailable:{type(exc).__name__}"
+        self.last_trace["orb_status"] = orb_status
+        if hsv_scores.size == 0:
             return None
-        scores = rough_matrix @ query
+
         limit = min(max(1, int(self.config.rough_candidate_limit)), len(rough_entries))
         if limit == len(rough_entries):
-            hit_indexes = np.argsort(scores)[::-1]
+            hit_indexes = np.argsort(hsv_scores)[::-1]
         else:
-            partition = np.argpartition(scores, -limit)[-limit:]
-            hit_indexes = partition[np.argsort(scores[partition])[::-1]]
-        hits = [(float(scores[index]), rough_entries[int(index)]) for index in hit_indexes]
-        self.last_trace["rough_candidates_used"] = len(hits)
-        if not hits:
+            partition = np.argpartition(hsv_scores, -limit)[-limit:]
+            hit_indexes = partition[np.argsort(hsv_scores[partition])[::-1]]
+        hsv_hits = [(float(hsv_scores[index]), rough_entries[int(index)]) for index in hit_indexes]
+
+        entries_by_work_key = {str(entry.get("work_key", "")): entry for entry in rough_entries}
+        orb_hits: list[tuple[float, dict[str, Any]]] = []
+        for document_key, score in zip(orb_document_keys, orb_scores):
+            entry = entries_by_work_key.get(str(document_key))
+            if entry is None or float(score) <= 0.0:
+                continue
+            orb_hits.append((float(score), entry))
+        orb_hits.sort(key=lambda item: item[0], reverse=True)
+        orb_hits = orb_hits[:limit]
+
+        self.last_trace["rough_candidates_used"] = len(hsv_hits)
+        self.last_trace["hsv_candidates_used"] = len(hsv_hits)
+        self.last_trace["orb_candidates_used"] = len(orb_hits)
+        if not hsv_hits and not orb_hits:
             return None
 
-        if self._sift_detector is None:
-            self._sift_detector = create_sift_detector()
-        detector = self._sift_detector
-        query_keypoints, query_descriptors = detector.detectAndCompute(query_color, query_mask)
-        if query_descriptors is None or len(query_keypoints) < 3:
+        query = self._extract_query_sift_features(query_color, query_mask)
+        if query is None:
             return None
-        query_descriptors = query_descriptors.astype(np.float32)
-        if self._sift_matcher is None:
-            self._sift_matcher = cv2.BFMatcher(cv2.NORM_L2)
-        matcher = self._sift_matcher
-        candidate_rows: list[dict[str, Any]] = []
+        query_keypoints, query_descriptors = query
+
         observation_state = TileIndexStateStore(self.tile_root, str(context.area_id))
-        observation_index_store = MinimapIndexStore(self.tile_root, str(context.area_id))
-        observation_tile_keys = [
-            key
-            for _, entry in hits
-            for key in (parse_canonical_tile_key(raw) for raw in entry.get("tile_keys", []))
-            if key is not None
-        ]
-        observation_statuses = observation_index_store.get_tile_statuses(observation_tile_keys)
+        region_groups = build_candidate_regions(
+            [entry for _, entry in hsv_hits],
+            [entry for _, entry in orb_hits],
+            context.tile_size,
+        )
+        # Each branch is score-descending, so the first contribution holds that branch's best.
+        group_source_scores: dict[PlaneKey, dict[str, float]] = {}
+        for scheme, scheme_hits in (("hsv", hsv_hits), ("orb", orb_hits)):
+            for score, entry in scheme_hits:
+                for key in (parse_canonical_tile_key(raw) for raw in entry.get("tile_keys", [])):
+                    if key is None:
+                        continue
+                    group_source_scores.setdefault(
+                        (key.area_id, key.kind, key.layer_id, key.z_level),
+                        {},
+                    ).setdefault(scheme, float(score))
 
-        for rank, (score, entry) in enumerate(hits, start=1):
-            tile_keys = [
-                key
-                for key in (parse_canonical_tile_key(raw) for raw in entry.get("tile_keys", []))
-                if key is not None
-            ]
+        plans: list[_RegionGroupPlan] = []
+        for rank, (plane, group) in enumerate(region_groups.items(), start=1):
+            source_scores = group_source_scores.get(plane, {})
+            plans.append(
+                _RegionGroupPlan(
+                    rank=rank,
+                    group=group,
+                    # Cross-scheme scores are not comparable, so the HSV maximum keeps the legacy field.
+                    score=source_scores.get("hsv", 0.0),
+                    sources=tuple(scheme for scheme in _ROUGH_SCHEMES if scheme in source_scores),
+                    source_scores={scheme: source_scores.get(scheme) for scheme in _ROUGH_SCHEMES},
+                    work_key=_region_group_work_key(plane),
+                )
+            )
+        return self._localize_from_region_groups(
+            context,
+            plans,
+            query_color=query_color,
+            query_keypoints=query_keypoints,
+            query_descriptors=query_descriptors,
+            observation_state=observation_state,
+            observation_index_store=observation_index_store,
+        )
+
+    def _match_with_history_shortcut(
+        self,
+        normalized_minimap_image: Any,
+        minimap_mask: Any,
+        context: MapContext,
+        active_game_xy: tuple[int | float, int | float],
+    ) -> VisualLocalizationResult | None:
+        center_px = self._game_xy_to_tile_global_pixel(context, active_game_xy[0], active_game_xy[1])
+        self.last_trace = {
+            "match_path": "history_shortcut",
+            "rough_index_source": "tile_index",
+            "rough_candidates_available": 0,
+            "rough_candidates_used": 0,
+            "hsv_candidates_used": 0,
+            "orb_candidates_used": 0,
+            "rough_candidates_skipped_missing": 0,
+            "history_center_px": center_px,
+            "history_radius_px": float(self.config.history_shortcut_radius_px),
+            "rough_hits": [],
+        }
+        rough_entries = self._load_tile_rough_entries(context.area_id)
+        self.last_trace["rough_candidates_available"] = len(rough_entries)
+        if not rough_entries:
+            return None
+        region_groups = build_radius_regions(rough_entries, center_px, float(self.config.history_shortcut_radius_px))
+        plans: list[_RegionGroupPlan] = [
+            _RegionGroupPlan(
+                rank=rank,
+                group=group,
+                score=0.0,
+                sources=("history",),
+                source_scores={scheme: None for scheme in _ROUGH_SCHEMES},
+                work_key=_region_group_work_key(plane),
+                center_px=center_px,
+            )
+            for rank, (plane, group) in enumerate(region_groups.items(), start=1)
+        ]
+        self.last_trace["rough_candidates_used"] = len(plans)
+
+        query_color, query_mask = self._query_color_and_mask(normalized_minimap_image, minimap_mask)
+        query = self._extract_query_sift_features(query_color, query_mask)
+        if query is None:
+            return None
+        query_keypoints, query_descriptors = query
+        return self._localize_from_region_groups(
+            context,
+            plans,
+            query_color=query_color,
+            query_keypoints=query_keypoints,
+            query_descriptors=query_descriptors,
+            observation_state=TileIndexStateStore(self.tile_root, str(context.area_id)),
+            observation_index_store=MinimapIndexStore(self.tile_root, str(context.area_id)),
+        )
+
+    def _localize_from_region_groups(
+        self,
+        context: MapContext,
+        plans: list[_RegionGroupPlan],
+        *,
+        query_color: npt.NDArray[np.uint8],
+        query_keypoints: Any,
+        query_descriptors: npt.NDArray[np.float32],
+        observation_state: TileIndexStateStore,
+        observation_index_store: MinimapIndexStore,
+    ) -> VisualLocalizationResult | None:
+        matcher = self._get_sift_matcher()
+        observation_statuses = observation_index_store.get_tile_statuses(
+            [key for plan in plans for key in plan.group.tile_keys]
+        )
+        candidate_rows: list[dict[str, Any]] = []
+        for plan in plans:
             hit_trace = {
-                "rank": rank,
-                "score": score,
-                "work_key": entry.get("work_key", ""),
-                "tile_keys": [canonical_tile_key(key) for key in tile_keys],
+                "rank": plan.rank,
+                "score": plan.score,
+                "work_key": plan.work_key,
+                "tile_keys": [canonical_tile_key(key) for key in plan.group.tile_keys],
+                "rectangles": list(plan.group.rectangles),
+                "sources": list(plan.sources),
+                "source_scores": dict(plan.source_scores),
                 "sift_index_source": "tile_index",
                 "feature_count": 0,
                 "raw_match_count": 0,
@@ -854,7 +1135,7 @@ class MinimapVisualLocator:
             self.last_trace["rough_hits"].append(hit_trace)
             index = self._load_existing_sift_tiles(
                 context.area_id,
-                tile_keys,
+                plan.group.tile_keys,
                 state=observation_state,
                 index_store=observation_index_store,
                 sqlite_statuses=observation_statuses,
@@ -865,6 +1146,12 @@ class MinimapVisualLocator:
                 continue
             descriptors = index["descriptors"]
             global_xy = index["global_xy"]
+            if plan.center_px is None:
+                indices = select_region_feature_indices(global_xy, plan.group.rectangles)
+            else:
+                indices = select_radius_feature_indices(global_xy, plan.center_px, float(self.config.history_shortcut_radius_px))
+            descriptors = descriptors[indices]
+            global_xy = global_xy[indices]
             hit_trace["feature_count"] = int(len(descriptors))
             if len(descriptors) < 3:
                 hit_trace["skip_reason"] = "too_few_features"
@@ -895,8 +1182,8 @@ class MinimapVisualLocator:
             confidence = min(1.0, float(len(inlier_matches)) / 20.0)
             candidate_rows.append(
                 {
-                    "rank": rank,
-                    "rough_score": score,
+                    "rank": plan.rank,
+                    "rough_score": plan.score,
                     "raw_match_count": len(knn),
                     "good_match_count": len(good),
                     "inlier_count": len(inlier_matches),
@@ -912,8 +1199,8 @@ class MinimapVisualLocator:
                     "estimate": {key: value for key, value in estimate.items() if key != "inlier_matches"},
                     "rough": VisualMatchEvidence(
                         location=(0, 0),
-                        raw_score=float(score),
-                        normalized_confidence=max(0.0, min(1.0, float(score))),
+                        raw_score=float(plan.score),
+                        normalized_confidence=max(0.0, min(1.0, float(plan.score))),
                         threshold=0.0,
                     ),
                     "exact": VisualMatchEvidence(
@@ -947,9 +1234,14 @@ class MinimapVisualLocator:
         if not root.exists():
             return []
         index_root = self.tile_root / str(area_id) / "indexes"
+        index_store = MinimapIndexStore(self.tile_root, str(area_id))
+        area_version = int(index_store.get_area_index_version(str(area_id)))
+        if area_version != CURRENT_TILE_INDEX_VERSION:
+            return []
         cache_key = (
             str(self.tile_root.resolve()),
             str(area_id),
+            area_version,
             self._file_stamp_tuple(index_root / "tile_index_state.json"),
             self._file_stamp_tuple(index_root / "minimap_index.sqlite3"),
         )
@@ -958,7 +1250,6 @@ class MinimapVisualLocator:
             return list(cached)
         rough_paths = tuple(sorted(root.glob("*.json")))
         state = TileIndexStateStore(self.tile_root, str(area_id))
-        index_store = MinimapIndexStore(self.tile_root, str(area_id))
         parsed_entries: list[tuple[dict[str, Any], list[TileKey]]] = []
         all_tile_keys: list[TileKey] = []
         for path in rough_paths:
@@ -967,6 +1258,8 @@ class MinimapVisualLocator:
             except Exception:
                 continue
             if not isinstance(raw, dict):
+                continue
+            if self._rough_entry_sift_rect(raw) is None:
                 continue
             tile_keys = [
                 key
@@ -990,6 +1283,7 @@ class MinimapVisualLocator:
         settled_cache_key = (
             str(self.tile_root.resolve()),
             str(area_id),
+            area_version,
             self._file_stamp_tuple(index_root / "tile_index_state.json"),
             self._file_stamp_tuple(index_root / "minimap_index.sqlite3"),
         )
@@ -1130,6 +1424,11 @@ class MinimapVisualLocator:
         scale_y = float(context.coord_transform.get("scaleY", 1.0) or 1.0)
         return float(pixel_x) / scale_x / 100.0, float(pixel_y) / scale_y / 100.0
 
+    def _game_xy_to_tile_global_pixel(self, context: MapContext, game_x: float, game_y: float) -> tuple[float, float]:
+        scale_x = float(context.coord_transform.get("scaleX", 1.0) or 1.0)
+        scale_y = float(context.coord_transform.get("scaleY", 1.0) or 1.0)
+        return float(game_x) * scale_x * 100.0, float(game_y) * scale_y * 100.0
+
     def _synthetic_manifest_for_tile_index(self, context: MapContext) -> StitchedManifest:
         return StitchedManifest(
             area_id=context.area_id,
@@ -1153,3 +1452,9 @@ class MinimapVisualLocator:
 
 def _safe_tile_index_name(value: str) -> str:
     return value.replace("|", "__").replace("/", "_").replace(":", "_")
+
+
+def _region_group_work_key(plane: PlaneKey) -> str:
+    area_id, kind, layer_id, z_level = plane
+    z_part = "base" if z_level is None else str(int(z_level))
+    return f"region|{area_id}|{kind}|{layer_id}|{z_part}"

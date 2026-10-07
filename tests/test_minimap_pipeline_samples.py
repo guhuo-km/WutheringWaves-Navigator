@@ -26,6 +26,7 @@ from minimap_stability_config import MinimapStabilityConfig
 from minimap_stitched_resources import StitchedResourceBuilder
 from minimap_tile_cache import MinimapTileCache
 from minimap_tile_downloader import TileDownloadResult, convert_tile_snapshot_to_download_inputs
+from screen_capture import FramePatch
 
 
 TILE_METADATA_SNAPSHOT_FIXTURE = {
@@ -130,7 +131,7 @@ def test_decision_function_handles_supplied_candidates():
 def test_observation_pipeline_exposes_single_decision_object():
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
     result = run_observation_paths(
-        frame,
+        FramePatch.whole(frame),
         ocr_candidate=CoordinateCandidate(100, 200, 30, source="ocr"),
     )
 
@@ -197,7 +198,7 @@ def test_debug_script_run_observation_paths_without_visual(tmp_path):
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
     roi = dbg.MinimapRoi(x=10, y=10, width=100, height=100, shape="circle", source="manual")
     result = dbg.run_observation_paths(
-        frame,
+        FramePatch.whole(frame),
         roi=roi,
         ocr_candidate=CoordinateCandidate(100, 200, 30, source="ocr"),
     )
@@ -211,7 +212,7 @@ def test_debug_script_run_observation_paths_without_visual(tmp_path):
     assert result["timings_ms"]["decision"] >= 0
 
 
-def test_debug_script_auto_detects_roi_from_top_left_fraction(monkeypatch):
+def test_debug_script_auto_detects_roi_from_the_frame_search_area(monkeypatch):
     script_dir = ROOT / "scripts"
     if str(script_dir) not in sys.path:
         sys.path.insert(0, str(script_dir))
@@ -221,15 +222,18 @@ def test_debug_script_auto_detects_roi_from_top_left_fraction(monkeypatch):
     frame = np.zeros((900, 1600, 3), dtype=np.uint8)
     calls = []
 
-    def fake_detect(image, search_rect):
-        calls.append((image, search_rect))
+    def fake_detect(patch):
+        calls.append(patch)
         return dbg.MinimapRoi(x=12, y=34, width=56, height=56, shape="circle", source="auto")
 
     monkeypatch.setattr(dbg, "detect_minimap_circle_roi", fake_detect)
 
     roi = dbg._auto_detect_roi(frame)
 
-    assert calls == [(frame, (0, 0, 200, 225))]
+    assert len(calls) == 1
+    assert (calls[0].origin_x, calls[0].origin_y) == (0, 0)
+    assert calls[0].image.shape == (225, 200, 3)
+    assert (calls[0].frame_width, calls[0].frame_height) == (1600, 900)
     assert roi == dbg.MinimapRoi(x=12, y=34, width=56, height=56, shape="circle", source="auto")
 
 
@@ -243,7 +247,10 @@ def test_debug_script_writes_roi_debug_images(tmp_path):
     frame = np.zeros((120, 160, 3), dtype=np.uint8)
     frame[20:60, 10:50] = 180
     roi = dbg.MinimapRoi(x=10, y=20, width=40, height=40, shape="circle", source="manual")
-    normalized = dbg.normalize_minimap_crop(dbg.crop_minimap_from_frame(frame, roi), roi.shape)
+    normalized = dbg.normalize_minimap_crop(
+        FramePatch.whole(frame).crop(roi.x, roi.y, roi.width, roi.height),
+        roi.shape,
+    )
 
     written = dbg._write_roi_debug_images(frame, roi, normalized, tmp_path, "sample")
 
@@ -449,7 +456,7 @@ def test_observation_pipeline_module_runs_without_visual_resources():
     roi = MinimapRoi(x=10, y=10, width=100, height=100, shape="circle", source="manual")
 
     result = run_observation_paths(
-        frame,
+        FramePatch.whole(frame),
         roi=roi,
         ocr_candidate=CoordinateCandidate(100, 200, 30, source="ocr"),
     )
@@ -463,7 +470,7 @@ def test_observation_pipeline_reports_heading_failure_reason_without_roi():
     frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
     result = run_observation_paths(
-        frame,
+        FramePatch.whole(frame),
         ocr_candidate=CoordinateCandidate(100, 200, 30, source="ocr"),
     )
 
@@ -476,7 +483,7 @@ def test_observation_pipeline_reports_heading_failure_reason_when_no_heading_mat
     roi = MinimapRoi(x=10, y=10, width=100, height=100, shape="circle", source="manual")
 
     result = run_observation_paths(
-        frame,
+        FramePatch.whole(frame),
         roi=roi,
         ocr_candidate=CoordinateCandidate(100, 200, 30, source="ocr"),
     )
@@ -509,7 +516,7 @@ def test_debug_script_uses_visual_result_candidate_for_decision(tmp_path, monkey
     context = MapContext("906", "default", 1024, {"scaleX": 1.0, "scaleY": 1.0, "offsetX": 0.0, "offsetY": 0.0})
 
     result = dbg.run_observation_paths(
-        frame,
+        FramePatch.whole(frame),
         roi=roi,
         map_context=context,
         tile_root=tmp_path,
@@ -541,7 +548,7 @@ def test_observation_pipeline_excludes_center_arrow_from_visual_match_mask(tmp_p
     context = MapContext("906", "default", 1024, {"scaleX": 1.0, "scaleY": 1.0, "offsetX": 0.0, "offsetY": 0.0})
 
     run_observation_paths(
-        frame,
+        FramePatch.whole(frame),
         roi=roi,
         map_context=context,
         tile_root=tmp_path,
@@ -571,7 +578,7 @@ def test_observation_pipeline_uses_configured_decision_threshold(tmp_path, monke
     context = MapContext("906", "default", 1024, {"scaleX": 1.0, "scaleY": 1.0, "offsetX": 0.0, "offsetY": 0.0})
 
     result = run_observation_paths(
-        frame,
+        FramePatch.whole(frame),
         roi=roi,
         map_context=context,
         tile_root=tmp_path,
@@ -608,7 +615,7 @@ def test_observation_pipeline_passes_previous_coordinate_as_visual_layer_active_
     context = MapContext("906", "default", 1024, {"scaleX": 1.0, "scaleY": 1.0, "offsetX": 0.0, "offsetY": 0.0})
 
     run_observation_paths(
-        frame,
+        FramePatch.whole(frame),
         roi=roi,
         map_context=context,
         tile_root=tmp_path,
@@ -644,7 +651,7 @@ def test_observation_pipeline_uses_sift_visual_path_without_saved_scale(tmp_path
     context = MapContext("906", "default", 1024, {"scaleX": 1.0, "scaleY": 1.0, "offsetX": 0.0, "offsetY": 0.0})
 
     result = run_observation_paths(
-        frame,
+        FramePatch.whole(frame),
         roi=roi,
         map_context=context,
         tile_root=tmp_path,
@@ -720,11 +727,12 @@ def test_frame_package_can_export_heading_debug_artifacts(tmp_path):
 
     package_path = write_minimap_frame_package(
         frame,
+        ocr_crop=frame[:30, :],
+        minimap_patch=FramePatch.whole(frame),
         output_root=tmp_path,
         label="heading_debug",
         roi=roi,
         stability_config=MinimapStabilityConfig(),
-        extra={"runtime_capture_area": {"x": 2, "y": 3, "width": 20, "height": 10}},
         include_debug_artifacts=True,
     )
 

@@ -4,7 +4,7 @@ from dataclasses import asdict, is_dataclass
 import json
 from pathlib import Path
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
@@ -12,9 +12,11 @@ import numpy as np
 from core import paths
 from core.map_context import CoordinateCandidate, MapContext
 from minimap_heading import collect_heading_geometry_debug
-from minimap_roi import MinimapRoi
-from minimap_roi import crop_minimap_from_frame, normalize_minimap_crop
+from minimap_roi import MinimapRoi, normalize_minimap_crop
 from minimap_stability_config import MinimapStabilityConfig
+
+if TYPE_CHECKING:
+    from screen_capture import FramePatch
 
 
 FRAME_IMAGE_NAME = "frame.png"
@@ -48,46 +50,25 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(_serialize(payload), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _valid_rect(value: Any) -> tuple[int, int, int, int] | None:
-    if not isinstance(value, dict):
-        return None
-    try:
-        x = int(value.get("x", 0) or 0)
-        y = int(value.get("y", 0) or 0)
-        width = int(value.get("width", 0) or 0)
-        height = int(value.get("height", 0) or 0)
-    except Exception:
-        return None
-    if width <= 0 or height <= 0:
-        return None
-    return x, y, width, height
-
-
 def _write_debug_artifacts(
     package_dir: Path,
-    frame: np.ndarray,
     *,
+    ocr_crop: np.ndarray | None,
+    minimap_patch: "FramePatch | None",
     roi: MinimapRoi | None,
     stability_config: MinimapStabilityConfig | None,
-    extra: dict[str, Any],
 ) -> dict[str, str]:
     artifacts: dict[str, str] = {}
 
-    runtime_capture_area = _valid_rect(extra.get("runtime_capture_area"))
-    if runtime_capture_area is not None:
-        from screen_capture import crop_image_region
+    if ocr_crop is not None and ocr_crop.size:
+        _write_image(package_dir / "ocr_crop.png", ocr_crop)
+        artifacts["ocr_crop"] = "ocr_crop.png"
 
-        x, y, width, height = runtime_capture_area
-        ocr_crop = crop_image_region(frame, x, y, width, height)
-        if getattr(ocr_crop, "size", 0):
-            _write_image(package_dir / "ocr_crop.png", ocr_crop)
-            artifacts["ocr_crop"] = "ocr_crop.png"
-
-    if roi is None:
+    if roi is None or minimap_patch is None:
         return artifacts
 
-    minimap_crop = crop_minimap_from_frame(frame, roi)
-    if not getattr(minimap_crop, "size", 0):
+    minimap_crop = minimap_patch.crop(roi.x, roi.y, roi.width, roi.height)
+    if not minimap_crop.size:
         return artifacts
     _write_image(package_dir / "minimap_crop.png", minimap_crop)
     artifacts["minimap_crop"] = "minimap_crop.png"
@@ -127,8 +108,10 @@ def _package_root(root: Path | None = None) -> Path:
 
 
 def write_minimap_frame_package(
-    frame: np.ndarray,
+    full_frame: np.ndarray | None,
     *,
+    ocr_crop: np.ndarray | None = None,
+    minimap_patch: "FramePatch | None" = None,
     output_root: Path | None = None,
     label: str | None = None,
     roi: MinimapRoi | None = None,
@@ -139,26 +122,29 @@ def write_minimap_frame_package(
     extra: dict[str, Any] | None = None,
     include_debug_artifacts: bool = False,
 ) -> Path:
-    """Export one already-captured frame and metadata for the offline debug harness."""
-    if frame is None or getattr(frame, "size", 0) == 0:
-        raise ValueError("frame_package_requires_non_empty_frame")
+    """Export one recognition capture and its metadata for the offline debug harness.
 
+    ``full_frame`` is only supplied while the capture path keeps the whole frame around, so a
+    package without it still carries every artifact the recognition pipeline actually used.
+    """
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     safe_label = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in (label or "frame")).strip("_") or "frame"
     package_dir = _package_root(output_root) / f"{timestamp}_{int(time.time() * 1000) % 1000:03d}_{safe_label}"
     package_dir.mkdir(parents=True, exist_ok=False)
 
-    image_path = package_dir / FRAME_IMAGE_NAME
-    _write_image(image_path, frame)
+    frame_name: str | None = None
+    if full_frame is not None and full_frame.size:
+        _write_image(package_dir / FRAME_IMAGE_NAME, full_frame)
+        frame_name = FRAME_IMAGE_NAME
 
     extra_payload = extra or {}
     debug_artifacts = (
         _write_debug_artifacts(
             package_dir,
-            frame,
+            ocr_crop=ocr_crop,
+            minimap_patch=minimap_patch,
             roi=roi,
             stability_config=stability_config,
-            extra=extra_payload,
         )
         if include_debug_artifacts
         else {}
@@ -166,7 +152,7 @@ def write_minimap_frame_package(
 
     payload = {
         "version": 1,
-        "frame": FRAME_IMAGE_NAME,
+        "frame": frame_name,
         "roi": _serialize(roi),
         "ocrCandidate": _serialize(ocr_candidate),
         "mapContext": _serialize(map_context),

@@ -13,8 +13,11 @@ class MinimapStabilityConfig:
     history_y_threshold: int = 150
     auto_roi_lock_tolerance_px: int = 15
     heading_recognition_enabled: bool = True
-    rough_candidate_limit: int = 20
+    rough_candidate_limit: int = 72
     single_source_promotion_frames: int = 5
+    history_shortcut_radius_px: float = 300.0
+    sift_min_inliers: int = 5
+    sift_ratio: float = 0.75
 
 
 def _read_setting(settings, key: str, default):
@@ -45,4 +48,7 @@ def load_minimap_stability_config(settings=None) -> MinimapStabilityConfig:
         heading_recognition_enabled=bool(_read_setting(settings, f"{prefix}.heading_recognition_enabled", defaults.heading_recognition_enabled)),
         rough_candidate_limit=int(_read_setting(settings, f"{prefix}.rough_candidate_limit", defaults.rough_candidate_limit)),
         single_source_promotion_frames=int(_read_setting(settings, f"{prefix}.single_source_promotion_frames", defaults.single_source_promotion_frames)),
+        history_shortcut_radius_px=float(_read_setting(settings, f"{prefix}.history_shortcut_radius_px", defaults.history_shortcut_radius_px)),
+        sift_min_inliers=int(_read_setting(settings, f"{prefix}.sift_min_inliers", defaults.sift_min_inliers)),
+        sift_ratio=float(_read_setting(settings, f"{prefix}.sift_ratio", defaults.sift_ratio)),
     )

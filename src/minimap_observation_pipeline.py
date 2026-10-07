@@ -3,17 +3,18 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 import time
-from typing import Any
-
-import numpy as np
+from typing import TYPE_CHECKING, Any
 
 from core.map_context import CoordinateCandidate, MapContext
 from coordinate_continuity import ContinuityState
 from coordinate_decision import choose_coordinate
 from minimap_heading import detect_heading
-from minimap_roi import MinimapRoi, build_minimap_texture_match_mask, crop_minimap_from_frame, normalize_minimap_crop
+from minimap_roi import MinimapRoi, build_minimap_texture_match_mask, normalize_minimap_crop
 from minimap_stability_config import MinimapStabilityConfig, load_minimap_stability_config
 from minimap_visual_locator import MinimapVisualLocator, VisualMatchConfig
+
+if TYPE_CHECKING:
+    from screen_capture import FramePatch
 
 
 def _serialize(obj: Any) -> Any:
@@ -25,7 +26,7 @@ def _serialize(obj: Any) -> Any:
 
 
 def run_observation_paths(
-    frame: np.ndarray,
+    patch: "FramePatch",
     *,
     map_context: MapContext | None = None,
     roi: MinimapRoi | None = None,
@@ -36,7 +37,7 @@ def run_observation_paths(
     detect_heading_enabled: bool = True,
     vision_locator: MinimapVisualLocator | None = None,
 ) -> dict[str, Any]:
-    """Run the current OCR/visual/heading decision pipeline on one provided frame."""
+    """Run the current OCR/visual/heading decision pipeline on one captured minimap patch."""
     total_start = time.perf_counter()
     continuity = continuity or ContinuityState()
     stability_config = stability_config or load_minimap_stability_config()
@@ -56,7 +57,7 @@ def run_observation_paths(
     }
 
     if roi is not None:
-        minimap_crop = crop_minimap_from_frame(frame, roi)
+        minimap_crop = patch.crop(roi.x, roi.y, roi.width, roi.height)
         stage_start = time.perf_counter()
         normalized = normalize_minimap_crop(minimap_crop, roi.shape)
         timings_ms["normalize_minimap"] = (time.perf_counter() - stage_start) * 1000.0
@@ -78,6 +79,9 @@ def run_observation_paths(
                 tile_root,
                 config=VisualMatchConfig(
                     rough_candidate_limit=stability_config.rough_candidate_limit,
+                    history_shortcut_radius_px=stability_config.history_shortcut_radius_px,
+                    sift_min_inliers=stability_config.sift_min_inliers,
+                    sift_ratio=stability_config.sift_ratio,
                 ),
             )
             visual_result = locator.match(

@@ -3,8 +3,9 @@
 Boundaries:
 - Userscript exposes map context and incrementally discovered tile metadata only.
 - Python downloads and caches tiles.
-- Normal visual localization does not depend on OCR coordinates.
-- History does not silently reuse old coordinates as a fallback.
+- Visual localization solves coordinates from SIFT inliers only; OCR coordinates are not a solving input.
+- The last accepted coordinate, from OCR or vision, only seeds the history shortcut's retrieval circle.
+- History is never returned as a result: shortcut candidates must still pass SIFT matching and inlier checks.
 - Heading recognition reuses the minimap crop but is not part of coordinate solving.
 """
 

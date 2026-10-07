@@ -13,6 +13,7 @@ numpy>=1.24.0
 
 # OCR和机器学习
 onnxruntime-directml==1.24.4
+faiss-cpu>=1.15.1
 
 # 快捷键支持
 keyboard>=0.13.5
@@ -21,6 +22,7 @@ pynput>=1.7.6
 # Windows API (窗口检测、进程信息)
 pywin32>=306
 psutil>=5.9.0
+windows-capture==2.0.1
 
 # HTTP请求
 requests>=2.31.0

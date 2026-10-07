@@ -272,5 +272,32 @@ class TestPathBEdgeCases:
         assert metadata['complete'] is True
 
 
+def test_coordinate_split_width_factor_comes_from_config():
+    worker = OCRWorker(config_dict={"coordinate_split_width_factor": 0.45})
+
+    assert worker.coordinate_split_width_factor == 0.45
+
+
+def test_split_numeric_group_width_factor_controls_real_frame_geometry():
+    """Measured geometry of recognition.log frame 6450: the y/z gap is 6.4px, the group median gap 0.1px."""
+    # 这个测试验的是 "给定拆分系数时，真实帧的几何会被怎么切"。
+    # 系数在这里显式传入，不跟产品默认值绑定——默认值归默认值测试管。
+    worker = OCRWorker(config_dict={"coordinate_split_width_factor": 0.5})
+    tokens = [
+        {"char": "8", "x1": 94.8, "x2": 107.8},
+        {"char": "8", "x1": 107.8, "x2": 120.7},
+        {"char": "8", "x1": 120.5, "x2": 133.5},
+        {"char": "3", "x1": 139.9, "x2": 152.8},
+        {"char": "5", "x1": 152.9, "x2": 166.1},
+    ]
+    group = {"text": "88835", "tokens": tokens}
+
+    assert worker._split_numeric_group_by_largest_gap(group, min_digits=4) is None
+
+    worker.update_coordinate_split_width_factor(0.45)
+
+    assert worker._split_numeric_group_by_largest_gap(group, min_digits=4) == ("888", "35")
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

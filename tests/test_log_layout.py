@@ -141,13 +141,19 @@ def test_observation_recognition_log_includes_tile_index_trace_details():
             "rough_index_source": "tile_index",
             "rough_candidates_available": 12,
             "rough_candidates_used": 8,
+            "hsv_candidates_used": 6,
+            "orb_candidates_used": 2,
+            "orb_status": "ready",
             "rough_candidates_skipped_missing": 3,
             "rough_hits": [
                 {
                     "rank": 1,
                     "score": 0.88,
-                    "work_key": "rough|8|standard|default|base|tile|...",
+                    "work_key": "region|8|standard|default|base",
                     "tile_keys": ["8|standard|default|base|10|20"],
+                    "rectangles": [(20480, 20480, 1024, 1024)],
+                    "sources": ["hsv", "orb"],
+                    "source_scores": {"hsv": 0.88, "orb": 0.42},
                     "sift_index_source": "tile_index",
                     "feature_count": 123,
                     "raw_match_count": 50,
@@ -155,7 +161,23 @@ def test_observation_recognition_log_includes_tile_index_trace_details():
                     "inlier_count": 18,
                     "accepted": True,
                     "skip_reason": "",
-                }
+                },
+                {
+                    "rank": 2,
+                    "score": 0.0,
+                    "work_key": "region|8|standard|default|1",
+                    "tile_keys": ["8|standard|default|1|10|21"],
+                    "rectangles": [(20480, 21504, 400, 400)],
+                    "sources": ["orb"],
+                    "source_scores": {"hsv": None, "orb": 0.31},
+                    "sift_index_source": "tile_index",
+                    "feature_count": 2,
+                    "raw_match_count": 0,
+                    "good_match_count": 0,
+                    "inlier_count": 0,
+                    "accepted": False,
+                    "skip_reason": "too_few_features",
+                },
             ],
         },
         "decision": {"coord": [100, 200, 30], "source": "visual", "reason": "visual_near_history"},
@@ -165,9 +187,42 @@ def test_observation_recognition_log_includes_tile_index_trace_details():
     recognition_text = "\n".join(line for log_type, line in routed if log_type == "recognition")
 
     assert "tile_index: rough_candidates_available=12 used=8 skipped_missing=3" in recognition_text
-    assert "hit rank=1 score=0.88 work_key=rough|8|standard|default|base|tile|..." in recognition_text
+    assert "hsv_used=6 orb_used=2 orb_status=ready" in recognition_text
+    assert "hit rank=1 score=0.88 work_key=region|8|standard|default|base" in recognition_text
     assert "tiles=8|standard|default|base|10|20" in recognition_text
+    assert "sources=hsv,orb source_scores=hsv=0.88 orb=0.42" in recognition_text
     assert "sift_index=tile_index features=123 raw=50 good=22 inliers=18 accepted=True skip=" in recognition_text
+    assert "hit rank=2 score=0.0 work_key=region|8|standard|default|1" in recognition_text
+    assert "sources=orb source_scores=hsv=None orb=0.31" in recognition_text
+    assert "skip=too_few_features" in recognition_text
+
+
+def test_observation_recognition_log_renders_history_shortcut_path_without_rough_counters():
+    bundle = {
+        "visual_trace": {
+            "match_path": "history_shortcut",
+            "rough_index_source": "tile_index",
+            "history_center_px": (20480.0, 21504.0),
+            "history_radius_px": 300.0,
+            "rough_hits": [],
+        },
+        "decision": {"coord": [100, 200, 30], "source": "visual", "reason": "visual_history_shortcut"},
+    }
+
+    routed = list(route_observation_bundle(bundle, detailed_debug=True))
+    recognition_text = "\n".join(line for log_type, line in routed if log_type == "recognition")
+    tile_index_line = next(line for line in recognition_text.splitlines() if "tile_index:" in line)
+
+    assert "path=history_shortcut" in tile_index_line
+    assert "center=(20480.0, 21504.0)" in tile_index_line
+    assert "radius=300.0" in tile_index_line
+    assert "rough_candidates_available" not in tile_index_line
+    assert "skipped_missing" not in tile_index_line
+    assert "hsv_used" not in tile_index_line
+    assert "orb_used" not in tile_index_line
+    assert "orb_status" not in tile_index_line
+    assert "rough_candidates_available" not in recognition_text
+    assert "orb_status" not in recognition_text
 
 
 def test_observation_recognition_log_includes_visual_failure_reason():

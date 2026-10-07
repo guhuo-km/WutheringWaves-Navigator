@@ -15,8 +15,21 @@ def test_minimap_stability_config_uses_confirmed_defaults():
     assert config.history_y_threshold == 150
     assert config.auto_roi_lock_tolerance_px == 15
     assert config.heading_recognition_enabled is True
-    assert config.rough_candidate_limit == 20
+    assert config.rough_candidate_limit == 72
     assert config.single_source_promotion_frames == 5
+    assert config.history_shortcut_radius_px == 300.0
+    assert config.sift_min_inliers == 5
+    assert config.sift_ratio == 0.75
+
+
+def test_minimap_stability_config_defaults_candidate_limit_to_72_when_unset():
+    class EmptySettings:
+        def get(self, key, default=None):
+            return default
+
+    config = load_minimap_stability_config(EmptySettings())
+
+    assert config.rough_candidate_limit == 72
 
 
 def test_minimap_stability_config_loads_existing_settings_values():
@@ -32,6 +45,9 @@ def test_minimap_stability_config_loads_existing_settings_values():
             "minimap_stability.heading_recognition_enabled": False,
             "minimap_stability.rough_candidate_limit": "12",
             "minimap_stability.single_source_promotion_frames": "7",
+            "minimap_stability.history_shortcut_radius_px": "420",
+            "minimap_stability.sift_min_inliers": "9",
+            "minimap_stability.sift_ratio": "0.62",
         }
 
         def get(self, key, default=None):
@@ -49,3 +65,6 @@ def test_minimap_stability_config_loads_existing_settings_values():
     assert config.heading_recognition_enabled is False
     assert config.rough_candidate_limit == 12
     assert config.single_source_promotion_frames == 7
+    assert config.history_shortcut_radius_px == 420.0
+    assert config.sift_min_inliers == 9
+    assert config.sift_ratio == 0.62

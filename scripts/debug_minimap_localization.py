@@ -31,10 +31,10 @@ from minimap_legacy_tiles import import_legacy_tile_tree  # noqa: E402
 from minimap_roi import (  # noqa: E402
     MinimapRoi,
     build_minimap_texture_match_mask,
-    crop_minimap_from_frame,
     detect_minimap_circle_roi,
     normalize_minimap_crop,
 )
+from screen_capture import FramePatch, auto_minimap_search_rect  # noqa: E402
 from minimap_stitched_resources import StitchedResourceBuilder  # noqa: E402
 from minimap_tile_downloader import download_missing_tiles, generate_standard_tile_inputs_for_game_xy  # noqa: E402
 
@@ -109,9 +109,8 @@ def _load_coordinate_candidate(data: dict[str, Any] | None) -> CoordinateCandida
 
 
 def _auto_detect_roi(frame) -> MinimapRoi | None:
-    frame_height, frame_width = frame.shape[:2]
-    search_rect = (0, 0, max(1, int(frame_width / 8)), max(1, int(frame_height / 4)))
-    return detect_minimap_circle_roi(frame, search_rect)
+    search_rect = auto_minimap_search_rect(int(frame.shape[1]), int(frame.shape[0]))
+    return detect_minimap_circle_roi(FramePatch.whole(frame).sub_rect(*search_rect))
 
 
 def _safe_debug_stem(image_path: Path) -> str:
@@ -135,7 +134,7 @@ def _write_roi_debug_images(
     else:
         cv2.circle(overlay, center, max(1, min(roi.width, roi.height) // 2), (0, 255, 0), 2)
 
-    crop = crop_minimap_from_frame(frame, roi)
+    crop = FramePatch.whole(frame).crop(roi.x, roi.y, roi.width, roi.height)
     masked_rgb = cv2.bitwise_and(normalized.exact_image, normalized.exact_image, mask=normalized.mask)
     masked = cv2.cvtColor(masked_rgb, cv2.COLOR_BGR2BGRA)
     masked[:, :, 3] = normalized.mask
@@ -370,7 +369,7 @@ def _run_one_image(image_path: Path, args: argparse.Namespace, package_data: dic
         return prepare_current_exit
 
     if roi is not None and args.roi_debug_dir:
-        crop = crop_minimap_from_frame(frame, roi)
+        crop = FramePatch.whole(frame).crop(roi.x, roi.y, roi.width, roi.height)
         normalized = normalize_minimap_crop(crop, roi.shape)
         written = _write_roi_debug_images(
             frame,
@@ -386,7 +385,7 @@ def _run_one_image(image_path: Path, args: argparse.Namespace, package_data: dic
         continuity.accept((args.previous_x, args.previous_y, args.previous_z))
 
     result = run_observation_paths(
-        frame,
+        FramePatch.whole(frame),
         map_context=map_context,
         roi=roi,
         tile_root=tile_root,

@@ -1,5 +1,9 @@
 from core.map_context import TileKey
-from minimap_index_store import MinimapIndexStore
+from minimap_index_store import (
+    CURRENT_TILE_INDEX_VERSION,
+    UNAVAILABLE_TILE_INDEX_VERSION,
+    MinimapIndexStore,
+)
 from minimap_tile_index_state import canonical_tile_key
 
 
@@ -77,3 +81,63 @@ def test_index_store_reads_multiple_tile_statuses_in_one_batch(tmp_path):
     assert set(statuses) == {canonical_tile_key(ready), canonical_tile_key(missing)}
     assert statuses[canonical_tile_key(ready)].tile_present is True
     assert statuses[canonical_tile_key(missing)].tile_present is False
+
+
+def test_current_tile_index_version_contract_matches_the_query_side_agreement():
+    assert CURRENT_TILE_INDEX_VERSION == 3
+    assert UNAVAILABLE_TILE_INDEX_VERSION == 0
+
+
+def test_area_index_version_is_unavailable_before_any_rebuild(tmp_path):
+    assert MinimapIndexStore(tmp_path, "8").get_area_index_version("8") == UNAVAILABLE_TILE_INDEX_VERSION
+
+
+def test_area_index_version_roundtrips_and_is_overwritten(tmp_path):
+    store = MinimapIndexStore(tmp_path, "8")
+
+    store.set_area_index_version("8", CURRENT_TILE_INDEX_VERSION)
+    assert MinimapIndexStore(tmp_path, "8").get_area_index_version("8") == CURRENT_TILE_INDEX_VERSION
+
+    store.set_area_index_version("8", UNAVAILABLE_TILE_INDEX_VERSION)
+    assert MinimapIndexStore(tmp_path, "8").get_area_index_version("8") == UNAVAILABLE_TILE_INDEX_VERSION
+
+
+def test_area_index_version_is_stored_per_area(tmp_path):
+    MinimapIndexStore(tmp_path, "8").set_area_index_version("8", CURRENT_TILE_INDEX_VERSION)
+
+    assert MinimapIndexStore(tmp_path, "8").get_area_index_version("8") == CURRENT_TILE_INDEX_VERSION
+    assert MinimapIndexStore(tmp_path, "906").get_area_index_version("906") == UNAVAILABLE_TILE_INDEX_VERSION
+
+
+def test_area_orb_ready_is_false_without_a_row_and_roundtrips(tmp_path):
+    store = MinimapIndexStore(tmp_path, "8")
+    assert store.is_area_orb_ready("8") is False
+
+    store.set_area_orb_ready("8", True)
+    assert MinimapIndexStore(tmp_path, "8").is_area_orb_ready("8") is True
+
+    store.set_area_orb_ready("8", False)
+    assert MinimapIndexStore(tmp_path, "8").is_area_orb_ready("8") is False
+
+
+def test_clear_tile_index_status_drops_tile_rows_but_keeps_area_version(tmp_path):
+    key = _tile(16, -13)
+    store = MinimapIndexStore(tmp_path, "8")
+    store.record_tile_available(key, png_path="tile.png", mtime_ns=11, size=22)
+    store.mark_rough_ready(key, rough_count=1)
+    store.set_area_index_version("8", CURRENT_TILE_INDEX_VERSION)
+
+    removed = store.clear_tile_index_status()
+
+    assert removed == 1
+    assert store.tile_status_items() == []
+    assert store.get_tile_status(key).tile_present is False
+    assert store.health_summary() == {
+        "tiles": 0,
+        "rough_ready": 0,
+        "sift_ready": 0,
+        "rough_missing": 0,
+        "sift_missing": 0,
+        "failed": 0,
+    }
+    assert store.get_area_index_version("8") == CURRENT_TILE_INDEX_VERSION

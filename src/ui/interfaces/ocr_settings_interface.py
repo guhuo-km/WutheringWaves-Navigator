@@ -20,6 +20,18 @@ except ImportError:
         return default if default is not None else key
 
 from core.settings_manager import SettingsManager
+from screen_capture import normalize_capture_mode
+
+
+# 下拉框选项：(规范化截图模式, 文本语言 key, 中文默认文本)
+CAPTURE_MODE_OPTIONS = (
+    ("auto", "ocr_capture_mode_auto", "自动（推荐）"),
+    ("wgc", "ocr_capture_mode_wgc", "WGC"),
+    ("printwindow", "ocr_capture_mode_printwindow", "PrintWindow"),
+    ("window_bitblt", "ocr_capture_mode_bitblt", "窗口 BitBlt"),
+)
+
+CAPTURE_MODE_INDEX = {value: index for index, (value, _key, _text) in enumerate(CAPTURE_MODE_OPTIONS)}
 
 
 class OCRSettingsInterface(QWidget):
@@ -73,7 +85,8 @@ class OCRSettingsInterface(QWidget):
         self.capture_mode_label = BodyLabel()
         grid.addWidget(self.capture_mode_label, 0, 0)
         self.capture_mode = ComboBox()
-        self.capture_mode.addItems(["", ""])
+        for mode_value, _key, _text in CAPTURE_MODE_OPTIONS:
+            self.capture_mode.addItem("", userData=mode_value)
         self.capture_mode.currentIndexChanged.connect(self.on_settings_changed)
         grid.addWidget(self.capture_mode, 0, 1)
         
@@ -216,18 +229,22 @@ class OCRSettingsInterface(QWidget):
         self.recognition_params_title_label.setStyleSheet("font-weight: bold;")
         basic_layout.addWidget(self.recognition_params_title_label)
 
+        self.judgement_group_label = BodyLabel()
+        self.judgement_group_label.setStyleSheet("font-weight: bold;")
+        basic_layout.addWidget(self.judgement_group_label)
+
         threshold_grid = QGridLayout()
         threshold_grid.setVerticalSpacing(10)
         self.coordinate_agreement_xy_threshold_label = BodyLabel()
         threshold_grid.addWidget(self.coordinate_agreement_xy_threshold_label, 0, 0)
         threshold_grid.addWidget(BodyLabel("X"), 0, 1)
         self.coordinate_agreement_x_threshold_spin = self._create_int_spin(
-            1, 100000, "minimap_stability.coordinate_agreement_x_threshold", 50
+            1, 100000, "minimap_stability.coordinate_agreement_x_threshold", 50, width=120
         )
         threshold_grid.addWidget(self.coordinate_agreement_x_threshold_spin, 0, 2)
         threshold_grid.addWidget(BodyLabel("Y"), 0, 3)
         self.coordinate_agreement_y_threshold_spin = self._create_int_spin(
-            1, 100000, "minimap_stability.coordinate_agreement_y_threshold", 50
+            1, 100000, "minimap_stability.coordinate_agreement_y_threshold", 50, width=120
         )
         threshold_grid.addWidget(self.coordinate_agreement_y_threshold_spin, 0, 4)
 
@@ -235,41 +252,113 @@ class OCRSettingsInterface(QWidget):
         threshold_grid.addWidget(self.history_xy_threshold_label, 1, 0)
         threshold_grid.addWidget(BodyLabel("X"), 1, 1)
         self.history_x_threshold_spin = self._create_int_spin(
-            1, 100000, "minimap_stability.history_x_threshold", 150
+            1, 100000, "minimap_stability.history_x_threshold", 150, width=120
         )
         threshold_grid.addWidget(self.history_x_threshold_spin, 1, 2)
         threshold_grid.addWidget(BodyLabel("Y"), 1, 3)
         self.history_y_threshold_spin = self._create_int_spin(
-            1, 100000, "minimap_stability.history_y_threshold", 150
+            1, 100000, "minimap_stability.history_y_threshold", 150, width=120
         )
         threshold_grid.addWidget(self.history_y_threshold_spin, 1, 4)
 
-        self.auto_roi_lock_tolerance_label = BodyLabel()
-        threshold_grid.addWidget(self.auto_roi_lock_tolerance_label, 2, 0)
-        self.auto_roi_lock_tolerance_spin = self._create_int_spin(
-            0, 100, "minimap_stability.auto_roi_lock_tolerance_px", 15
+        self.single_source_promotion_frames_label = BodyLabel()
+        threshold_grid.addWidget(self.single_source_promotion_frames_label, 2, 0)
+        self.single_source_promotion_frames_spin = self._create_int_spin(
+            1, 30, "minimap_stability.single_source_promotion_frames", 5, width=120
         )
-        threshold_grid.addWidget(self.auto_roi_lock_tolerance_spin, 2, 2)
+        threshold_grid.addWidget(self.single_source_promotion_frames_spin, 2, 2)
+
+        self.auto_roi_lock_tolerance_label = BodyLabel()
+        threshold_grid.addWidget(self.auto_roi_lock_tolerance_label, 3, 0)
+        self.auto_roi_lock_tolerance_spin = self._create_int_spin(
+            0, 100, "minimap_stability.auto_roi_lock_tolerance_px", 15, width=120
+        )
+        threshold_grid.addWidget(self.auto_roi_lock_tolerance_spin, 3, 2)
+        threshold_grid.setColumnStretch(5, 1)
+        basic_layout.addLayout(threshold_grid)
+
+        self.matching_group_label = BodyLabel()
+        self.matching_group_label.setStyleSheet("font-weight: bold;")
+        basic_layout.addWidget(self.matching_group_label)
+
+        matching_grid = QGridLayout()
+        matching_grid.setVerticalSpacing(10)
 
         self.rough_candidate_limit_label = BodyLabel()
-        threshold_grid.addWidget(self.rough_candidate_limit_label, 3, 0)
+        matching_grid.addWidget(self.rough_candidate_limit_label, 0, 0)
         self.rough_candidate_limit_spin = self._create_int_spin(
-            1, 100, "minimap_stability.rough_candidate_limit", 20
+            1, 100, "minimap_stability.rough_candidate_limit", 72, width=120
         )
-        threshold_grid.addWidget(self.rough_candidate_limit_spin, 3, 2)
-        threshold_grid.setColumnStretch(4, 1)
-        basic_layout.addLayout(threshold_grid)
+        matching_grid.addWidget(self.rough_candidate_limit_spin, 0, 1)
+
+        self.history_shortcut_radius_label = BodyLabel()
+        matching_grid.addWidget(self.history_shortcut_radius_label, 0, 2)
+        self.history_shortcut_radius_spin = self._create_int_spin(
+            50, 2000, "minimap_stability.history_shortcut_radius_px", 300, width=120
+        )
+        self.history_shortcut_radius_spin.setSingleStep(10)
+        matching_grid.addWidget(self.history_shortcut_radius_spin, 0, 3)
+
+        self.sift_min_inliers_label = BodyLabel()
+        matching_grid.addWidget(self.sift_min_inliers_label, 1, 0)
+        self.sift_min_inliers_spin = self._create_int_spin(
+            3, 200, "minimap_stability.sift_min_inliers", 5, width=120
+        )
+        matching_grid.addWidget(self.sift_min_inliers_spin, 1, 1)
+
+        self.sift_ratio_label = BodyLabel()
+        matching_grid.addWidget(self.sift_ratio_label, 1, 2)
+        self.sift_ratio_spin = self._create_double_spin(
+            0.50, 0.95, 0.01, "minimap_stability.sift_ratio", 0.75, width=120
+        )
+        matching_grid.addWidget(self.sift_ratio_spin, 1, 3)
+
+        self.coordinate_split_width_factor_label = BodyLabel()
+        matching_grid.addWidget(self.coordinate_split_width_factor_label, 2, 0)
+        self.coordinate_split_width_factor_spin = DoubleSpinBox()
+        self.coordinate_split_width_factor_spin.setRange(0.20, 0.80)
+        self.coordinate_split_width_factor_spin.setSingleStep(0.01)
+        self.coordinate_split_width_factor_spin.setDecimals(2)
+        self.coordinate_split_width_factor_spin.setValue(0.40)
+        self.coordinate_split_width_factor_spin.setFixedWidth(120)
+        self.coordinate_split_width_factor_spin.valueChanged.connect(self.on_settings_changed)
+        matching_grid.addWidget(self.coordinate_split_width_factor_spin, 2, 1)
+        matching_grid.setColumnStretch(4, 1)
+        basic_layout.addLayout(matching_grid)
 
         layout.addWidget(self.basic_card)
         layout.addStretch()
         self.retranslate_ui()
         self.update_theme()
 
-    def _create_int_spin(self, minimum: int, maximum: int, setting_key: str, default: int) -> SpinBox:
+    def _create_int_spin(
+        self, minimum: int, maximum: int, setting_key: str, default: int, width: int | None = None
+    ) -> SpinBox:
         spin = SpinBox()
         spin.setRange(minimum, maximum)
         spin.setValue(int(self.settings.get(setting_key, default)))
+        if width is not None:
+            spin.setFixedWidth(width)
         spin.valueChanged.connect(lambda value, key=setting_key: self.settings.set(key, int(value)))
+        return spin
+
+    def _create_double_spin(
+        self,
+        minimum: float,
+        maximum: float,
+        step: float,
+        setting_key: str,
+        default: float,
+        width: int | None = None,
+    ) -> DoubleSpinBox:
+        spin = DoubleSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setSingleStep(step)
+        spin.setDecimals(2)
+        spin.setValue(float(self.settings.get(setting_key, default)))
+        if width is not None:
+            spin.setFixedWidth(width)
+        spin.valueChanged.connect(lambda value, key=setting_key: self.settings.set(key, float(value)))
         return spin
     
     def set_target_window(self, name: str):
@@ -305,12 +394,11 @@ class OCRSettingsInterface(QWidget):
     def on_settings_changed(self):
         if self._loading_settings:
             return
-        # Save screenshot mode as string (BitBlt or PrintWindow)
-        mode = "BitBlt" if self.capture_mode.currentIndex() == 0 else "PrintWindow"
-        self.settings.set("ocr.screenshot_mode", mode)
+        self.settings.set("ocr.screenshot_mode", self.capture_mode.currentData())
         self.settings.set("ocr.interval", self.interval_spin.value())
         self.settings.set("ocr.digit_confidence_threshold", float(self.digit_conf_threshold_spin.value()))
         self.settings.set("ocr.symbol_confidence_threshold", float(self.symbol_conf_threshold_spin.value()))
+        self.settings.set("ocr.coordinate_split_width_factor", float(self.coordinate_split_width_factor_spin.value()))
         self.settings.set("ocr.target_window", self.target_window.text())
         self.settings.set("ocr.auto_detect_region_enabled", self._auto_detect_switch.isChecked())
         self.settings.set("minimap_roi.auto_calibration_enabled", self.minimap_auto_calibration_switch.isChecked())
@@ -336,14 +424,17 @@ class OCRSettingsInterface(QWidget):
         self._loading_settings = True
         try:
         # Load screenshot mode and set index accordingly
-            mode = self.settings.get("ocr.screenshot_mode", "BitBlt")
-            self.capture_mode.setCurrentIndex(1 if mode == "PrintWindow" else 0)
+            mode = normalize_capture_mode(self.settings.get("ocr.screenshot_mode", "auto"))
+            self.capture_mode.setCurrentIndex(CAPTURE_MODE_INDEX.get(mode, 0))
             self.interval_spin.setValue(self.settings.get("ocr.interval", 500))
             self.digit_conf_threshold_spin.setValue(
                 float(self.settings.get("ocr.digit_confidence_threshold", 0.45))
             )
             self.symbol_conf_threshold_spin.setValue(
                 float(self.settings.get("ocr.symbol_confidence_threshold", 0.45))
+            )
+            self.coordinate_split_width_factor_spin.setValue(
+                float(self.settings.get("ocr.coordinate_split_width_factor", 0.40))
             )
             window = self.settings.get("ocr.target_window", "")
             if window:
@@ -370,7 +461,7 @@ class OCRSettingsInterface(QWidget):
         return int(self.interval_spin.value())
 
     def get_screenshot_mode(self) -> str:
-        return "BitBlt" if self.capture_mode.currentIndex() == 0 else "PrintWindow"
+        return self.capture_mode.currentData()
 
     def get_target_window_name(self) -> str:
         return self.target_window.text().strip()
@@ -380,6 +471,9 @@ class OCRSettingsInterface(QWidget):
 
     def get_symbol_confidence_threshold(self) -> float:
         return float(self.symbol_conf_threshold_spin.value())
+
+    def get_coordinate_split_width_factor(self) -> float:
+        return float(self.coordinate_split_width_factor_spin.value())
 
     def is_heading_recognition_enabled(self) -> bool:
         return bool(self.heading_recognition_enabled_switch.isChecked())
@@ -465,12 +559,14 @@ class OCRSettingsInterface(QWidget):
     def retranslate_ui(self):
         self.basic_title_label.setText(tr("ocr_basic_settings", "识别设置"))
         self.capture_mode_label.setText(tr("ocr_capture_mode", "截图方式:"))
-        self.capture_mode.setItemText(0, tr("ocr_capture_mode_bitblt", "BitBlt (默认)"))
-        self.capture_mode.setItemText(1, tr("ocr_capture_mode_printwindow", "PrintWindow"))
+        for index, (_value, key, default_text) in enumerate(CAPTURE_MODE_OPTIONS):
+            self.capture_mode.setItemText(index, tr(key, default_text))
         self.capture_mode.setToolTip(
             tr(
                 "ocr_capture_mode_tooltip",
-                "BitBlt: 快速截图，适用于大多数情况\nPrintWindow: 窗口截图，适用于某些特殊窗口",
+                "自动: 依次尝试 WGC → PrintWindow → 窗口 BitBlt，其中 WGC 仅 Windows build 20348 及以上可用\n"
+                "WGC: 窗口图形捕获，延迟低\nPrintWindow: 让窗口自身重绘，适用于部分特殊窗口\n"
+                "窗口 BitBlt: 从屏幕拷贝窗口像素，兼容性最好",
             )
         )
         self.target_window_label.setText(tr("ocr_target_window", "目标窗口:"))
@@ -498,10 +594,17 @@ class OCRSettingsInterface(QWidget):
         self.ocr_manual_calibrate_btn.setText(tr("ocr_manual_calibrate_region", "校准OCR区域"))
         self.minimap_manual_calibrate_btn.setText(tr("ocr_manual_calibrate_minimap_region", "校准小地图区域"))
         self.recognition_params_title_label.setText(tr("ocr_recognition_params_title", "识别参数"))
+        self.judgement_group_label.setText(tr("ocr_judgement_group", "判定阈值"))
+        self.matching_group_label.setText(tr("ocr_matching_group", "视觉匹配与解析"))
         self.coordinate_agreement_xy_threshold_label.setText(tr("ocr_coordinate_agreement_xy_threshold", "OCR/视觉一致阈值"))
         self.history_xy_threshold_label.setText(tr("ocr_history_xy_threshold", "历史连续性阈值"))
         self.auto_roi_lock_tolerance_label.setText(tr("ocr_auto_roi_lock_tolerance", "ROI锁定误差(px)"))
         self.rough_candidate_limit_label.setText(tr("ocr_rough_candidate_limit", "粗筛候选数量"))
+        self.coordinate_split_width_factor_label.setText(tr("ocr_coordinate_split_width_factor", "坐标拆分宽度系数"))
+        self.history_shortcut_radius_label.setText(tr("ocr_history_shortcut_radius", "历史快捷路径半径(px)"))
+        self.sift_min_inliers_label.setText(tr("ocr_sift_min_inliers", "SIFT最小内点数"))
+        self.sift_ratio_label.setText(tr("ocr_sift_ratio", "SIFT匹配比值"))
+        self.single_source_promotion_frames_label.setText(tr("ocr_single_source_promotion_frames", "单来源认可帧数"))
         self._refresh_minimap_manual_button_state()
         self._redraw_auto_window_status()
     

@@ -1962,6 +1962,7 @@ class MainWindow(FluentWindow):
             target_window = self._ocr_settings_interface.get_target_window_name()
             digit_conf = self._ocr_settings_interface.get_digit_confidence_threshold()
             symbol_conf = self._ocr_settings_interface.get_symbol_confidence_threshold()
+            split_width_factor = self._ocr_settings_interface.get_coordinate_split_width_factor()
             auto_detect_enabled = self._ocr_settings_interface.is_auto_detect_enabled()
             heading_enabled = self._ocr_settings_interface.is_heading_recognition_enabled()
 
@@ -1969,6 +1970,7 @@ class MainWindow(FluentWindow):
             self._ocr_manager.ocr_config['ocr_interval'] = int(interval)
             self._ocr_manager.ocr_config['digit_confidence_threshold'] = float(digit_conf)
             self._ocr_manager.ocr_config['symbol_confidence_threshold'] = float(symbol_conf)
+            self._ocr_manager.ocr_config['coordinate_split_width_factor'] = float(split_width_factor)
             self._ocr_manager.ocr_config['auto_detect_region_enabled'] = bool(auto_detect_enabled)
             if not auto_detect_enabled:
                 self._ocr_manager.ocr_config['target_window_name'] = target_window
@@ -1986,24 +1988,22 @@ class MainWindow(FluentWindow):
                 except Exception:
                     pass
                 try:
+                    worker.update_coordinate_split_width_factor(float(split_width_factor))
+                except Exception:
+                    pass
+                try:
                     worker.update_screenshot_mode(screenshot_mode)
                 except Exception:
                     pass
                 try:
                     area = self._ocr_manager.ocr_config.get('ocr_capture_area') or {}
                     active_target = self._ocr_manager.ocr_config.get('target_window_name', '')
-                    game_rect = self._ocr_manager._current_game_window_rect
-                    minimap_search_region = (
-                        self._ocr_manager._calculate_minimap_search_region(game_rect)
-                        if auto_detect_enabled and game_rect is not None
-                        else None
-                    )
                     worker.update_capture_settings(
                         area,
                         int(interval),
                         active_target,
-                        minimap_search_region,
                     )
+                    self._ocr_manager.refresh_capture_regions()
                 except Exception:
                     pass
         except Exception as e:

@@ -41,7 +41,12 @@ except ImportError:
 
 from ocr_engine import OCRWorker
 from ocr_region_calibrator import OCRRegionCalibrator
-from screen_capture import capture_recognition_inputs_callback
+from screen_capture import (
+    auto_minimap_search_size,
+    auto_ocr_region_size,
+    capture_recognition_inputs_callback,
+    normalize_capture_mode,
+)
 from core import paths
 from core.gpu_adapters import GpuAdapterSelectionError, normalize_adapter_selection
 from core.map_context import CoordinateCandidate
@@ -620,11 +625,10 @@ class OCRControlPanel(QDialog):
         self.window_name_edit.setText(config.get('target_window_name', ''))
         
         # 设置截图模式
-        mode = config.get('screenshot_mode', 'BitBlt')
-        if mode == 'PrintWindow':
-            self.capture_mode_combo.setCurrentIndex(1)
-        else:
-            self.capture_mode_combo.setCurrentIndex(0)
+        mode = normalize_capture_mode(config.get('screenshot_mode', 'auto'))
+        self.capture_mode_combo.setCurrentIndex(
+            1 if mode == 'printwindow' else 0
+        )
     
     def setup_ocr_region(self):
         """设置OCR区域"""
@@ -902,7 +906,7 @@ class OCRManager(QObject):
                 'verbose_debug': False  # 默认关闭详细调试，需要时手动开启
             },
             'target_window_name': '',
-            'screenshot_mode': 'BitBlt',
+            'screenshot_mode': 'auto',
             'auto_detect_region_enabled': True,
             'auto_jump_enabled': True,  # 默认启用自动跳转
             'gpu_acceleration_enabled': True,
@@ -937,12 +941,14 @@ class OCRManager(QObject):
 
         # 日志管理器引用（来自父窗口）
         self._log_manager = getattr(parent, "_log_manager", None) if parent else None
+        self._install_capture_event_sink()
         self._settings = SettingsManager()
         self._detailed_ocr_logging = False
         self.runtime_capture_area: Optional[Dict[str, int]] = None
         self.latest_observation_frame = None
         self.latest_heading_candidate = None
         self._current_game_window_rect: Optional[tuple[int, int, int, int]] = None
+        self._current_game_hwnd: int = 0
         self._vision_map_context = None
         self._vision_tile_root: Optional[Path] = None
         self._vision_locator = None
@@ -950,6 +956,7 @@ class OCRManager(QObject):
         self._minimap_auto_candidates: list[MinimapRoi] = []
         self._minimap_auto_search_active = False
         self._last_minimap_auto_frame_result = None
+        self._pushed_minimap_capture_region: Optional[Dict[str, int]] = None
         self._coordinate_continuity = ContinuityState()
         self._observation_worker = MinimapObservationWorker(self._collect_minimap_observation)
         self._observation_worker.result_ready.connect(self._handle_observation_completed)
@@ -962,6 +969,20 @@ class OCRManager(QObject):
                 self.ocr_worker.set_detailed_log_sink(self._enqueue_detailed_ocr_log)
             except Exception:
                 pass
+
+    def _install_capture_event_sink(self) -> None:
+        """将截图后端事件接入系统日志（与自动窗口检测同一通路）。"""
+        try:
+            from screen_capture import get_screen_capture
+            get_screen_capture().set_event_sink(self._publish_capture_event)
+        except Exception:
+            logging.getLogger(__name__).exception("install capture event sink failed")
+
+    def _publish_capture_event(self, message: str) -> None:
+        if not self._log_manager:
+            return
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self._log_manager.enqueue("system", f"[{timestamp}] [INFO] {message}")
 
     def set_detailed_ocr_logging(self, enabled: bool):
         """设置详细识别日志开关（运行中可动态生效）。"""
@@ -983,6 +1004,9 @@ class OCRManager(QObject):
                 merged_config = self.default_config.copy()
                 merged_config.update(config)
                 merged_config, changed = normalize_builtin_ocr_model_path(merged_config)
+                merged_config['screenshot_mode'] = normalize_capture_mode(
+                    merged_config.get('screenshot_mode')
+                )
                 if changed:
                     self.config_file.parent.mkdir(parents=True, exist_ok=True)
                     with open(self.config_file, 'w', encoding='utf-8') as f:
@@ -1161,7 +1185,7 @@ class OCRManager(QObject):
         self.ocr_region_source_changed.emit("manual")
 
     def start_auto_window_detect(self):
-        """启动自动窗口检测（启动后自动设置默认OCR区域）"""
+        """启动自动窗口检测（找到窗口后停止轮询）"""
         if self._auto_window_timer.isActive():
             return
 
@@ -1191,21 +1215,35 @@ class OCRManager(QObject):
         self._auto_window_remaining = 5
         self._emit_auto_window_status(state="searching", countdown=self._auto_window_remaining)
 
-    def _poll_auto_window(self) -> bool:
-        """轮询查找游戏窗口，成功或无需设置时返回True"""
-        try:
-            from screen_capture import get_screen_capture
-            screen_capture = get_screen_capture()
-            result = screen_capture.find_best_game_window()
-        except Exception as e:
-            print(f"Auto window detect: failed to query windows: {e}")
-            self._emit_auto_window_status(state="error", message=str(e))
-            return True
+    @Slot()
+    def _on_capture_no_window(self) -> None:
+        """Resume the original periodic window search when the worker has no usable window.
 
-        if not result:
-            print("Auto window detect: not found, retry in 5s")
-            return False
+        ``start_auto_window_detect`` already ignores re-entry while the timer is running, so a
+        missing window only restarts discovery once and stops again when the window is found.
+        """
+        if self.ocr_config.get('ocr_capture_area_source') == 'auto':
+            self.start_auto_window_detect()
 
+    def _client_rect_from_window_result(
+        self,
+        result: Dict[str, Any],
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """Build the (left, top, right, bottom) client rect, or None when the client area is unusable."""
+        left = int(result['client_x'])
+        top = int(result['client_y'])
+        width = int(result['client_width'])
+        height = int(result['client_height'])
+        if width <= 0 or height <= 0:
+            return None
+        return (left, top, left + width, top + height)
+
+    def _apply_auto_capture_region(
+        self,
+        rect: Tuple[int, int, int, int],
+        window_title: str,
+    ) -> Dict[str, int]:
+        """Recompute the auto OCR region from the window client rect and push it to the worker."""
         # Auto mode ALWAYS overrides current OCR region.
         # If current region is manual, keep a backup for later restore when auto mode is turned off.
         if self.ocr_config.get('ocr_capture_area_source') == 'manual':
@@ -1213,9 +1251,6 @@ class OCRManager(QObject):
             if self._is_valid_region(current_manual):
                 self.ocr_config['manual_ocr_capture_area'] = current_manual.copy()
 
-        rect = result['rect']
-        window_title = result['title']
-        window_mode = result['mode']
         region = self._calculate_default_region(rect)
         self._current_game_window_rect = (
             int(rect[0]),
@@ -1238,18 +1273,42 @@ class OCRManager(QObject):
 
         if self.ocr_worker is not None and self.ocr_worker.is_running:
             interval = self.ocr_config.get('ocr_interval', 1000)
-            minimap_search_region = self._calculate_minimap_search_region(
-                self._current_game_window_rect
-            )
             try:
                 self.ocr_worker.update_capture_settings(
-                    region,
+                    None,
                     interval,
                     window_title,
-                    minimap_search_region,
+                    self._current_game_hwnd,
                 )
             except Exception as e:
                 print(f"Auto window detect: update capture settings failed: {e}")
+
+        return region
+
+    def _poll_auto_window(self) -> bool:
+        """轮询查找游戏窗口，成功或无需设置时返回True"""
+        try:
+            from screen_capture import get_screen_capture
+            screen_capture = get_screen_capture()
+            result = screen_capture.find_best_game_window()
+        except Exception as e:
+            print(f"Auto window detect: failed to query windows: {e}")
+            self._emit_auto_window_status(state="error", message=str(e))
+            return True
+
+        if not result:
+            print("Auto window detect: not found, retry in 5s")
+            return False
+
+        rect = self._client_rect_from_window_result(result)
+        if rect is None:
+            print("Auto window detect: client area not ready, retry later")
+            return False
+
+        self._current_game_hwnd = int(result.get('hwnd') or 0)
+        window_title = result['title']
+        window_mode = result['mode']
+        region = self._apply_auto_capture_region(rect, window_title)
 
         self._emit_auto_window_status(
             state="found",
@@ -1298,7 +1357,12 @@ class OCRManager(QObject):
             interval = self.ocr_config.get('ocr_interval', 1000)
             window_name = self.ocr_config.get('target_window_name', '')
             try:
-                self.ocr_worker.update_capture_settings(self.ocr_config['ocr_capture_area'], interval, window_name)
+                self.ocr_worker.update_capture_settings(
+                    self.ocr_config['ocr_capture_area'],
+                    interval,
+                    window_name,
+                    self._current_game_hwnd,
+                )
             except Exception as e:
                 print(f"Restore manual region: update capture settings failed: {e}")
 
@@ -1329,18 +1393,12 @@ class OCRManager(QObject):
         return True
 
     def _calculate_default_region(self, rect: Tuple[int, int, int, int]) -> Dict[str, int]:
+        """Screen-coordinate form of ScreenCapture's frame-relative auto OCR region."""
         left, top, right, bottom = rect
-        window_width = right - left
-        window_height = bottom - top
-
-        region_width = max(1, window_width // 4)
-        region_height = max(1, window_height // 32)
-        region_x = left
-        region_y = bottom - region_height
-
+        region_width, region_height = auto_ocr_region_size(right - left, bottom - top)
         return {
-            'x': int(region_x),
-            'y': int(region_y),
+            'x': int(left),
+            'y': int(bottom - region_height),
             'width': int(region_width),
             'height': int(region_height)
         }
@@ -1381,13 +1439,15 @@ class OCRManager(QObject):
             
             worker_config = dict(self.ocr_config)
             worker_config['detailed_ocr_logging'] = bool(self._detailed_ocr_logging)
-            if (
-                self.ocr_config.get('ocr_capture_area_source') == 'auto'
-                and self._current_game_window_rect is not None
-            ):
-                worker_config['minimap_search_region'] = self._calculate_minimap_search_region(
-                    self._current_game_window_rect
-                )
+            worker_config['target_hwnd'] = self._current_game_hwnd
+            worker_config['save_minimap_frame_packages'] = bool(
+                self._settings.get("logging.save_minimap_frame_packages", False)
+            )
+            if self.ocr_config.get('ocr_capture_area_source') == 'auto':
+                # Auto regions are relative to the captured frame, not to the screen.
+                worker_config['ocr_capture_area'] = None
+            worker_config['minimap_search_region'] = self._minimap_capture_region()
+            self._pushed_minimap_capture_region = worker_config['minimap_search_region']
             self.ocr_worker = OCRWorker(config_dict=worker_config)
             self.ocr_worker.set_detailed_log_sink(self._enqueue_detailed_ocr_log)
             self.ocr_worker.set_recognition_capture_callback(
@@ -1409,6 +1469,7 @@ class OCRManager(QObject):
             self.ocr_worker.ocr_output_updated.connect(self.on_ocr_output_updated)
             self.ocr_worker.capture_area_updated.connect(self.on_capture_area_updated)
             self.ocr_worker.captured_frame_ready.connect(self.on_observation_frame_captured)
+            self.ocr_worker.capture_no_window.connect(self._on_capture_no_window)
             self.ocr_worker.fatal_gpu_error.connect(self.on_fatal_gpu_error)
             self.ocr_worker.finished.connect(self._on_ocr_worker_finished)
             
@@ -1433,6 +1494,8 @@ class OCRManager(QObject):
                 if stopped and not worker.isRunning():
                     worker.deleteLater()
                     self.ocr_worker = None
+                    from screen_capture import get_screen_capture
+                    get_screen_capture().close()
                 else:
                     error_msg = "停止OCR识别超时，工作线程仍在运行"
                     print(error_msg)
@@ -1625,6 +1688,9 @@ class OCRManager(QObject):
     @Slot(object)
     def on_recognition_frame_completed(self, payload):
         """Handle one completed OCR frame; visual recognition still runs if OCR failed."""
+        # The ROI state can change outside this class (manual calibration writes settings),
+        # so each captured frame is the sync point that keeps the crop rectangle matching it.
+        self.refresh_capture_regions()
         ocr_candidate = None
         if isinstance(payload, dict):
             frame_result = payload.get("frame_result")
@@ -1741,14 +1807,29 @@ class OCRManager(QObject):
         tile_root: Path | None,
         area_id: object,
         rough_candidate_limit: int,
+        history_shortcut_radius_px: float,
+        sift_min_inliers: int,
+        sift_ratio: float,
     ) -> MinimapVisualLocator | None:
         if tile_root is None or area_id is None:
             return None
-        key = (str(Path(tile_root).resolve()), str(area_id), int(rough_candidate_limit))
+        key = (
+            str(Path(tile_root).resolve()),
+            str(area_id),
+            int(rough_candidate_limit),
+            float(history_shortcut_radius_px),
+            int(sift_min_inliers),
+            float(sift_ratio),
+        )
         if key != self._vision_locator_key:
             self._vision_locator = MinimapVisualLocator(
                 Path(tile_root),
-                config=VisualMatchConfig(rough_candidate_limit=int(rough_candidate_limit)),
+                config=VisualMatchConfig(
+                    rough_candidate_limit=int(rough_candidate_limit),
+                    history_shortcut_radius_px=float(history_shortcut_radius_px),
+                    sift_min_inliers=int(sift_min_inliers),
+                    sift_ratio=float(sift_ratio),
+                ),
             )
             self._vision_locator_key = key
         return self._vision_locator
@@ -1763,29 +1844,23 @@ class OCRManager(QObject):
                 "visual_failure_reason": "no_observation_frame",
                 "heading_failure_reason": "no_observation_frame",
             }
-        frame = getattr(frame_result, "minimap_frame", None)
-        if frame is None:
+        patch = getattr(frame_result, "minimap_patch", None)
+        if patch is None:
             return {
                 "visual_candidate": None,
                 "visual_result": None,
                 "heading_candidate": None,
-                "visual_failure_reason": "no_minimap_frame",
-                "heading_failure_reason": "no_minimap_frame",
+                "visual_failure_reason": "no_minimap_patch",
+                "heading_failure_reason": "no_minimap_patch",
             }
         if (
             self._minimap_auto_search_active
             and frame_result is not self._last_minimap_auto_frame_result
         ):
             self._last_minimap_auto_frame_result = frame_result
-            search_rect = getattr(frame_result, "minimap_search_rect", None)
-            if search_rect is not None:
-                candidate = detect_minimap_circle_roi(
-                    frame,
-                    search_rect,
-                    require_arrow_anchor=True,
-                )
-                if candidate is not None:
-                    self._handle_minimap_auto_candidate(candidate)
+            candidate = detect_minimap_circle_roi(patch, require_arrow_anchor=True)
+            if candidate is not None:
+                self._handle_minimap_auto_candidate(candidate)
         roi = self._build_minimap_roi_from_settings()
         if roi is None:
             if self._minimap_auto_search_active:
@@ -1810,7 +1885,7 @@ class OCRManager(QObject):
             heading_enabled = bool(stability_config.heading_recognition_enabled)
             detect_heading_now = heading_enabled
             frame_package_path = self._export_minimap_frame_package(
-                frame,
+                frame_result,
                 roi=roi,
                 ocr_candidate=ocr_candidate,
                 map_context=map_context,
@@ -1820,9 +1895,12 @@ class OCRManager(QObject):
                 tile_root=tile_root,
                 area_id=getattr(map_context, "area_id", None),
                 rough_candidate_limit=stability_config.rough_candidate_limit,
+                history_shortcut_radius_px=stability_config.history_shortcut_radius_px,
+                sift_min_inliers=stability_config.sift_min_inliers,
+                sift_ratio=stability_config.sift_ratio,
             )
             observation = run_observation_paths(
-                frame,
+                patch,
                 roi=roi,
                 map_context=map_context,
                 tile_root=tile_root,
@@ -1849,7 +1927,7 @@ class OCRManager(QObject):
 
     def _export_minimap_frame_package(
         self,
-        frame,
+        frame_result,
         *,
         roi: MinimapRoi,
         ocr_candidate: CoordinateCandidate | None,
@@ -1868,8 +1946,10 @@ class OCRManager(QObject):
             else:
                 label_parts.append(f"{ocr_candidate.x}_{ocr_candidate.y}_{ocr_candidate.z}")
             package_path = write_minimap_frame_package(
-                frame,
+                frame_result.full_frame,
                 label="_".join(label_parts),
+                ocr_crop=frame_result.ocr_crop,
+                minimap_patch=frame_result.minimap_patch,
                 roi=roi,
                 ocr_candidate=ocr_candidate,
                 map_context=map_context,
@@ -1901,35 +1981,62 @@ class OCRManager(QObject):
         except Exception:
             return None
 
-    def _calculate_minimap_search_region(self, rect: Tuple[int, int, int, int]) -> Dict[str, int]:
-        left, top, right, bottom = rect
-        window_width = max(1, int(right) - int(left))
-        window_height = max(1, int(bottom) - int(top))
-        return {
-            "x": int(left),
-            "y": int(top),
-            "width": max(1, int(window_width / 8)),
-            "height": max(1, int(window_height / 4)),
-        }
+    def _minimap_capture_region(self) -> Optional[Dict[str, int]]:
+        """Frame-coordinate rectangle the capture path must crop for minimap recognition.
 
-    def get_minimap_preview_area(self) -> Optional[Dict[str, int]]:
-        rect = self._current_game_window_rect
-        if rect is None:
-            return None
-        if self._minimap_auto_search_active:
-            return self._calculate_minimap_search_region(rect)
-        if str(self._settings.get("minimap_roi.status", "") or "") != "locked":
-            return None
+        ``None`` means "auto search stage": the crop then falls back to the frame's
+        built-in top-left search area. A locked or manually calibrated ROI is used as
+        it is stored, because it is already expressed in the captured frame's
+        coordinates and needs no window position.
+        """
         roi = self._build_minimap_roi_from_settings()
         if roi is None:
             return None
-        left, top, _, _ = rect
         return {
-            "x": int(left) + int(roi.x),
-            "y": int(top) + int(roi.y),
+            "x": int(roi.x),
+            "y": int(roi.y),
             "width": int(roi.width),
             "height": int(roi.height),
         }
+
+    def refresh_capture_regions(self) -> None:
+        """Push the current minimap crop rectangle to the worker whenever it changed."""
+        region = self._minimap_capture_region()
+        if region == self._pushed_minimap_capture_region:
+            return
+        if self.ocr_worker is None:
+            return
+        self.ocr_worker.update_minimap_capture_region(region)
+        self._pushed_minimap_capture_region = region
+
+    def _calculate_minimap_search_region(self, rect: Tuple[int, int, int, int]) -> Dict[str, int]:
+        """Screen-coordinate form of ScreenCapture's frame-relative auto minimap search region."""
+        left, top, right, bottom = rect
+        search_width, search_height = auto_minimap_search_size(right - left, bottom - top)
+        return {
+            "x": int(left),
+            "y": int(top),
+            "width": int(search_width),
+            "height": int(search_height),
+        }
+
+    def get_minimap_preview_area(self) -> Optional[Dict[str, int]]:
+        """Screen-coordinate rectangle used only to draw the preview box."""
+        rect = self._current_game_window_rect
+        if rect is None:
+            return None
+        region = self._minimap_capture_region()
+        if region is not None:
+            left, top, _, _ = rect
+            return {
+                "x": int(left) + region["x"],
+                "y": int(top) + region["y"],
+                "width": region["width"],
+                "height": region["height"],
+            }
+        if self._minimap_auto_search_active:
+            return self._calculate_minimap_search_region(rect)
+        return None
 
     def normalize_minimap_manual_selection(self, x: int, y: int, width: int, height: int) -> MinimapRoi:
         rect = self._current_game_window_rect

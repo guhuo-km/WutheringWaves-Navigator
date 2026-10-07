@@ -51,3 +51,17 @@ def test_update_handoff_starts_updater_after_event_loop_returns():
     assert "self.close()" in launch_body
     assert "subprocess.Popen" not in launch_body
     assert main_source.index("exit_code = app.exec()") < main_source.index("subprocess.Popen(")
+
+
+def test_main_app_runs_candidate_limit_migration_before_main_window():
+    project_root = Path(__file__).resolve().parents[1]
+    source = (project_root / "src" / "main_app.py").read_text(encoding="utf-8")
+
+    construction = source.index("settings = SettingsManager()")
+    migration = source.index("settings.migrate_minimap_rough_candidate_limit()")
+    main_window_import = source.index("from ui.main_window import MainWindow")
+    main_window_call = source.index("main_window = MainWindow()")
+
+    assert construction < migration
+    assert migration < main_window_import
+    assert main_window_import < main_window_call

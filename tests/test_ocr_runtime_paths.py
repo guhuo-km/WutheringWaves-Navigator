@@ -11,7 +11,7 @@ from ocr_manager import (
 )
 from minimap_roi import MinimapRoi
 from minimap_observation_worker import MinimapObservationWorker
-from screen_capture import RecognitionCapture
+from screen_capture import FramePatch, RecognitionCapture
 
 import numpy as np
 
@@ -20,18 +20,14 @@ def _recognition_capture(
     frame: np.ndarray,
     *,
     ocr_crop: np.ndarray | None = None,
-    search_rect: tuple[int, int, int, int] | None = None,
+    minimap_patch: FramePatch | None = None,
+    full_frame: np.ndarray | None = None,
 ) -> RecognitionCapture:
-    height, width = frame.shape[:2]
     return RecognitionCapture(
         ocr_crop=frame if ocr_crop is None else ocr_crop,
-        minimap_frame=frame,
-        minimap_search_rect=(
-            search_rect
-            if search_rect is not None
-            else (0, 0, max(1, width // 8), max(1, height // 4))
-        ),
+        minimap_patch=minimap_patch if minimap_patch is not None else FramePatch.whole(frame),
         source="window_full",
+        full_frame=full_frame,
     )
 
 
@@ -372,6 +368,8 @@ def test_ocr_worker_uses_recognition_capture_callback():
         mode,
         target_window_name,
         minimap_search_region,
+        target_hwnd=0,
+        include_full_frame=False,
     ):
         calls.append(
             (
@@ -382,9 +380,11 @@ def test_ocr_worker_uses_recognition_capture_callback():
                 mode,
                 target_window_name,
                 minimap_search_region,
+                target_hwnd,
+                include_full_frame,
             )
         )
-        return _recognition_capture(frame, ocr_crop=crop, search_rect=(0, 0, 15, 25))
+        return _recognition_capture(frame, ocr_crop=crop)
 
     worker = OCRWorker()
     worker.capture_area = {"x": 40, "y": 50, "width": 30, "height": 20}
@@ -400,14 +400,75 @@ def test_ocr_worker_uses_recognition_capture_callback():
             50,
             30,
             20,
-            "BitBlt",
+            "auto",
             "game",
             {"x": 10, "y": 20, "width": 15, "height": 25},
+            0,
+            False,
         )
     ]
     assert image.shape == (20, 30, 3)
     assert image.mean() == 155
-    assert worker._last_recognition_capture.minimap_frame is frame
+
+
+def test_ocr_worker_requests_the_full_frame_only_for_debug_export():
+    frame = np.zeros((100, 120, 3), dtype=np.uint8)
+    crop = np.full((20, 30, 3), 155, dtype=np.uint8)
+    calls = []
+
+    def fake_capture(
+        x,
+        y,
+        width,
+        height,
+        mode,
+        target_window_name,
+        minimap_search_region,
+        target_hwnd=0,
+        include_full_frame=False,
+    ):
+        calls.append(include_full_frame)
+        return _recognition_capture(frame, ocr_crop=crop, full_frame=frame if include_full_frame else None)
+
+    worker = OCRWorker()
+    worker.capture_area = {"x": 40, "y": 50, "width": 30, "height": 20}
+    worker.save_minimap_frame_packages = True
+    worker.set_recognition_capture_callback(fake_capture)
+
+    worker._capture_ocr_region()
+
+    assert calls == [True]
+    assert worker._last_recognition_capture.full_frame is frame
+
+
+def test_ocr_worker_passes_auto_regions_as_none():
+    frame = np.zeros((100, 120, 3), dtype=np.uint8)
+    crop = np.full((50, 640, 3), 77, dtype=np.uint8)
+    calls = []
+
+    def fake_capture(
+        x,
+        y,
+        width,
+        height,
+        mode,
+        target_window_name,
+        minimap_search_region,
+        target_hwnd=0,
+        include_full_frame=False,
+    ):
+        calls.append((x, y, width, height, mode, target_window_name, minimap_search_region, target_hwnd))
+        return _recognition_capture(frame, ocr_crop=crop)
+
+    worker = OCRWorker(config_dict={"ocr_capture_area": None})
+    worker.target_window_name = "game"
+    worker.set_recognition_capture_callback(fake_capture)
+
+    image = worker._capture_ocr_region()
+
+    assert calls == [(None, None, None, None, "auto", "game", None, 0)]
+    assert image.shape == (50, 640, 3)
+    assert worker._last_recognition_capture.minimap_patch.image is frame
 
 
 def test_ocr_manager_wires_recognition_capture_to_worker():
@@ -433,7 +494,7 @@ def test_active_minimap_auto_search_uses_each_captured_frame_before_ocr_completi
     detected_frames = []
     monkeypatch.setattr(
         "ocr_manager.detect_minimap_circle_roi",
-        lambda image, *args, **kwargs: detected_frames.append(image) or None,
+        lambda patch, *args, **kwargs: detected_frames.append(patch) or None,
     )
 
     manager.on_observation_frame_captured(frame_result)
@@ -441,7 +502,7 @@ def test_active_minimap_auto_search_uses_each_captured_frame_before_ocr_completi
     manager._collect_minimap_observation(None)
 
     assert manager._observation_worker.submitted == [None]
-    assert detected_frames == [frame]
+    assert detected_frames == [frame_result.minimap_patch]
 
 
 def test_ocr_manager_runs_minimap_observation_when_roi_and_frame_available(monkeypatch):
@@ -461,8 +522,8 @@ def test_ocr_manager_runs_minimap_observation_when_roi_and_frame_available(monke
 
     calls = []
 
-    def fake_run_observation_paths(frame, **kwargs):
-        calls.append((frame, kwargs))
+    def fake_run_observation_paths(patch, **kwargs):
+        calls.append((patch, kwargs))
         return {
             "visual_candidate": None,
             "visual_result": None,
@@ -473,14 +534,15 @@ def test_ocr_manager_runs_minimap_observation_when_roi_and_frame_available(monke
     manager.auto_jump_enabled = False
     manager._settings = FakeSettings()
     frame = np.zeros((100, 120, 3), dtype=np.uint8)
-    manager.latest_observation_frame = _recognition_capture(frame)
+    capture = _recognition_capture(frame)
+    manager.latest_observation_frame = capture
     monkeypatch.setattr("ocr_manager.run_observation_paths", fake_run_observation_paths)
 
     _complete_frame_sync(manager, CoordinateCandidate(100, 200, 30, source="ocr"))
 
     assert len(calls) == 1
-    used_frame, kwargs = calls[0]
-    assert used_frame is frame
+    used_patch, kwargs = calls[0]
+    assert used_patch is capture.minimap_patch
     assert kwargs["roi"].x == 10
     assert kwargs["roi"].y == 20
     assert kwargs["roi"].width == 40
@@ -723,8 +785,8 @@ def test_ocr_manager_exports_frame_package_only_when_package_export_enabled(monk
 
     calls = []
 
-    def fake_write_minimap_frame_package(frame, **kwargs):
-        calls.append((frame, kwargs))
+    def fake_write_minimap_frame_package(full_frame, **kwargs):
+        calls.append((full_frame, kwargs))
         return tmp_path / "pkg" / "package.json"
 
     manager = OCRManager()
@@ -732,17 +794,20 @@ def test_ocr_manager_exports_frame_package_only_when_package_export_enabled(monk
     manager.set_detailed_ocr_logging(True)
     manager._settings = FakeSettings()
     frame = np.zeros((100, 120, 3), dtype=np.uint8)
-    manager.latest_observation_frame = _recognition_capture(frame)
+    capture = _recognition_capture(frame, full_frame=frame)
+    manager.latest_observation_frame = capture
     monkeypatch.setattr("ocr_manager.write_minimap_frame_package", fake_write_minimap_frame_package)
     monkeypatch.setattr(
         "ocr_manager.run_observation_paths",
-        lambda frame, **kwargs: {"visual_candidate": None, "visual_result": None, "heading_candidate": None},
+        lambda patch, **kwargs: {"visual_candidate": None, "visual_result": None, "heading_candidate": None},
     )
 
     observation = manager._collect_minimap_observation(CoordinateCandidate(100, 200, 30, source="ocr"))
 
     assert len(calls) == 1
     assert calls[0][0] is frame
+    assert calls[0][1]["ocr_crop"] is capture.ocr_crop
+    assert calls[0][1]["minimap_patch"] is capture.minimap_patch
     assert calls[0][1]["roi"].x == 10
     assert calls[0][1]["include_debug_artifacts"] is True
     assert calls[0][1]["ocr_candidate"].as_tuple() == (100, 200, 30)
@@ -803,7 +868,7 @@ def test_ocr_manager_routes_frame_package_export_failure_to_ocr_log(monkeypatch)
         def enqueue(self, log_type, line):
             self.records.append((log_type, line))
 
-    def fake_write_minimap_frame_package(frame, **kwargs):
+    def fake_write_minimap_frame_package(full_frame, **kwargs):
         raise RuntimeError("package failed")
 
     manager = OCRManager()
@@ -1066,6 +1131,10 @@ def test_ocr_manager_auto_window_detect_replaces_stale_target_and_starts_minimap
                 "mode": "windowed",
                 "width": 1936,
                 "height": 1119,
+                "client_x": 619,
+                "client_y": 241,
+                "client_width": 1936,
+                "client_height": 1119,
             }
 
     class FakeWorker:
@@ -1089,19 +1158,19 @@ def test_ocr_manager_auto_window_detect_replaces_stale_target_and_starts_minimap
 
     assert manager._current_game_window_rect == (619, 241, 2555, 1360)
     assert manager.ocr_config["target_window_name"] == "鸣潮"
-    assert manager.ocr_worker.capture_settings == [
-        (
-            {"x": 619, "y": 1326, "width": 484, "height": 34},
-            1000,
-            "鸣潮",
-            {"x": 619, "y": 241, "width": 242, "height": 279},
-        )
-    ]
+    assert manager.ocr_config["ocr_capture_area"] == {
+        "x": 619,
+        "y": 1326,
+        "width": 484,
+        "height": 34,
+    }
+    assert manager.ocr_config["ocr_capture_area_source"] == "auto"
+    assert manager.ocr_worker.capture_settings == [(None, 1000, "鸣潮", 0)]
     assert manager._minimap_auto_search_active is True
     assert manager._settings.values["minimap_roi.status"] == "searching"
 
 
-def test_ocr_manager_minimap_preview_uses_search_rect_while_auto_searching():
+def test_ocr_manager_minimap_preview_uses_the_auto_search_area_while_auto_searching():
     class FakeSettings:
         values = {
             "minimap_roi.status": "searching",
@@ -1152,6 +1221,30 @@ def test_ocr_manager_minimap_preview_uses_locked_roi_after_auto_search_locks():
     }
 
 
+def test_ocr_manager_manual_minimap_roi_outside_auto_search_area_survives_unknown_window_position():
+    class FakeSettings:
+        values = {
+            "minimap_roi.status": "locked",
+            "minimap_roi.x": 1200,
+            "minimap_roi.y": 900,
+            "minimap_roi.width": 200,
+            "minimap_roi.height": 200,
+        }
+
+        def get(self, key, default=None):
+            return self.values.get(key, default)
+
+    manager = OCRManager()
+    manager._settings = FakeSettings()
+    manager._current_game_window_rect = None
+
+    capture_rect = manager._minimap_capture_region()
+
+    # A 2560x1600 frame only auto-searches the top-left 320x400 area.
+    assert capture_rect == {"x": 1200, "y": 900, "width": 200, "height": 200}
+    assert capture_rect["x"] > 2560 // 8 or capture_rect["y"] > 1600 // 4
+
+
 def test_ocr_manager_converts_manual_minimap_selection_to_game_window_relative_roi():
     manager = OCRManager()
     manager._current_game_window_rect = (619, 241, 2555, 1360)
@@ -1193,7 +1286,7 @@ def test_ocr_manager_does_not_use_saved_minimap_roi_while_auto_searching(monkeyp
     assert observation["visual_failure_reason"] == "minimap_roi_searching"
 
 
-def test_ocr_manager_detects_minimap_auto_roi_in_top_left_fraction_after_ocr(monkeypatch):
+def test_ocr_manager_detects_minimap_auto_roi_in_the_captured_patch_after_ocr(monkeypatch):
     class FakeSettings:
         values = {}
 
@@ -1203,8 +1296,8 @@ def test_ocr_manager_detects_minimap_auto_roi_in_top_left_fraction_after_ocr(mon
     calls = []
     handled = []
 
-    def fake_detect(frame, search_rect, **kwargs):
-        calls.append((frame, search_rect, kwargs))
+    def fake_detect(patch, **kwargs):
+        calls.append((patch, kwargs))
         return MinimapRoi(12, 34, 56, 56, "circle", "auto")
 
     manager = OCRManager()
@@ -1212,7 +1305,8 @@ def test_ocr_manager_detects_minimap_auto_roi_in_top_left_fraction_after_ocr(mon
     manager._settings = FakeSettings()
     manager._minimap_auto_search_active = True
     frame = np.zeros((900, 1600, 3), dtype=np.uint8)
-    manager.latest_observation_frame = _recognition_capture(frame)
+    capture = _recognition_capture(frame)
+    manager.latest_observation_frame = capture
     monkeypatch.setattr("ocr_manager.detect_minimap_circle_roi", fake_detect, raising=False)
     monkeypatch.setattr(
         manager,
@@ -1222,49 +1316,11 @@ def test_ocr_manager_detects_minimap_auto_roi_in_top_left_fraction_after_ocr(mon
 
     _complete_frame_sync(manager, CoordinateCandidate(100, 200, 30, source="ocr"))
 
-    assert calls == [(frame, (0, 0, 200, 225), {"require_arrow_anchor": True})]
+    assert calls == [(capture.minimap_patch, {"require_arrow_anchor": True})]
     assert handled == [MinimapRoi(12, 34, 56, 56, "circle", "auto")]
 
 
-def test_ocr_manager_detects_minimap_auto_roi_in_provided_minimap_frame(monkeypatch):
-    class FakeSettings:
-        values = {}
-
-        def get(self, key, default=None):
-            return self.values.get(key, default)
-
-    calls = []
-    handled = []
-
-    def fake_detect(frame, search_rect, **kwargs):
-        calls.append((frame, search_rect, kwargs))
-        return MinimapRoi(12, 34, 56, 56, "circle", "auto")
-
-    manager = OCRManager()
-    manager.auto_jump_enabled = False
-    manager._settings = FakeSettings()
-    manager._minimap_auto_search_active = True
-    game_frame = np.zeros((900, 1600, 3), dtype=np.uint8)
-    manager.latest_observation_frame = _recognition_capture(game_frame)
-    monkeypatch.setattr("ocr_manager.detect_minimap_circle_roi", fake_detect, raising=False)
-    monkeypatch.setattr(
-        manager,
-        "_handle_minimap_auto_candidate",
-        lambda roi: handled.append(roi) or False,
-    )
-
-    _complete_frame_sync(manager, CoordinateCandidate(100, 200, 30, source="ocr"))
-
-    assert len(calls) == 1
-    used_frame, search_rect, kwargs = calls[0]
-    assert used_frame is game_frame
-    assert used_frame.shape == (900, 1600, 3)
-    assert search_rect == (0, 0, 200, 225)
-    assert kwargs == {"require_arrow_anchor": True}
-    assert handled == [MinimapRoi(12, 34, 56, 56, "circle", "auto")]
-
-
-def test_ocr_manager_runs_locked_minimap_observation_on_provided_minimap_frame(monkeypatch):
+def test_ocr_manager_runs_locked_minimap_observation_on_the_captured_patch(monkeypatch):
     class FakeSettings:
         values = {
             "minimap_roi.x": 10,
@@ -1280,23 +1336,23 @@ def test_ocr_manager_runs_locked_minimap_observation_on_provided_minimap_frame(m
 
     calls = []
 
-    def fake_run_observation_paths(frame, **kwargs):
-        calls.append((frame, kwargs))
+    def fake_run_observation_paths(patch, **kwargs):
+        calls.append((patch, kwargs))
         return {"visual_candidate": None, "visual_result": None, "heading_candidate": None}
 
     manager = OCRManager()
     manager.auto_jump_enabled = False
     manager._settings = FakeSettings()
     game_frame = np.zeros((900, 1600, 3), dtype=np.uint8)
-    manager.latest_observation_frame = _recognition_capture(game_frame)
+    capture = _recognition_capture(game_frame)
+    manager.latest_observation_frame = capture
     monkeypatch.setattr("ocr_manager.run_observation_paths", fake_run_observation_paths)
 
     _complete_frame_sync(manager, CoordinateCandidate(100, 200, 30, source="ocr"))
 
     assert len(calls) == 1
-    used_frame, kwargs = calls[0]
-    assert used_frame is game_frame
-    assert used_frame.shape == (900, 1600, 3)
+    used_patch, kwargs = calls[0]
+    assert used_patch is capture.minimap_patch
     assert kwargs["roi"] == MinimapRoi(10, 20, 40, 50, "circle", "manual")
 
 

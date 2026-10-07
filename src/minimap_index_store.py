@@ -9,6 +9,14 @@ from typing import Iterable
 from core.map_context import TileKey
 from minimap_tile_index_state import canonical_tile_key, parse_canonical_tile_key
 
+# Version authority for a generated tile index. `0` means the area has never been
+# generated with the current rule or is being rebuilt, so no query may read it;
+# `CURRENT_TILE_INDEX_VERSION` is written only after every coarse window and every
+# SIFT tile of the whole area regenerated without a single failure under the current
+# 400 four-phase coarse rule and the area ORB product of that area is ready.
+CURRENT_TILE_INDEX_VERSION = 3
+UNAVAILABLE_TILE_INDEX_VERSION = 0
+
 
 @dataclass(frozen=True)
 class MinimapIndexTileStatus:
@@ -67,6 +75,57 @@ class MinimapIndexStore:
 
     def mark_failed(self, key: TileKey, *, error: str) -> None:
         self._upsert(key, error=str(error))
+
+    def clear_tile_index_status(self) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute("DELETE FROM tile_index_status")
+        return int(cursor.rowcount or 0)
+
+    def get_area_index_version(self, area_id: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT version FROM area_index_version WHERE area_id = ?",
+                (str(area_id),),
+            ).fetchone()
+        if row is None:
+            return UNAVAILABLE_TILE_INDEX_VERSION
+        return int(row["version"] or UNAVAILABLE_TILE_INDEX_VERSION)
+
+    def set_area_index_version(self, area_id: str, version: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO area_index_version (area_id, version, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(area_id) DO UPDATE SET
+                    version=excluded.version,
+                    updated_at=excluded.updated_at
+                """,
+                (str(area_id), int(version), time.time()),
+            )
+
+    def is_area_orb_ready(self, area_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT ready FROM area_orb_status WHERE area_id = ?",
+                (str(area_id),),
+            ).fetchone()
+        if row is None:
+            return False
+        return bool(row["ready"])
+
+    def set_area_orb_ready(self, area_id: str, ready: bool) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO area_orb_status (area_id, ready, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(area_id) DO UPDATE SET
+                    ready=excluded.ready,
+                    updated_at=excluded.updated_at
+                """,
+                (str(area_id), int(bool(ready)), time.time()),
+            )
 
     def get_tile_status(self, key: TileKey) -> MinimapIndexTileStatus:
         return self.get_tile_status_by_raw_key(canonical_tile_key(key))
@@ -178,6 +237,24 @@ class MinimapIndexStore:
                     feature_count INTEGER NOT NULL DEFAULT 0,
                     stale_reason TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS area_index_version (
+                    area_id TEXT PRIMARY KEY,
+                    version INTEGER NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS area_orb_status (
+                    area_id TEXT PRIMARY KEY,
+                    ready INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL
                 )
                 """

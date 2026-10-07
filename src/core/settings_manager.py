@@ -4,6 +4,7 @@ Settings manager - wrapper for app_settings.json
 """
 
 import os
+import copy
 import json
 from typing import Any, Optional
 
@@ -137,7 +138,27 @@ class SettingsManager:
     def reload(self) -> None:
         """Reload settings from file"""
         self._load()
-    
+
+    def migrate_minimap_rough_candidate_limit(self) -> bool:
+        """One-time bump of minimap_stability.rough_candidate_limit to 72; True when applied, False when the flag already marks it done, RuntimeError (after memory rollback) if the save fails."""
+        value_key = "minimap_stability.rough_candidate_limit"
+        flag_key = "migrations.minimap_rough_candidate_limit_72"
+        target = 72
+
+        if self.get(flag_key) is True:
+            return False
+
+        snapshot = copy.deepcopy(self._cache)
+        self.set(value_key, target, save=False)
+        self.set(flag_key, True, save=False)
+        if not self._save():
+            self._cache.clear()
+            self._cache.update(snapshot)
+            raise RuntimeError(
+                f"Failed to persist minimap rough_candidate_limit migration to {self.settings_file}"
+            )
+        return True
+
     def get_all(self) -> dict:
         """Get all settings as a dictionary"""
         return self._cache.copy()

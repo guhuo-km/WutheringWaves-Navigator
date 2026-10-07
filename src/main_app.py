@@ -12,6 +12,22 @@ import tempfile
 import subprocess
 from pathlib import Path
 
+# 必须在 faiss / onnxruntime / cv2 等原生库 import 之前设置：OpenMP 运行时只在初始化时读一次 OMP_WAIT_POLICY。
+# faiss 的 OpenMP 工作线程默认在每次调用后自旋等待；本程序每 500 ms 才调用一次，实测每帧整进程 CPU 从 891 ms 降到 234 ms（单帧实际耗时 86.5 ms 降到 65.1 ms），建库只慢 8.4%。
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
+# 同样必须在 faiss / numpy 等原生库 import 之前设置：OpenBLAS 只在初始化时读一次线程数。
+# faiss 的 wheel 自带一份 OpenBLAS（faiss_cpu.libs\\libopenblas.dll），numpy 2.4.2 也自带一份
+# （libscipy_openblas64_*.dll）。两份在加载时都按工作线程数预留固定大小的匿名暂存池：
+# faiss 那份每线程 128 MiB，numpy 那份每线程 32 MiB；均不写入数据、进程结束前不释放。
+# 实测 OPENBLAS_NUM_THREADS 为 1/2/4/8/16 时块数为 0/1/3/7/15（块数 = 线程数 - 1），
+# 默认不设时本机 16 逻辑核会预留 15*128 MiB + 15*32 MiB 约 2.3 GiB 已提交但基本不用的匿名内存，
+# 且这些零页一旦被访问就会进入工作集，直接推高任务管理器的"内存"列。
+# 本程序每帧真正走 BLAS 的运算只有 rough_matrix @ query（约 2.83 MFLOP），亚毫秒级，单线程足够；
+# faiss 的二进制指纹搜索是 popcount 位运算、不走 BLAS，其并行度由 OMP_NUM_THREADS 管，不受此设置影响。
+# 用户在环境变量中已显式指定时用 setdefault 尊重该值。
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 sys.dont_write_bytecode = True
 
 BOOTSTRAP_SRC_ROOT = Path(__file__).resolve().parent
@@ -161,6 +177,7 @@ def main() -> int:
     from ui.dialogs.disclaimer_dialog import DisclaimerDialog
     from core.settings_manager import SettingsManager
     settings = SettingsManager()
+    settings.migrate_minimap_rough_candidate_limit()
     if not settings.get("disclaimer_accepted", False):
         dialog = DisclaimerDialog()
         if dialog.exec() != QDialog.Accepted:

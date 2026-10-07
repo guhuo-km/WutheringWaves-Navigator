@@ -286,12 +286,19 @@ def test_minimap_visual_controls_move_from_map_settings_to_ocr_settings():
         "minimap_auto_calibration_label",
         "minimap_auto_calibration_switch",
         "minimap_manual_calibrate_btn",
+        "judgement_group_label",
+        "matching_group_label",
         "coordinate_agreement_x_threshold_spin",
         "coordinate_agreement_y_threshold_spin",
         "history_x_threshold_spin",
         "history_y_threshold_spin",
         "auto_roi_lock_tolerance_spin",
         "rough_candidate_limit_spin",
+        "coordinate_split_width_factor_spin",
+        "history_shortcut_radius_spin",
+        "sift_min_inliers_spin",
+        "sift_ratio_spin",
+        "single_source_promotion_frames_spin",
         "heading_recognition_enabled_switch",
     ]
     for name in expected_ocr_names:
@@ -313,6 +320,11 @@ def test_minimap_visual_controls_move_from_map_settings_to_ocr_settings():
         "minimap_stability.auto_roi_lock_tolerance_px",
         "minimap_stability.rough_candidate_limit",
         "minimap_stability.heading_recognition_enabled",
+        "minimap_stability.history_shortcut_radius_px",
+        "minimap_stability.sift_min_inliers",
+        "minimap_stability.sift_ratio",
+        "minimap_stability.single_source_promotion_frames",
+        "ocr.coordinate_split_width_factor",
     ]
     for key in expected_settings:
         assert key in ocr_text

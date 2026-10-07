@@ -34,13 +34,25 @@ def _fmt_visual_trace(trace: dict[str, Any] | None) -> list[str]:
     if not isinstance(trace, dict):
         return []
     if trace.get("rough_index_source") == "tile_index":
-        lines = [
-            "  visual_trace:",
-            "    tile_index: "
-            f"rough_candidates_available={trace.get('rough_candidates_available')} "
-            f"used={trace.get('rough_candidates_used')} "
-            f"skipped_missing={trace.get('rough_candidates_skipped_missing')}",
-        ]
+        if trace.get("match_path") == "history_shortcut":
+            summary = (
+                "    tile_index: "
+                f"path={trace.get('match_path')} "
+                f"center={trace.get('history_center_px')} "
+                f"radius={trace.get('history_radius_px')}"
+            )
+        else:
+            summary = (
+                "    tile_index: "
+                f"rough_candidates_available={trace.get('rough_candidates_available')} "
+                f"used={trace.get('rough_candidates_used')} "
+                f"skipped_missing={trace.get('rough_candidates_skipped_missing')} "
+                f"hsv_used={trace.get('hsv_candidates_used')} "
+                f"orb_used={trace.get('orb_candidates_used')} "
+                f"orb_status={trace.get('orb_status')} "
+                f"path={trace.get('match_path')}"
+            )
+        lines = ["  visual_trace:", summary]
         hits = trace.get("rough_hits")
         if isinstance(hits, list):
             for hit in hits:
@@ -53,6 +65,13 @@ def _fmt_visual_trace(trace: dict[str, Any] | None) -> list[str]:
                     f"work_key={hit.get('work_key')}"
                 )
                 lines.append(f"        tiles={tile_text}")
+                sources = hit.get("sources")
+                source_text = ",".join(str(value) for value in sources) if isinstance(sources, list) else ""
+                source_scores = hit.get("source_scores")
+                source_score_text = " ".join(
+                    f"{scheme}={source_scores[scheme]}" for scheme in source_scores
+                ) if isinstance(source_scores, dict) else ""
+                lines.append(f"        sources={source_text} source_scores={source_score_text}")
                 lines.append(
                     f"        sift_index={hit.get('sift_index_source')} features={hit.get('feature_count')} "
                     f"raw={hit.get('raw_match_count')} good={hit.get('good_match_count')} "
