@@ -123,6 +123,7 @@ src/login_history.json
 *.onnx
 !models/coord_ocr.onnx
 models/*.7z
+models/*.zip
 
 # docs-ai 语料索引 (由 services/docs-ai/scripts/sync-corpus.mjs 生成)
 services/docs-ai/corpus/
